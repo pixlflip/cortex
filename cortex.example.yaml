@@ -1,0 +1,88 @@
+# Cortex configuration — copy to cortex.yaml and edit.
+#
+# This file is PUBLIC-SAFE: it holds structure, never secrets. Tokens and API
+# keys are read from environment variables referenced by name (token_env /
+# api_key_env). Any "${ENV_VAR}" below is interpolated from the environment.
+#
+# As shipped, this runs locally over stdio with no API key required:
+# local-only vault, git audit on, LLM disabled (deterministic tools only).
+
+vault:
+  # Path to your note vault (relative paths resolve against this file's dir).
+  path: ./vault
+  git:
+    enabled: true              # git audit trail + rollback
+    actor_name: cortex
+    actor_email: cortex@localhost
+
+sync:
+  adapter: none                # none (default) | git | nextcloud | s3
+  # Examples for when you opt in:
+  # adapter: git
+  # options: { remote: origin, branch: main }
+
+# Identities that may connect. Each maps a credential to one principal and a set
+# of scopes (globs over vault-relative paths). A non-matching path is invisible.
+principals:
+  - name: local
+    scopes: ["**"]             # everything; tighten per principal as needed
+    # token_env: CORTEX_TOKEN_LOCAL   # required only for http transport
+
+  # Example of a scoped remote agent (uncomment + set the env var to use):
+  # - name: web-assistant
+  #   scopes: ["Public/**", "Projects/Shared/**"]
+  #   token_env: CORTEX_TOKEN_WEB_ASSISTANT
+
+auth:
+  enabled: true
+  # Principal used for local stdio connections (which carry no token).
+  local_principal: local
+  # Run a full OAuth 2.1 authorization server (http transport only) so the
+  # one-click connector UIs in Claude.ai / ChatGPT / Grok can authorize. The
+  # browser is sent to a Cortex consent page where the user pastes their
+  # principal token; the issued OAuth token is bound to that principal. Static
+  # bearer tokens keep working too. Requires a correct public_url.
+  oauth_enabled: false
+
+server:
+  transport: stdio             # stdio (local) | http (remote, Streamable HTTP)
+  host: 127.0.0.1
+  port: 8765
+  # --- http transport only (remote MCP clients) ---
+  path: /mcp                   # Streamable HTTP endpoint path
+  # Externally-visible HTTPS URL (terminate TLS at a reverse proxy in front):
+  # public_url: https://cortex.example.com
+  # DNS-rebinding protection — list the hosts/origins allowed to call directly.
+  # Leave empty when behind a trusted reverse proxy. Example:
+  # allowed_origins: ["https://claude.ai", "https://chatgpt.com"]
+  #
+  # http transport requires at least one principal with a token_env (below), and
+  # the bearer token maps to that principal. NOTE: programmatic clients and the
+  # Anthropic API mcp_servers connector accept a bearer token directly; the
+  # one-click Claude.ai / ChatGPT connector UIs expect OAuth 2.1 (a later step).
+  # See docs/http-exposure.md.
+
+llm:
+  # Powers the semantic_search tool (and later the janitor). Ships disabled so
+  # Cortex runs with no API key. To enable, the simplest path is OpenRouter —
+  # one key, many models. Set provider: openrouter and CORTEX_LLM_API_KEY:
+  #
+  #   provider: openrouter
+  #   api_key_env: CORTEX_LLM_API_KEY
+  #   # model + base_url default automatically for openrouter:
+  #   #   model: anthropic/claude-sonnet-4.6   (latest Claude Sonnet; the default)
+  #   #   base_url: https://openrouter.ai/api/v1
+  #   # For the always-newest Sonnet instead of a pinned version:
+  #   #   model: "~anthropic/claude-sonnet-latest"
+  #   options: { max_tokens: 1500 }           # synthesis answer length
+  #
+  # Other providers: openai (needs model), ollama (local, no key, needs model),
+  # anthropic (needs the 'anthropic' extra; model defaults to claude-sonnet-4-6).
+  provider: none               # none | openrouter | openai | anthropic | ollama
+
+janitor:
+  enabled: false               # dark by default — keep it off until spec'd
+  dry_run: true                # report-only before any write mode
+  interval_seconds: 3600
+  allowed_paths: []            # paths the janitor may touch (when enabled)
+  forbidden_paths: []          # always-off paths (in addition to hard categories)

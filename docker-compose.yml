@@ -1,0 +1,32 @@
+# Cortex via Docker Compose — the primary one-command spin-up.
+#
+#   1. cp cortex.example.yaml cortex.yaml   # edit to taste
+#   2. put your notes in ./vault            # or point vault.path elsewhere
+#   3. docker compose run --rm cortex check
+#   4. docker compose run --rm cortex init  # create the git audit baseline
+#
+# Secrets (tokens, API keys) come from the environment / a .env file — never
+# bake them into the image or commit them. See cortex.example.yaml for which
+# env vars each principal/provider references.
+
+services:
+  cortex:
+    build:
+      context: .
+      # args: { EXTRAS: "openai" }   # uncomment to bundle a provider SDK
+    image: cortex:latest
+    environment:
+      CORTEX_CONFIG: /data/cortex.yaml
+      # Provide tokens/keys here or via a .env file, e.g.:
+      # CORTEX_TOKEN_LOCAL: ${CORTEX_TOKEN_LOCAL}
+      # CORTEX_LLM_API_KEY: ${CORTEX_LLM_API_KEY}
+    volumes:
+      - ./vault:/data/vault
+      - ./cortex.yaml:/data/cortex.yaml:ro
+    # stdin_open/tty let stdio MCP clients attach (docker compose run -it).
+    stdin_open: true
+    tty: true
+    # For remote MCP clients (server.transport: http), expose the port and put
+    # a TLS-terminating reverse proxy in front. See docs/http-exposure.md.
+    # ports:
+    #   - "8765:8765"

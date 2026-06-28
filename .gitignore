@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Local config & secrets (never commit these)
+cortex.yaml
+.env
+*.netrc
+
+# A runtime 'cortex init' on the bundled sample vault creates vault/.git —
+# keep that out of the code repo (the sample notes themselves stay tracked).
+/vault/.git/
+
+# Vault sync internals (if a synced vault ever lives here)
+.sync_*.db*
+._sync_*.db*
+*.~lock*
+
+# OS noise
+.DS_Store
+Thumbs.db
