@@ -97,11 +97,14 @@ This repo is built in dependency order (see the build sequence in
 - ✅ Git audit layer (commit-on-mutation with actor + reason)
 - ✅ Scoping + auth (token → principal → scopes; directory-bounded globs)
 - ✅ MCP server **v1, read-only** over stdio — all tools above
+- ✅ LLM provider layer (OpenRouter default → latest Claude Sonnet; also
+  OpenAI / Anthropic / Ollama / none)
+- ✅ Live `semantic_search` — scoped retrieve-then-synthesize (the model only
+  sees notes the principal may read)
 - ✅ Docker image + Compose, and a bare-metal/systemd path
 
-**Next on the roadmap:** LLM provider layer (OpenRouter default) → live
-`semantic_search` → secure HTTP exposure (bearer auth + TLS) → sync adapters →
-the bounded janitor.
+**Next on the roadmap:** secure HTTP exposure (bearer auth + TLS) → sync
+adapters → the bounded janitor.
 
 ---
 

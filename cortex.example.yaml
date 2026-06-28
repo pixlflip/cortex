@@ -44,12 +44,22 @@ server:
   port: 8765
 
 llm:
-  # Default recommendation: OpenRouter (one key, many models). Set provider to
-  # 'openrouter' and CORTEX_LLM_API_KEY to enable semantic_search + janitor.
+  # Powers the semantic_search tool (and later the janitor). Ships disabled so
+  # Cortex runs with no API key. To enable, the simplest path is OpenRouter —
+  # one key, many models. Set provider: openrouter and CORTEX_LLM_API_KEY:
+  #
+  #   provider: openrouter
+  #   api_key_env: CORTEX_LLM_API_KEY
+  #   # model + base_url default automatically for openrouter:
+  #   #   model: anthropic/claude-sonnet-4.6   (latest Claude Sonnet; the default)
+  #   #   base_url: https://openrouter.ai/api/v1
+  #   # For the always-newest Sonnet instead of a pinned version:
+  #   #   model: "~anthropic/claude-sonnet-latest"
+  #   options: { max_tokens: 1500 }           # synthesis answer length
+  #
+  # Other providers: openai (needs model), ollama (local, no key, needs model),
+  # anthropic (needs the 'anthropic' extra; model defaults to claude-sonnet-4-6).
   provider: none               # none | openrouter | openai | anthropic | ollama
-  # model: anthropic/claude-sonnet-4.6        # latest Claude Sonnet via OpenRouter
-  # api_key_env: CORTEX_LLM_API_KEY
-  # base_url: https://openrouter.ai/api/v1
 
 janitor:
   enabled: false               # dark by default — keep it off until spec'd

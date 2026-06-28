@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from .auth import Authenticator
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
+from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .vault import VaultError, VaultStore
 
@@ -35,6 +36,8 @@ class CortexServer:
         self.principal = principal
         self.vault = VaultStore(config.vault.path)
         self.git = GitAudit(config.vault.path, config.vault.git)
+        # None when llm.provider is "none"; raises at startup on misconfig.
+        self.provider = build_provider(config.llm)
         self.mcp = FastMCP("cortex")
         self._register()
 
@@ -44,6 +47,42 @@ class CortexServer:
         if not path_allowed(path, self.principal.scopes):
             # Do not distinguish "absent" from "out of scope".
             raise ValueError(f"note not found or not in scope: {path}")
+
+    def _gather_context(
+        self, query: str, max_notes: int, budget_chars: int
+    ) -> tuple[list[str], str]:
+        """Deterministically gather the top *visible* notes for a query into a
+        compact, budgeted context string. Shared by context_pack and
+        semantic_search so retrieval stays scoped and model-free — the model (if
+        any) only ever sees notes this principal is allowed to read."""
+        hits = self.vault.search(query, limit=200)
+        seen: list[str] = []
+        for h in hits:
+            if h.path in seen:
+                continue
+            if path_allowed(h.path, self.principal.scopes):
+                seen.append(h.path)
+            if len(seen) >= max(1, max_notes):
+                break
+        chunks: list[str] = []
+        used_paths: list[str] = []
+        used = 0
+        for rel in seen:
+            try:
+                note = self.vault.read_note(rel)
+            except VaultError:
+                continue
+            header = f"\n## {rel}\n"
+            remaining = budget_chars - used - len(header)
+            if remaining <= 0:
+                break
+            body = note.body.strip()
+            if len(body) > remaining:
+                body = body[:remaining].rstrip() + "\n…(truncated)"
+            chunks.append(header + body + "\n")
+            used += len(header) + len(body)
+            used_paths.append(rel)
+        return used_paths, "".join(chunks)
 
     # -- tools -------------------------------------------------------------
 
@@ -108,50 +147,46 @@ class CortexServer:
         def context_pack(query: str, max_notes: int = 5, budget_chars: int = 6000) -> str:
             """Assemble a compact, token-budgeted context bundle for a query from
             the highest-matching visible notes. Deterministic; no model spend."""
-            hits = self.vault.search(query, limit=200)
-            seen: list[str] = []
-            for h in hits:
-                if h.path in seen:
-                    continue
-                if path_allowed(h.path, self.principal.scopes):
-                    seen.append(h.path)
-                if len(seen) >= max(1, max_notes):
-                    break
-            chunks: list[str] = [f"# Context pack for: {query}\n"]
-            used = len(chunks[0])
-            for rel in seen:
-                try:
-                    note = self.vault.read_note(rel)
-                except VaultError:
-                    continue
-                header = f"\n## {rel}\n"
-                remaining = budget_chars - used - len(header)
-                if remaining <= 0:
-                    break
-                body = note.body.strip()
-                if len(body) > remaining:
-                    body = body[:remaining].rstrip() + "\n…(truncated)"
-                chunks.append(header + body + "\n")
-                used += len(header) + len(body)
-            if not seen:
-                chunks.append("\n_No visible notes matched this query._\n")
-            return "".join(chunks)
+            used, ctx = self._gather_context(query, max_notes, budget_chars)
+            if not used:
+                return f"# Context pack for: {query}\n\n_No visible notes matched this query._\n"
+            return f"# Context pack for: {query}\n{ctx}"
 
         @mcp.tool()
-        def semantic_search(question: str) -> str:
+        def semantic_search(question: str, max_notes: int = 8) -> str:
             """Fuzzy 'comb the vault and synthesize' search. This is the only tool
-            that spends model tokens; it delegates to the configured LLM provider.
-            Returns a clear notice if no provider is configured."""
-            if self.config.llm.provider == "none":
+            that spends model tokens: it retrieves the most relevant *visible*
+            notes (deterministic, scope-checked) and asks the configured LLM to
+            answer the question grounded in them. Returns a clear notice if no
+            provider is configured."""
+            if self.provider is None:
                 return (
                     "semantic_search is disabled: no LLM provider configured "
                     "(llm.provider = none). Use search / context_pack for "
                     "deterministic retrieval, or configure a provider."
                 )
-            # Wired to the provider in the LLM build step.
-            raise ValueError(
-                "semantic_search backend not yet wired (LLM provider step pending)"
+            used, ctx = self._gather_context(question, max_notes=max_notes, budget_chars=12000)
+            if not used:
+                return (
+                    "No notes in your scope matched that question, so there is "
+                    "nothing to synthesize. Try different terms or a broader scope."
+                )
+            system = (
+                "You are Cortex, a memory assistant. Answer the user's question "
+                "using ONLY the provided vault notes. If the notes do not contain "
+                "the answer, say so plainly — do not invent facts. Cite the note "
+                "path(s) you drew from in parentheses. Be concise."
             )
+            prompt = f"Question: {question}\n\nVault notes:\n{ctx}"
+            max_tokens = int(self.config.llm.options.get("max_tokens", 1500))
+            try:
+                result = self.provider.complete(
+                    system=system, prompt=prompt, max_tokens=max_tokens
+                )
+            except LLMError as exc:
+                raise ValueError(f"semantic_search failed: {exc}") from exc
+            footer = f"\n\n— synthesized by {result.model} from: {', '.join(used)}"
+            return result.text.rstrip() + footer
 
     # -- run ---------------------------------------------------------------
 
