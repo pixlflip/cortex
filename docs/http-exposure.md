@@ -51,26 +51,53 @@ nginx is equivalent — proxy `https://cortex.example.com/mcp` →
 `allowed_origins`/`allowed_hosts` empty; for direct exposure, set them so
 DNS-rebinding protection is enabled.
 
-## 3. Client compatibility — read this before connecting
+## 3. Two auth modes
 
-The transport (Streamable HTTP over HTTPS) is what every current MCP client
-expects. **Authentication is where clients differ:**
+Cortex supports both, on the same Streamable HTTP transport. Pick by who needs
+to connect.
 
-| Client | Works with bearer today? | Notes |
+### Bearer only (default — `auth.oauth_enabled: false`)
+
+Each request sends `Authorization: Bearer <principal token>`. Simple, great for
+programmatic and API-driven clients.
+
+### OAuth 2.1 (`auth.oauth_enabled: true`) — for one-click connector UIs
+
+Cortex runs a full authorization server: protected-resource + AS metadata,
+**dynamic client registration**, and an **authorization-code + PKCE** flow. The
+browser is redirected to a Cortex **consent page** where the user pastes their
+principal token; the issued OAuth access token is bound to that principal, and
+scoping is enforced exactly as everywhere else. Static bearer tokens keep
+working in this mode too, so nothing below regresses.
+
+```yaml
+server:
+  transport: http
+  public_url: https://cortex.example.com   # REQUIRED and correct — it's the OAuth issuer
+auth:
+  enabled: true
+  oauth_enabled: true
+```
+
+### Client compatibility
+
+| Client | Bearer mode | OAuth mode |
 |---|---|---|
-| Anthropic API `mcp_servers` connector | ✅ | Pass the token as `authorization_token` |
-| Custom code / your own MCP client | ✅ | Send `Authorization: Bearer …` |
-| MCP Inspector, n8n, scripts | ✅ | Bearer header |
-| ChatGPT (developer mode) | ⚠️ partial | Header auth works in some paths; OAuth preferred |
-| **Claude.ai one-click connector UI** | ❌ not yet | The UI only offers OAuth fields — no bearer field |
-| **ChatGPT / Grok one-click connector UI** | ❌ not yet | Expect OAuth 2.1 + dynamic client registration |
+| Anthropic API `mcp_servers` connector (`authorization_token`) | ✅ | ✅ |
+| Custom code / MCP Inspector / n8n / scripts | ✅ | ✅ |
+| **Claude.ai** one-click connector UI | ❌ (no bearer field) | ✅ |
+| **ChatGPT** connector UI / developer mode | ⚠️ partial | ✅ |
+| **Grok** custom connector UI | ❌ | ✅ |
 
-So bearer auth covers programmatic and API-driven use **today**. The one-click
-"add a custom connector" buttons in Claude.ai, ChatGPT, and Grok are built
-around **OAuth 2.1** (protected-resource metadata + dynamic client registration
-+ PKCE), which Cortex will add as the next step. Cortex already serves the
-`/.well-known/oauth-protected-resource` discovery document, so the OAuth layer
-slots in on top of this without changing the tool or scoping model.
+To add Cortex in Claude.ai / ChatGPT / Grok: enable OAuth, point the connector
+at `https://cortex.example.com/mcp`, let it auto-discover and register, and when
+it sends you to the Cortex consent page, paste the principal token for the scope
+you want that connector to have.
+
+> Token storage is in-memory: a server restart invalidates issued OAuth tokens
+> and registered clients, so connectors re-authorize. Persisting them is a
+> planned enhancement. Principal tokens should be high-entropy
+> (`openssl rand -hex 32`) — at the consent step they are the login credential.
 
 ## 4. Verify
 

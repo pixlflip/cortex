@@ -89,6 +89,10 @@ class AuthConfig:
     # Principal used for local stdio connections, which carry no bearer token.
     # Must be the name of a defined principal, or None to deny stdio.
     local_principal: str | None = None
+    # Run a full OAuth 2.1 authorization server (http transport) so one-click
+    # connector UIs (Claude.ai / ChatGPT / Grok) can authorize. When false,
+    # http is a bearer-only resource server.
+    oauth_enabled: bool = False
 
 
 @dataclass
@@ -190,6 +194,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     auth = AuthConfig(
         enabled=auth_raw.get("enabled", True),
         local_principal=auth_raw.get("local_principal"),
+        oauth_enabled=auth_raw.get("oauth_enabled", False),
     )
 
     server_raw = raw.get("server", {}) or {}
@@ -249,6 +254,8 @@ def _validate(cfg: CortexConfig) -> None:
             "http transport requires at least one principal with a token_env; "
             "otherwise no client can authenticate."
         )
+    if cfg.auth.oauth_enabled and cfg.server.transport != "http":
+        raise ConfigError("auth.oauth_enabled requires server.transport: http")
     if cfg.server.transport not in ("stdio", "http"):
         raise ConfigError(f"unknown server.transport '{cfg.server.transport}'")
 

@@ -18,11 +18,15 @@ tool permitted to spend model tokens.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import (
+    AuthSettings,
+    ClientRegistrationOptions,
+    RevocationOptions,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -59,6 +63,20 @@ class CortexTokenVerifier(TokenVerifier):
         )
 
 
+@dataclass
+class HttpServe:
+    """Resolved HTTP-transport settings. Exactly one of ``token_verifier``
+    (bearer-only, 9a) or ``oauth_provider`` (full OAuth 2.1 AS, 9b) is set."""
+
+    auth_settings: AuthSettings
+    transport_security: TransportSecuritySettings
+    host: str
+    port: int
+    path: str
+    token_verifier: TokenVerifier | None = None
+    oauth_provider: object | None = None
+
+
 class CortexServer:
     """Holds vault/git/LLM state and registers the MCP tools.
 
@@ -71,7 +89,7 @@ class CortexServer:
         config: CortexConfig,
         principal: Principal | None = None,
         *,
-        http_auth: tuple | None = None,
+        http: HttpServe | None = None,
     ):
         self.config = config
         self.principal = principal  # None => resolve per-request (HTTP)
@@ -79,23 +97,33 @@ class CortexServer:
         self.git = GitAudit(config.vault.path, config.vault.git)
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
-        self.mcp = self._build_mcp(http_auth)
+        self.mcp = self._build_mcp(http)
         self._register()
 
-    def _build_mcp(self, http_auth: tuple | None) -> FastMCP:
-        if http_auth is None:
+    def _build_mcp(self, http: HttpServe | None) -> FastMCP:
+        if http is None:
             return FastMCP("cortex")
-        verifier, auth_settings, transport_security, host, port, path = http_auth
-        return FastMCP(
-            "cortex",
-            token_verifier=verifier,
-            auth=auth_settings,
-            transport_security=transport_security,
-            host=host,
-            port=port,
-            streamable_http_path=path,
+        kwargs = dict(
+            auth=http.auth_settings,
+            transport_security=http.transport_security,
+            host=http.host,
+            port=http.port,
+            streamable_http_path=http.path,
             stateless_http=True,
         )
+        if http.oauth_provider is not None:
+            kwargs["auth_server_provider"] = http.oauth_provider
+        else:
+            kwargs["token_verifier"] = http.token_verifier
+        mcp = FastMCP("cortex", **kwargs)
+        if http.oauth_provider is not None:
+            # Public consent page where the resource owner pastes their token.
+            from .oauth import LOGIN_PATH
+
+            mcp.custom_route(LOGIN_PATH, methods=["GET", "POST"])(
+                http.oauth_provider.handle_consent
+            )
+        return mcp
 
     # -- principal resolution ---------------------------------------------
 
@@ -284,25 +312,46 @@ def build_stdio_server(config: CortexConfig) -> CortexServer:
 
 
 def build_http_server(config: CortexConfig) -> CortexServer:
-    """Construct a server for remote Streamable HTTP access with bearer auth.
+    """Construct a server for remote Streamable HTTP access.
 
-    Each request authenticates with a bearer token that maps to a principal.
-    Host/Origin validation (DNS-rebinding protection) is enabled whenever the
-    config names allowed hosts/origins.
+    With ``auth.oauth_enabled`` (9b) Cortex runs a full OAuth 2.1 authorization
+    server — dynamic client registration + authorization-code/PKCE — so the
+    one-click Claude.ai / ChatGPT / Grok connector UIs work. Otherwise (9a) it's
+    a bearer-only resource server. Either way, requests authenticate to a
+    principal and per-request scoping is enforced; static config bearer tokens
+    keep working in both modes.
     """
     sc = config.server
     base = sc.public_url or f"http://{sc.host}:{sc.port}"
-    verifier = CortexTokenVerifier(Authenticator(config))
-    auth_settings = AuthSettings(
-        issuer_url=base,
-        resource_server_url=base,
-        required_scopes=[],
-    )
+    authn = Authenticator(config)
     restrict = bool(sc.allowed_hosts or sc.allowed_origins)
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=restrict,
         allowed_hosts=sc.allowed_hosts or ["*"],
         allowed_origins=sc.allowed_origins or ["*"],
     )
-    http_auth = (verifier, auth_settings, transport_security, sc.host, sc.port, sc.path)
-    return CortexServer(config, principal=None, http_auth=http_auth)
+
+    if config.auth.oauth_enabled:
+        from .oauth import CortexOAuthProvider
+
+        provider = CortexOAuthProvider(authn, base)
+        auth_settings = AuthSettings(
+            issuer_url=base,
+            resource_server_url=base,
+            required_scopes=[],
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+        http = HttpServe(
+            auth_settings, transport_security, sc.host, sc.port, sc.path,
+            oauth_provider=provider,
+        )
+    else:
+        auth_settings = AuthSettings(
+            issuer_url=base, resource_server_url=base, required_scopes=[]
+        )
+        http = HttpServe(
+            auth_settings, transport_security, sc.host, sc.port, sc.path,
+            token_verifier=CortexTokenVerifier(authn),
+        )
+    return CortexServer(config, principal=None, http=http)

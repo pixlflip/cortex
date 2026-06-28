@@ -37,6 +37,12 @@ auth:
   enabled: true
   # Principal used for local stdio connections (which carry no token).
   local_principal: local
+  # Run a full OAuth 2.1 authorization server (http transport only) so the
+  # one-click connector UIs in Claude.ai / ChatGPT / Grok can authorize. The
+  # browser is sent to a Cortex consent page where the user pastes their
+  # principal token; the issued OAuth token is bound to that principal. Static
+  # bearer tokens keep working too. Requires a correct public_url.
+  oauth_enabled: false
 
 server:
   transport: stdio             # stdio (local) | http (remote, Streamable HTTP)

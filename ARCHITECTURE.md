@@ -209,9 +209,10 @@ before the next begins.
 7. **LLM provider layer** — pluggable; default Claude; `none` works.
 8. **`semantic_search`** — the one non-deterministic tool, behind the provider.
 9. **Secure HTTP exposure** — (9a) Streamable HTTP + bearer→principal auth,
-   per-request scoping, Host/Origin protection, TLS via reverse proxy; then
-   (9b) OAuth 2.1 (protected-resource metadata + dynamic client registration +
-   PKCE) for one-click Claude.ai / ChatGPT / Grok connector UIs.
+   per-request scoping, Host/Origin protection, TLS via reverse proxy; (9b)
+   OAuth 2.1 authorization server (protected-resource + AS metadata, dynamic
+   client registration, authorization-code + PKCE, principal-token consent) for
+   one-click Claude.ai / ChatGPT / Grok connector UIs. **Done.**
 10. **Packaging** — Docker Compose for one-command spin-up *and* a first-class
     bare-metal path (`pip install` + `cortex` CLI + systemd unit) that runs from
     the repo unmodified on a Debian/Proxmox container.
