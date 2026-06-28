@@ -1,0 +1,30 @@
+# systemd unit template for Cortex on bare metal.
+# Copy to /etc/systemd/system/cortex.service and adjust paths to your install.
+# See docs/bare-metal.md.
+
+[Unit]
+Description=Cortex dynamic memory layer (MCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cortex
+Group=cortex
+WorkingDirectory=/srv/cortex/app
+Environment=CORTEX_CONFIG=/srv/cortex/cortex.yaml
+# Secrets (tokens, API keys) live here, not in the config file. Optional.
+EnvironmentFile=-/srv/cortex/cortex.env
+ExecStart=/srv/cortex/app/.venv/bin/cortex serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening: Cortex only needs its own data dir writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/cortex
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

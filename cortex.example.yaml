@@ -1,0 +1,59 @@
+# Cortex configuration — copy to cortex.yaml and edit.
+#
+# This file is PUBLIC-SAFE: it holds structure, never secrets. Tokens and API
+# keys are read from environment variables referenced by name (token_env /
+# api_key_env). Any "${ENV_VAR}" below is interpolated from the environment.
+#
+# As shipped, this runs locally over stdio with no API key required:
+# local-only vault, git audit on, LLM disabled (deterministic tools only).
+
+vault:
+  # Path to your note vault (relative paths resolve against this file's dir).
+  path: ./vault
+  git:
+    enabled: true              # git audit trail + rollback
+    actor_name: cortex
+    actor_email: cortex@localhost
+
+sync:
+  adapter: none                # none (default) | git | nextcloud | s3
+  # Examples for when you opt in:
+  # adapter: git
+  # options: { remote: origin, branch: main }
+
+# Identities that may connect. Each maps a credential to one principal and a set
+# of scopes (globs over vault-relative paths). A non-matching path is invisible.
+principals:
+  - name: local
+    scopes: ["**"]             # everything; tighten per principal as needed
+    # token_env: CORTEX_TOKEN_LOCAL   # required only for http transport
+
+  # Example of a scoped remote agent (uncomment + set the env var to use):
+  # - name: web-assistant
+  #   scopes: ["Public/**", "Projects/Shared/**"]
+  #   token_env: CORTEX_TOKEN_WEB_ASSISTANT
+
+auth:
+  enabled: true
+  # Principal used for local stdio connections (which carry no token).
+  local_principal: local
+
+server:
+  transport: stdio             # stdio (local) | http (remote, needs tokens+TLS)
+  host: 127.0.0.1
+  port: 8765
+
+llm:
+  # Default recommendation: OpenRouter (one key, many models). Set provider to
+  # 'openrouter' and CORTEX_LLM_API_KEY to enable semantic_search + janitor.
+  provider: none               # none | openrouter | openai | anthropic | ollama
+  # model: anthropic/claude-sonnet-4.6        # latest Claude Sonnet via OpenRouter
+  # api_key_env: CORTEX_LLM_API_KEY
+  # base_url: https://openrouter.ai/api/v1
+
+janitor:
+  enabled: false               # dark by default — keep it off until spec'd
+  dry_run: true                # report-only before any write mode
+  interval_seconds: 3600
+  allowed_paths: []            # paths the janitor may touch (when enabled)
+  forbidden_paths: []          # always-off paths (in addition to hard categories)
