@@ -26,6 +26,7 @@ services:
     # stdin_open/tty let stdio MCP clients attach (docker compose run -it).
     stdin_open: true
     tty: true
-    # When HTTP transport lands, expose it here:
+    # For remote MCP clients (server.transport: http), expose the port and put
+    # a TLS-terminating reverse proxy in front. See docs/http-exposure.md.
     # ports:
     #   - "8765:8765"

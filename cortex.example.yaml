@@ -39,9 +39,22 @@ auth:
   local_principal: local
 
 server:
-  transport: stdio             # stdio (local) | http (remote, needs tokens+TLS)
+  transport: stdio             # stdio (local) | http (remote, Streamable HTTP)
   host: 127.0.0.1
   port: 8765
+  # --- http transport only (remote MCP clients) ---
+  path: /mcp                   # Streamable HTTP endpoint path
+  # Externally-visible HTTPS URL (terminate TLS at a reverse proxy in front):
+  # public_url: https://cortex.example.com
+  # DNS-rebinding protection — list the hosts/origins allowed to call directly.
+  # Leave empty when behind a trusted reverse proxy. Example:
+  # allowed_origins: ["https://claude.ai", "https://chatgpt.com"]
+  #
+  # http transport requires at least one principal with a token_env (below), and
+  # the bearer token maps to that principal. NOTE: programmatic clients and the
+  # Anthropic API mcp_servers connector accept a bearer token directly; the
+  # one-click Claude.ai / ChatGPT connector UIs expect OAuth 2.1 (a later step).
+  # See docs/http-exposure.md.
 
 llm:
   # Powers the semantic_search tool (and later the janitor). Ships disabled so

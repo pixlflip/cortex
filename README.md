@@ -101,10 +101,14 @@ This repo is built in dependency order (see the build sequence in
   OpenAI / Anthropic / Ollama / none)
 - ✅ Live `semantic_search` — scoped retrieve-then-synthesize (the model only
   sees notes the principal may read)
+- ✅ Remote **Streamable HTTP** transport with bearer-token → principal auth,
+  per-request scoping, and Host/Origin protection (TLS via reverse proxy).
+  Works today with programmatic clients and the Anthropic API `mcp_servers`
+  connector. See [`docs/http-exposure.md`](docs/http-exposure.md).
 - ✅ Docker image + Compose, and a bare-metal/systemd path
 
-**Next on the roadmap:** secure HTTP exposure (bearer auth + TLS) → sync
-adapters → the bounded janitor.
+**Next on the roadmap:** OAuth 2.1 (the unlock for one-click Claude.ai / ChatGPT
+/ Grok connector UIs) → sync adapters → the bounded janitor.
 
 ---
 

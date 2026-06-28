@@ -208,7 +208,10 @@ before the next begins.
 6. **MCP server v1 (read-only)** — deterministic tools, local `stdio` first.
 7. **LLM provider layer** — pluggable; default Claude; `none` works.
 8. **`semantic_search`** — the one non-deterministic tool, behind the provider.
-9. **Secure HTTP exposure** — bearer auth, TLS via reverse proxy, tool filtering.
+9. **Secure HTTP exposure** — (9a) Streamable HTTP + bearer→principal auth,
+   per-request scoping, Host/Origin protection, TLS via reverse proxy; then
+   (9b) OAuth 2.1 (protected-resource metadata + dynamic client registration +
+   PKCE) for one-click Claude.ai / ChatGPT / Grok connector UIs.
 10. **Packaging** — Docker Compose for one-command spin-up *and* a first-class
     bare-metal path (`pip install` + `cortex` CLI + systemd unit) that runs from
     the repo unmodified on a Debian/Proxmox container.

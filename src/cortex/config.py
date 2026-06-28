@@ -96,6 +96,14 @@ class ServerConfig:
     transport: str = "stdio"  # stdio | http
     host: str = "127.0.0.1"
     port: int = 8765
+    path: str = "/mcp"  # Streamable HTTP endpoint path
+    # Externally-visible base URL (https://...), used as the OAuth issuer /
+    # resource identifier. Defaults to http://host:port when unset.
+    public_url: str | None = None
+    # Host/Origin allowlists for DNS-rebinding protection. Empty => allow all
+    # (fine behind a trusted reverse proxy; set these for direct exposure).
+    allowed_hosts: list[str] = field(default_factory=list)
+    allowed_origins: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -189,6 +197,10 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         transport=server_raw.get("transport", "stdio"),
         host=server_raw.get("host", "127.0.0.1"),
         port=int(server_raw.get("port", 8765)),
+        path=server_raw.get("path", "/mcp"),
+        public_url=server_raw.get("public_url"),
+        allowed_hosts=list(server_raw.get("allowed_hosts", []) or []),
+        allowed_origins=list(server_raw.get("allowed_origins", []) or []),
     )
 
     llm_raw = raw.get("llm", {}) or {}
@@ -232,6 +244,11 @@ def _validate(cfg: CortexConfig) -> None:
         )
     if cfg.server.transport == "http" and not cfg.auth.enabled:
         raise ConfigError("auth must be enabled for http transport (no public exposure unmapped)")
+    if cfg.server.transport == "http" and not any(p.token for p in cfg.principals):
+        raise ConfigError(
+            "http transport requires at least one principal with a token_env; "
+            "otherwise no client can authenticate."
+        )
     if cfg.server.transport not in ("stdio", "http"):
         raise ConfigError(f"unknown server.transport '{cfg.server.transport}'")
 

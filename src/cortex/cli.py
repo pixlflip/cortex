@@ -84,8 +84,8 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 def cmd_serve(args: argparse.Namespace) -> int:
     cfg = _load(args)
+    # Import here so 'cortex check/init/log' don't require the mcp package.
     if cfg.server.transport == "stdio":
-        # Import here so 'cortex check/init/log' don't require the mcp package.
         from .server import build_stdio_server
 
         server = build_stdio_server(cfg)
@@ -96,12 +96,21 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         server.run_stdio()
         return 0
+
+    from .server import build_http_server
+
+    sc = cfg.server
+    base = sc.public_url or f"http://{sc.host}:{sc.port}"
+    server = build_http_server(cfg)
     print(
-        f"transport '{cfg.server.transport}' is not yet available "
-        "(secure HTTP exposure is a later build step).",
+        f"cortex serving vault '{cfg.vault.path}' over streamable-http at "
+        f"{sc.host}:{sc.port}{sc.path} (public: {base}{sc.path}); "
+        f"{len([p for p in cfg.principals if p.token])} bearer principal(s). "
+        "Terminate TLS at a reverse proxy in front of this.",
         file=sys.stderr,
     )
-    return 1
+    server.run_http()
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -5,18 +5,28 @@ the tool layer, never trusting the caller: every path-addressed tool checks the
 calling principal's scopes, and a non-matching path is reported as "not found or
 not in scope" so existence isn't leaked across scope boundaries.
 
-All tools here are deterministic and cheap except ``semantic_search``, which is
-the single tool permitted to spend model tokens (wired to the LLM provider in a
-later build step).
+Two transports share the same tool layer:
+
+* **stdio** — local, single trusted principal bound for the connection.
+* **streamable-http** — remote; the principal is resolved *per request* from a
+  bearer token (token → principal mapping). This is what web/desktop MCP clients
+  connect to. OAuth 2.1 for one-click consumer connectors layers on top later.
+
+All tools are deterministic and cheap except ``semantic_search``, the single
+tool permitted to spend model tokens.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict
 
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-from .auth import Authenticator
+from .auth import Authenticator, AuthError
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .llm import LLMError, build_provider
@@ -24,32 +34,94 @@ from .scopes import filter_paths, path_allowed
 from .vault import VaultError, VaultStore
 
 
-class CortexServer:
-    """Holds vault/git/auth state and registers MCP tools for one principal.
+class CortexTokenVerifier(TokenVerifier):
+    """Maps an incoming bearer token to a Cortex principal.
 
-    In v1/stdio there is a single resolved principal for the connection. HTTP
-    per-request principal resolution is added with the secure-exposure step.
+    The verified token's ``subject`` carries the principal name; the tool layer
+    resolves the full principal (and its scopes) from config on each call. An
+    unrecognized token returns None, which the bearer middleware turns into 401.
     """
 
-    def __init__(self, config: CortexConfig, principal: Principal):
+    def __init__(self, authenticator: Authenticator):
+        self._auth = authenticator
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            principal = self._auth.for_token(token)
+        except AuthError:
+            return None
+        return AccessToken(
+            token=token,
+            client_id=principal.name,
+            scopes=[],
+            subject=principal.name,
+            expires_at=None,
+        )
+
+
+class CortexServer:
+    """Holds vault/git/LLM state and registers the MCP tools.
+
+    ``principal`` is set for stdio (one trusted local identity) and left None for
+    HTTP, where each request resolves its own principal from the bearer token.
+    """
+
+    def __init__(
+        self,
+        config: CortexConfig,
+        principal: Principal | None = None,
+        *,
+        http_auth: tuple | None = None,
+    ):
         self.config = config
-        self.principal = principal
+        self.principal = principal  # None => resolve per-request (HTTP)
         self.vault = VaultStore(config.vault.path)
         self.git = GitAudit(config.vault.path, config.vault.git)
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
-        self.mcp = FastMCP("cortex")
+        self.mcp = self._build_mcp(http_auth)
         self._register()
+
+    def _build_mcp(self, http_auth: tuple | None) -> FastMCP:
+        if http_auth is None:
+            return FastMCP("cortex")
+        verifier, auth_settings, transport_security, host, port, path = http_auth
+        return FastMCP(
+            "cortex",
+            token_verifier=verifier,
+            auth=auth_settings,
+            transport_security=transport_security,
+            host=host,
+            port=port,
+            streamable_http_path=path,
+            stateless_http=True,
+        )
+
+    # -- principal resolution ---------------------------------------------
+
+    def _get_principal(self) -> Principal:
+        """The principal for the current call: the bound one (stdio) or the one
+        mapped from the request's bearer token (HTTP)."""
+        if self.principal is not None:
+            return self.principal
+        token = get_access_token()
+        if token is None:
+            raise ValueError("unauthenticated")
+        principal = self.config.principal(token.subject or "")
+        if principal is None:
+            raise ValueError("unknown principal")
+        return principal
 
     # -- scope helpers -----------------------------------------------------
 
-    def _require_visible(self, path: str) -> None:
-        if not path_allowed(path, self.principal.scopes):
+    @staticmethod
+    def _require_visible(principal: Principal, path: str) -> None:
+        if not path_allowed(path, principal.scopes):
             # Do not distinguish "absent" from "out of scope".
             raise ValueError(f"note not found or not in scope: {path}")
 
     def _gather_context(
-        self, query: str, max_notes: int, budget_chars: int
+        self, principal: Principal, query: str, max_notes: int, budget_chars: int
     ) -> tuple[list[str], str]:
         """Deterministically gather the top *visible* notes for a query into a
         compact, budgeted context string. Shared by context_pack and
@@ -60,7 +132,7 @@ class CortexServer:
         for h in hits:
             if h.path in seen:
                 continue
-            if path_allowed(h.path, self.principal.scopes):
+            if path_allowed(h.path, principal.scopes):
                 seen.append(h.path)
             if len(seen) >= max(1, max_notes):
                 break
@@ -93,31 +165,35 @@ class CortexServer:
         def discover_scopes() -> dict:
             """What can I (the calling principal) see? Returns this principal's
             name, its scopes, and the count of notes currently visible to it."""
-            visible = filter_paths(self.vault.list_notes(), self.principal.scopes)
+            p = self._get_principal()
+            visible = filter_paths(self.vault.list_notes(), p.scopes)
             return {
-                "principal": self.principal.name,
-                "scopes": self.principal.scopes,
+                "principal": p.name,
+                "scopes": p.scopes,
                 "visible_note_count": len(visible),
             }
 
         @mcp.tool()
         def list_notes() -> list[str]:
             """List the relative paths of all notes visible to this principal."""
-            return filter_paths(self.vault.list_notes(), self.principal.scopes)
+            p = self._get_principal()
+            return filter_paths(self.vault.list_notes(), p.scopes)
 
         @mcp.tool()
         def search(query: str, regex: bool = False, limit: int = 50) -> list[dict]:
             """Search visible notes for a substring (or regex). Returns matching
             notes with line numbers and trimmed snippets. Deterministic; no model
             spend."""
+            p = self._get_principal()
             hits = self.vault.search(query, regex=regex, limit=max(1, min(limit, 200)))
-            scoped = [h for h in hits if path_allowed(h.path, self.principal.scopes)]
+            scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
             return [asdict(h) for h in scoped]
 
         @mcp.tool()
         def read_note(path: str, include_frontmatter: bool = True) -> str:
             """Read a full note by its vault-relative path. Scope-checked."""
-            self._require_visible(path)
+            p = self._get_principal()
+            self._require_visible(p, path)
             try:
                 note = self.vault.read_note(path)
             except VaultError as exc:
@@ -127,7 +203,8 @@ class CortexServer:
         @mcp.tool()
         def read_frontmatter(path: str) -> dict:
             """Read just the YAML frontmatter of a note. Scope-checked."""
-            self._require_visible(path)
+            p = self._get_principal()
+            self._require_visible(p, path)
             try:
                 return self.vault.read_frontmatter(path)
             except VaultError as exc:
@@ -137,7 +214,8 @@ class CortexServer:
         def read_section(path: str, heading: str) -> str:
             """Read a single section of a note, identified by its heading text.
             Scope-checked."""
-            self._require_visible(path)
+            p = self._get_principal()
+            self._require_visible(p, path)
             try:
                 return self.vault.read_section(path, heading)
             except VaultError as exc:
@@ -147,7 +225,8 @@ class CortexServer:
         def context_pack(query: str, max_notes: int = 5, budget_chars: int = 6000) -> str:
             """Assemble a compact, token-budgeted context bundle for a query from
             the highest-matching visible notes. Deterministic; no model spend."""
-            used, ctx = self._gather_context(query, max_notes, budget_chars)
+            p = self._get_principal()
+            used, ctx = self._gather_context(p, query, max_notes, budget_chars)
             if not used:
                 return f"# Context pack for: {query}\n\n_No visible notes matched this query._\n"
             return f"# Context pack for: {query}\n{ctx}"
@@ -159,13 +238,14 @@ class CortexServer:
             notes (deterministic, scope-checked) and asks the configured LLM to
             answer the question grounded in them. Returns a clear notice if no
             provider is configured."""
+            p = self._get_principal()
             if self.provider is None:
                 return (
                     "semantic_search is disabled: no LLM provider configured "
                     "(llm.provider = none). Use search / context_pack for "
                     "deterministic retrieval, or configure a provider."
                 )
-            used, ctx = self._gather_context(question, max_notes=max_notes, budget_chars=12000)
+            used, ctx = self._gather_context(p, question, max_notes=max_notes, budget_chars=12000)
             if not used:
                 return (
                     "No notes in your scope matched that question, so there is "
@@ -193,8 +273,36 @@ class CortexServer:
     def run_stdio(self) -> None:
         self.mcp.run(transport="stdio")
 
+    def run_http(self) -> None:
+        self.mcp.run(transport="streamable-http")
+
 
 def build_stdio_server(config: CortexConfig) -> CortexServer:
     """Construct a server for a local stdio connection (single local principal)."""
     principal = Authenticator(config).for_stdio()
     return CortexServer(config, principal)
+
+
+def build_http_server(config: CortexConfig) -> CortexServer:
+    """Construct a server for remote Streamable HTTP access with bearer auth.
+
+    Each request authenticates with a bearer token that maps to a principal.
+    Host/Origin validation (DNS-rebinding protection) is enabled whenever the
+    config names allowed hosts/origins.
+    """
+    sc = config.server
+    base = sc.public_url or f"http://{sc.host}:{sc.port}"
+    verifier = CortexTokenVerifier(Authenticator(config))
+    auth_settings = AuthSettings(
+        issuer_url=base,
+        resource_server_url=base,
+        required_scopes=[],
+    )
+    restrict = bool(sc.allowed_hosts or sc.allowed_origins)
+    transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=restrict,
+        allowed_hosts=sc.allowed_hosts or ["*"],
+        allowed_origins=sc.allowed_origins or ["*"],
+    )
+    http_auth = (verifier, auth_settings, transport_security, sc.host, sc.port, sc.path)
+    return CortexServer(config, principal=None, http_auth=http_auth)
