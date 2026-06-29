@@ -36,6 +36,7 @@ from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
+from .search_index import IndexHit, SearchIndex
 from .vault import VaultError, VaultStore
 
 
@@ -97,6 +98,13 @@ class CortexServer:
         self.principal = principal  # None => resolve per-request (HTTP)
         self.admin_store = admin_store or (AdminStore(config.admin.path) if config.admin.enabled else None)
         self.vault = VaultStore(config.vault.path)
+        self.index = SearchIndex(
+            self.vault,
+            config.index.path,
+            chunk_chars=config.index.chunk_chars,
+            overlap=config.index.overlap,
+            enabled=config.index.enabled,
+        )
         self.git = GitAudit(config.vault.path, config.vault.git)
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
@@ -163,32 +171,53 @@ class CortexServer:
     def _gather_context(
         self, principal: Principal, query: str, max_notes: int, budget_chars: int
     ) -> tuple[list[str], str]:
-        """Deterministically gather the top *visible* notes for a query into a
+        """Deterministically gather the top *visible* chunks for a query into a
         compact, budgeted context string. Shared by context_pack and
         semantic_search so retrieval stays scoped and model-free — the model (if
-        any) only ever sees notes this principal is allowed to read."""
-        hits = self.vault.search(query, limit=200)
-        seen: list[str] = []
-        for h in hits:
-            if h.path in seen:
-                continue
-            if path_allowed(h.path, principal.scopes):
-                seen.append(h.path)
-            if len(seen) >= max(1, max_notes):
+        any) only ever sees notes this principal is allowed to read.
+
+        Ranking comes from the SQLite FTS5/BM25 search index (falling back to
+        VaultStore substring search transparently if FTS5 is unavailable), so
+        natural-language phrasing — not just literal substrings — finds the
+        right note. Candidates are over-fetched at a generous, non-scaling-down
+        floor and only then scope-filtered, so a narrowly-scoped principal in a
+        large vault — who may have dozens of higher-ranked out-of-scope hits
+        ahead of their first visible one — never has an out-of-scope note
+        counted toward max_notes nor surfaced."""
+        self.index.ensure_fresh()
+        over_fetch = max(max(1, max_notes) * 20, 500)
+        hits = self.index.search(query, limit=over_fetch)
+        scoped = [h for h in hits if path_allowed(h.path, principal.scopes)]
+
+        # Dedup to the single best (top-ranked) chunk per note, preserving rank
+        # order, then cap to max_notes distinct notes.
+        best_per_note: dict[str, IndexHit] = {}
+        order: list[str] = []
+        for h in scoped:
+            if h.path not in best_per_note:
+                best_per_note[h.path] = h
+                order.append(h.path)
+            if len(order) >= max(1, max_notes):
                 break
+
         chunks: list[str] = []
         used_paths: list[str] = []
         used = 0
-        for rel in seen:
-            try:
-                note = self.vault.read_note(rel)
-            except VaultError:
-                continue
-            header = f"\n## {rel}\n"
+        for rel in order:
+            hit: IndexHit = best_per_note[rel]
+            breadcrumb = f" — {hit.headings}" if hit.headings else ""
+            header = f"\n## {rel}{breadcrumb}\n"
             remaining = budget_chars - used - len(header)
             if remaining <= 0:
                 break
-            body = note.body.strip()
+            body = (hit.body or hit.snippet or "").strip()
+            if not body:
+                # Defensive fallback: pull the note body directly if neither
+                # the chunk text nor the snippet came back populated.
+                try:
+                    body = self.vault.read_note(rel).body.strip()
+                except VaultError:
+                    continue
             if len(body) > remaining:
                 body = body[:remaining].rstrip() + "\n…(truncated)"
             chunks.append(header + body + "\n")
@@ -221,13 +250,33 @@ class CortexServer:
 
         @mcp.tool()
         def search(query: str, regex: bool = False, limit: int = 50) -> list[dict]:
-            """Search visible notes for a substring (or regex). Returns matching
-            notes with line numbers and trimmed snippets. Deterministic; no model
-            spend."""
+            """Search visible notes. By default, ranked keyword/natural-language
+            search over an FTS5/BM25 index (porter-stemmed, heading-aware) —
+            returns matching chunks with line numbers, trimmed snippets, and a
+            relevance score (lower is better). Pass regex=True for a literal
+            substring/regex scan instead (no ranking; score omitted).
+            Deterministic; no model spend."""
             p = self._get_principal()
-            hits = self.vault.search(query, regex=regex, limit=max(1, min(limit, 200)))
-            scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
-            return [asdict(h) for h in scoped]
+            capped = max(1, min(limit, 200))
+            if regex:
+                hits = self.vault.search(query, regex=True, limit=capped)
+                scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
+                return [asdict(h) for h in scoped[:capped]]
+            # Over-fetch ranked candidates *before* scope-filtering so an
+            # out-of-scope note is never counted toward the requested limit —
+            # only truncate to `limit` after filtering. The over-fetch floor is
+            # intentionally NOT scaled down for small `limit`: a principal with
+            # a narrow scope inside a large vault can have dozens of
+            # higher-ranked out-of-scope hits ahead of their first visible one,
+            # so a small limit must not shrink the candidate pool.
+            self.index.ensure_fresh()
+            over_fetch = max(capped * 5, 500)
+            hits = self.index.search(query, limit=over_fetch)
+            scoped = [h for h in hits if path_allowed(h.path, p.scopes)][:capped]
+            return [
+                {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score}
+                for h in scoped
+            ]
 
         @mcp.tool()
         def read_note(path: str, include_frontmatter: bool = True) -> str:

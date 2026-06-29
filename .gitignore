@@ -24,6 +24,10 @@ cortex.admin.json
 ._sync_*.db*
 *.~lock*
 
+# Search index — a rebuildable SQLite FTS5 cache derived from the vault.
+# Never commit this; 'cortex index' regenerates it from the notes on disk.
+cortex.index.sqlite*
+
 # OS noise
 .DS_Store
 Thumbs.db

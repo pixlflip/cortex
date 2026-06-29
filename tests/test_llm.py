@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from cortex.config import CortexConfig, LLMConfig, Principal, VaultConfig
+from cortex.config import CortexConfig, IndexConfig, LLMConfig, Principal, VaultConfig
 from cortex.llm import LLMError, LLMResult, build_provider
 from cortex.server import CortexServer
 
@@ -128,7 +128,13 @@ def vault(tmp_path: Path) -> Path:
 
 
 def _server(vault: Path, scopes: list[str]) -> CortexServer:
-    cfg = CortexConfig(vault=VaultConfig(path=vault))  # llm defaults to provider=none
+    cfg = CortexConfig(
+        vault=VaultConfig(path=vault),
+        # Keep the search index's SQLite file inside the tmp_path sandbox —
+        # otherwise its dataclass default resolves against the test runner's
+        # CWD instead of a throwaway directory.
+        index=IndexConfig(path=vault.parent / "cortex.index.sqlite"),
+    )  # llm defaults to provider=none
     return CortexServer(cfg, Principal(name="p", scopes=scopes))
 
 

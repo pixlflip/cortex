@@ -10,6 +10,7 @@ Commands:
     cortex init      Initialize the vault git repo + bootstrap snapshot commit.
     cortex log       Show recent audit commits.
     cortex check     Validate config and report the resolved setup.
+    cortex index     Build/refresh the FTS5 search index and report stats.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from . import __version__
 from .admin import AdminStore
 from .config import ConfigError, load_config
 from .gitlog import GitAudit
+from .search_index import SearchIndex
 from .vault import VaultStore
 
 
@@ -48,11 +50,55 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"  transport:    {cfg.server.transport}")
     print(f"  admin UI:     {'enabled' if cfg.admin.enabled else 'off'}"
           f" ({cfg.admin.path})" if cfg.admin.enabled else "")
+    if cfg.index.enabled:
+        idx = SearchIndex(
+            store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
+        )
+        idx.ensure_fresh()
+        stats = idx.stats()
+        backend = "fts5+bm25" if idx.fts_available else "substring-fallback (FTS5 unavailable)"
+        print(
+            f"  search index: enabled ({cfg.index.path}) [{backend}] "
+            f"— {stats['note_count']} notes, {stats['chunk_count']} chunks, "
+            f"last indexed {stats['last_indexed'] or 'never'}"
+        )
+        idx.close()
+    else:
+        print("  search index: disabled (falling back to substring search)")
     print(f"  llm provider: {cfg.llm.provider or 'none'} ({cfg.llm.model or '-'})")
     print(f"  janitor:      {'enabled' if cfg.janitor.enabled else 'dark'}"
           f"{' (dry-run)' if cfg.janitor.enabled and cfg.janitor.dry_run else ''}")
     print(f"  principals:   {', '.join(p.name for p in cfg.principals) or '(none)'}")
     print(f"  local principal: {cfg.auth.local_principal or '(none — stdio denied)'}")
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    store = VaultStore(cfg.vault.path)
+    if not cfg.index.enabled:
+        print("search index is disabled in config (index.enabled: false); nothing to build.")
+        return 0
+    idx = SearchIndex(
+        store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
+    )
+    if not idx.fts_available:
+        print(
+            "warning: SQLite FTS5 is not available in this environment; "
+            "ranked search will fall back to substring search.",
+            file=sys.stderr,
+        )
+    if args.rebuild:
+        idx.rebuild()
+        print(f"rebuilt search index at {cfg.index.path}")
+    else:
+        idx.sync()
+        print(f"refreshed search index at {cfg.index.path}")
+    stats = idx.stats()
+    print(f"  notes:        {stats['note_count']}")
+    print(f"  chunks:       {stats['chunk_count']}")
+    print(f"  last indexed: {stats['last_indexed'] or 'never'}")
+    idx.close()
     return 0
 
 
@@ -138,6 +184,10 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("log", help="show recent audit commits")
     pl.add_argument("-n", "--limit", type=int, default=20)
     pl.set_defaults(func=cmd_log)
+
+    pi = sub.add_parser("index", help="build/refresh the FTS5 search index")
+    pi.add_argument("--rebuild", action="store_true", help="drop and rebuild the index from scratch")
+    pi.set_defaults(func=cmd_index)
 
     return p
 

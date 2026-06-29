@@ -16,6 +16,7 @@ from cortex.auth import Authenticator
 from cortex.config import (
     ConfigError,
     CortexConfig,
+    IndexConfig,
     Principal,
     ServerConfig,
     VaultConfig,
@@ -35,6 +36,10 @@ def vault(tmp_path: Path) -> Path:
 def _http_config(vault: Path) -> CortexConfig:
     return CortexConfig(
         vault=VaultConfig(path=vault),
+        # Keep the search index's SQLite file inside the tmp_path sandbox too —
+        # otherwise its dataclass default ("./cortex.index.sqlite") resolves
+        # against the test runner's CWD instead of a throwaway directory.
+        index=IndexConfig(path=vault.parent / "cortex.index.sqlite"),
         principals=[
             Principal(name="web", scopes=["Public/**"], token="tok-web"),
             Principal(name="admin", scopes=["**"], token="tok-admin"),
