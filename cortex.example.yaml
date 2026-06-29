@@ -8,7 +8,7 @@
 # local-only vault, git audit on, LLM disabled (deterministic tools only).
 
 vault:
-  # Path to your note vault (relative paths resolve against this file's dir).
+  # Path to your Obsidian vault (relative paths resolve against this file's dir).
   path: ./vault
   git:
     enabled: true              # git audit trail + rollback

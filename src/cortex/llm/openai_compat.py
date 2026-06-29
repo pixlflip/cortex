@@ -59,8 +59,12 @@ class OpenAICompatProvider:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:500]
-            raise LLMError(f"LLM request failed ({exc.code}): {detail}") from exc
+            raw_detail = exc.read()
+            if isinstance(raw_detail, bytes):
+                detail = raw_detail.decode("utf-8", "replace")
+            else:
+                detail = str(raw_detail)
+            raise LLMError(f"LLM request failed ({exc.code}): {detail[:500]}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(f"LLM request failed: {exc.reason}") from exc
 

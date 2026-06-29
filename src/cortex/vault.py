@@ -1,7 +1,8 @@
-"""Vault Store — deterministic filesystem primitives over a note vault.
+"""Vault Store — deterministic filesystem primitives over an Obsidian vault.
 
-The vault is a local folder of Markdown/plain-text notes. Every operation here
-is deterministic and cheap: no network, no model. Notes are addressed by their
+The vault is a local Obsidian vault: Markdown notes with optional YAML
+frontmatter, folders, links, and human editability. Every operation here is
+deterministic and cheap: no network, no model. Notes are addressed by their
 **relative POSIX path** from the vault root (e.g. ``Projects/Cortex/README.md``)
 which is also how scopes are expressed.
 
@@ -20,8 +21,8 @@ import yaml
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?(.*)\Z", re.DOTALL)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
-# File extensions treated as readable notes.
-NOTE_SUFFIXES = {".md", ".markdown", ".txt"}
+# File extensions treated as readable Obsidian notes.
+NOTE_SUFFIXES = {".md", ".markdown"}
 
 
 class VaultError(Exception):

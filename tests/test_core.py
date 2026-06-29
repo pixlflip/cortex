@@ -25,6 +25,7 @@ def vault(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (root / "Public" / "open.md").write_text("# Open\n\npublic content\n", encoding="utf-8")
+    (root / "Public" / "scratch.txt").write_text("not an Obsidian note\n", encoding="utf-8")
     (root / ".obsidian").mkdir()
     (root / ".obsidian" / "workspace.json").write_text("{}", encoding="utf-8")
     return root
@@ -56,6 +57,7 @@ def test_list_notes_skips_hidden_dirs(vault: Path):
     notes = store.list_notes()
     assert "Welcome/hello.md" in notes
     assert "Public/open.md" in notes
+    assert "Public/scratch.txt" not in notes
     assert not any(".obsidian" in n for n in notes)
 
 

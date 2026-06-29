@@ -1,12 +1,12 @@
 [project]
 name = "cortex-memory"
 version = "0.1.0"
-description = "A dynamic, governed memory layer for note vaults, served over MCP."
+description = "A governed Obsidian-vault memory layer for AI agents, served over MCP."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Cortex contributors" }]
-keywords = ["mcp", "memory", "vault", "obsidian", "knowledge", "ai"]
+keywords = ["mcp", "memory", "vault", "obsidian", "agents", "chatbots", "ai"]
 
 dependencies = [
     "mcp>=1.2.0",

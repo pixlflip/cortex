@@ -2,12 +2,15 @@
 
 > Every mind needs a memory that is dynamic, not stationary.
 
-Cortex is a **dynamic memory layer** you can put in front of any knowledge
-vault (a folder of Markdown/plain-text notes) and expose to AI clients and
-humans through a secure [Model Context Protocol](https://modelcontextprotocol.io)
-(MCP) server. It is designed so that **anyone can spin one up** — locally with
-Docker, on a server, or on a homelab — and point their AI tools at their own
-memory without handing the whole vault to every caller.
+Cortex is a **dynamic memory layer for AI agents, assistants, and chatbots**
+backed by a real **Obsidian vault**. The vault is not an interchangeable blob of
+documents; it is the product's memory substrate: Obsidian-compatible Markdown,
+YAML frontmatter, folders, links, and direct human editability. Cortex exposes
+that vault to AI clients and humans through a secure
+[Model Context Protocol](https://modelcontextprotocol.io) (MCP) server. It is
+designed so that **anyone can spin one up** — locally with Docker, on a server,
+or on a homelab — and point their AI tools at their own memory without handing
+the whole vault to every caller.
 
 This document is the canonical design. It is intentionally
 infrastructure-agnostic: no IP addresses, no hostnames, no secrets. Everything
@@ -17,13 +20,14 @@ environment-specific is a config value with a sane default.
 
 ## 1. The problem
 
-People accumulate knowledge in note vaults (Obsidian, Logseq, plain Markdown,
-a wiki). That knowledge is *stationary*: it sits in files, and every tool that
-wants it either gets raw filesystem access (no scoping, no audit, no safety) or
-nothing at all. AI assistants in particular need **scoped, structured,
-auditable** retrieval — not "here's my entire life, please don't mess it up."
+People accumulate knowledge in Obsidian vaults. That knowledge is *stationary*:
+it sits in human-readable Markdown files, and every tool that wants it either
+gets raw filesystem access (no scoping, no audit, no safety) or nothing at all.
+AI assistants in particular need **scoped, structured, auditable** retrieval —
+not "here's my entire life, please don't mess it up."
 
-Cortex turns a stationary vault into a **governed, self-improving memory**:
+Cortex turns a stationary Obsidian vault into a **governed, self-improving
+memory**:
 
 - **Fast, deterministic retrieval** for machines (search, read, context packs).
 - **A single audit trail** so every change is attributable and reversible.
@@ -82,10 +86,11 @@ maintenance mind stays bounded and observable. They never blur.
 
 ### 3.1 Vault Store
 
-- The vault is a **local folder** of notes. All reads/writes go through the
+- The vault is a **local Obsidian vault**. All reads/writes go through the
   filesystem — never a remote call in the request path.
-- Notes are Markdown with optional YAML frontmatter (Obsidian-compatible, but
-  not Obsidian-specific).
+- Notes are Obsidian-compatible Markdown with optional YAML frontmatter. Cortex
+  treats Obsidian vault semantics as the memory format, not as one example among
+  many.
 - The store exposes primitives: list notes, read a note, read its frontmatter,
   read a named section (by heading), and substring/regex search.
 
@@ -107,7 +112,7 @@ own sync if you want one. Everything else is opt-in.
 
 | Adapter | Source of truth | Use case |
 |---|---|---|
-| `none` *(default)* | the local folder | Single-box; bring-your-own-sync |
+| `none` *(default)* | the local Obsidian vault | Single-box; bring-your-own-sync |
 | `git` | a git remote | Portable; the remote *is* both sync and audit |
 | `nextcloud` | Nextcloud/WebDAV | Obsidian-over-Nextcloud users (the original setup) |
 | `s3` | object storage | Cloud-first, large vaults |
@@ -228,7 +233,7 @@ last, behind its boundaries.
 ## 6. Non-goals (v1)
 
 - Not a sync tool itself — it *uses* a sync adapter; it doesn't reinvent one.
-- Not an editor/UI — humans keep using Obsidian/their editor of choice.
+- Not an editor/UI — humans keep using Obsidian/their Obsidian-compatible editor of choice.
 - Not a general database — it's a memory layer over files, with git as truth.
 - Not autonomous on day one — the Janitor stays dark until boundaries are spec'd
   and proven in dry-run.

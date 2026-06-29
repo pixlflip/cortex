@@ -38,7 +38,7 @@ runuser -u cortex -- bash -lc '
   cd /srv/cortex/app
   cp cortex.example.yaml /srv/cortex/cortex.yaml
 '
-# Edit /srv/cortex/cortex.yaml: set vault.path to your notes folder,
+# Edit /srv/cortex/cortex.yaml: set vault.path to your Obsidian vault,
 # define principals/scopes, choose an llm provider if you want semantic search.
 ```
 
