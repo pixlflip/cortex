@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+import yaml
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import (
@@ -37,7 +38,31 @@ from .gitlog import GitAudit
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .search_index import IndexHit, SearchIndex
-from .vault import VaultError, VaultStore
+from .vault import VaultError, VaultStore, _FRONTMATTER_RE
+
+
+def _validate_frontmatter_block(content: str, path: str) -> None:
+    """Reject content whose leading ``---`` frontmatter block fails to parse as
+    YAML, or parses to something other than a mapping.
+
+    ``vault.split_frontmatter`` is deliberately lenient (malformed frontmatter
+    falls back to treating the whole document as body, rather than raising) —
+    that's the right behavior for *reading* an existing note someone else may
+    have hand-edited. But ``write_note`` is creating/replacing content fresh,
+    so it can afford to be strict and catch a mistake before it lands. Reuses
+    the exact frontmatter-block regex from vault.py so "is this a frontmatter
+    block" is decided identically in both places.
+    """
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
+        return  # no leading --- block at all; nothing to validate
+    raw_fm = match.group(1)
+    try:
+        data = yaml.safe_load(raw_fm)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"malformed frontmatter in {path}: {exc}") from exc
+    if data is not None and not isinstance(data, dict):
+        raise ValueError(f"malformed frontmatter in {path}: must be a mapping")
 
 
 class CortexTokenVerifier(TokenVerifier):
@@ -168,6 +193,29 @@ class CortexServer:
             # Do not distinguish "absent" from "out of scope".
             raise ValueError(f"note not found or not in scope: {path}")
 
+    @staticmethod
+    def _require_writable(principal: Principal, path: str) -> None:
+        """A principal may mutate ``path`` iff it's in ``write_scopes`` —
+        falling back to its read ``scopes`` when ``write_scopes`` is unset, so
+        writes work immediately with no extra config. Setting ``write_scopes``
+        narrows the writable area independent of what's readable; this is the
+        hook for per-principal write permissioning, deferred for now."""
+        scopes = principal.write_scopes or principal.scopes
+        if not path_allowed(path, scopes):
+            # Same non-leaking wording as _require_visible: don't distinguish
+            # "absent" from "not in scope".
+            raise ValueError(f"not found or not in scope: {path}")
+
+    def _commit_and_reindex(self, principal: Principal, reason: str, path: str) -> str | None:
+        """Commit the single mutated path under a consistent actor convention,
+        then refresh the search index so subsequent reads see the change.
+        Returns the commit sha, or None if nothing actually changed on disk
+        (e.g. a write that reproduced the existing content byte-for-byte)."""
+        actor = f"principal:{principal.name} via mcp"
+        sha = self.git.commit(actor=actor, reason=reason, paths=[path])
+        self.index.ensure_fresh()
+        return sha
+
     def _gather_context(
         self, principal: Principal, query: str, max_notes: int, budget_chars: int
     ) -> tuple[list[str], str]:
@@ -224,6 +272,88 @@ class CortexServer:
             used += len(header) + len(body)
             used_paths.append(rel)
         return used_paths, "".join(chunks)
+
+    # -- write orchestration -------------------------------------------------
+    #
+    # These private methods hold the actual mutation logic so it's directly
+    # unit-testable without going through the MCP tool-call machinery; the
+    # `@mcp.tool()` closures registered below are thin wrappers that resolve
+    # the principal and delegate here. Every one of them: checks write scope,
+    # performs exactly one VaultStore mutation, commits it (actor + reason)
+    # via GitAudit, and refreshes the search index.
+
+    def _do_write_note(
+        self,
+        principal: Principal,
+        path: str,
+        content: str,
+        reason: str,
+        *,
+        overwrite: bool = False,
+        validate_frontmatter: bool = True,
+    ) -> dict:
+        self._require_writable(principal, path)
+        if validate_frontmatter:
+            _validate_frontmatter_block(content, path)
+        exists = self.vault.exists(path)
+        if exists and not overwrite:
+            raise ValueError(f"note already exists (pass overwrite=True to replace): {path}")
+        self.vault.write_text(path, content)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "created": not exists, "commit": sha}
+
+    def _do_patch_note(
+        self, principal: Principal, path: str, old_string: str, new_string: str, reason: str
+    ) -> dict:
+        self._require_writable(principal, path)
+        try:
+            text = self.vault.read_text(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        count = text.count(old_string)
+        if count == 0:
+            raise ValueError(f"not found in {path}: {old_string!r}")
+        if count > 1:
+            raise ValueError(f"ambiguous: {count} matches in {path}")
+        new_text = text.replace(old_string, new_string, 1)
+        self.vault.write_text(path, new_text)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "commit": sha}
+
+    def _do_append_note(
+        self, principal: Principal, path: str, text: str, reason: str, *, separator: str = "\n\n"
+    ) -> dict:
+        self._require_writable(principal, path)
+        try:
+            self.vault.append(path, text, separator=separator)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "commit": sha}
+
+    def _do_update_frontmatter(
+        self, principal: Principal, path: str, patch: dict, reason: str
+    ) -> dict:
+        self._require_writable(principal, path)
+        if not isinstance(patch, dict):
+            raise ValueError("patch must be a mapping")
+        try:
+            note = self.vault.read_note(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        note.frontmatter.update(patch)
+        self.vault.write_text(path, note.raw)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "frontmatter": note.frontmatter, "commit": sha}
+
+    def _do_delete_note(self, principal: Principal, path: str, reason: str) -> dict:
+        self._require_writable(principal, path)
+        try:
+            self.vault.delete_note(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "deleted": True, "commit": sha}
 
     # -- tools -------------------------------------------------------------
 
@@ -356,6 +486,80 @@ class CortexServer:
                 raise ValueError(f"semantic_search failed: {exc}") from exc
             footer = f"\n\n— synthesized by {result.model} from: {', '.join(used)}"
             return result.text.rstrip() + footer
+
+        # -- mutating tools --------------------------------------------------
+        #
+        # Registered ONLY when config.writes.enabled is true (default false).
+        # This is the single global switch: an operator who never sets
+        # `writes.enabled: true` in their cortex.yaml gets a server with no
+        # mutating tools in its MCP registry at all — not just tools that
+        # refuse at call time. Every tool here requires `reason: str` (no
+        # default), is scope-checked via `_require_writable`, and on success
+        # produces exactly one git commit (so it's always `git revert`-able)
+        # before the search index is refreshed. All real logic lives in the
+        # `_do_*` methods above so it's unit-testable without MCP plumbing.
+        if self.config.writes.enabled:
+
+            @mcp.tool()
+            def write_note(
+                path: str,
+                content: str,
+                reason: str,
+                overwrite: bool = False,
+                validate_frontmatter: bool = True,
+            ) -> dict:
+                """Create a new note, or replace an existing one if
+                overwrite=True. Refuses to clobber an existing note unless
+                overwrite is set. By default validates that any leading YAML
+                frontmatter block parses to a mapping (rejects malformed
+                frontmatter) — pass validate_frontmatter=False to skip.
+                Write-scope-checked. Commits to git (revertible) and refreshes
+                the search index. `reason` is required for the audit trail."""
+                p = self._get_principal()
+                return self._do_write_note(
+                    p, path, content, reason,
+                    overwrite=overwrite, validate_frontmatter=validate_frontmatter,
+                )
+
+            @mcp.tool()
+            def patch_note(path: str, old_string: str, new_string: str, reason: str) -> dict:
+                """Replace a single unique occurrence of old_string with
+                new_string in an existing note. Refuses if old_string isn't
+                found, or if it matches more than once (ambiguous — narrow the
+                string first). Write-scope-checked. Commits to git and
+                refreshes the search index."""
+                p = self._get_principal()
+                return self._do_patch_note(p, path, old_string, new_string, reason)
+
+            @mcp.tool()
+            def append_note(path: str, text: str, reason: str, separator: str = "\n\n") -> dict:
+                """Append text to the end of an existing note, joined by
+                separator (default a blank line). Requires the note to
+                already exist (use write_note to create one). Write-scope-
+                checked. Commits to git and refreshes the search index."""
+                p = self._get_principal()
+                return self._do_append_note(p, path, text, reason, separator=separator)
+
+            @mcp.tool()
+            def update_frontmatter(path: str, patch: dict, reason: str) -> dict:
+                """Merge patch into an existing note's YAML frontmatter,
+                leaving the body untouched. patch must be a mapping; keys in
+                patch overwrite existing frontmatter keys, other existing keys
+                are preserved. Write-scope-checked. Commits to git and
+                refreshes the search index."""
+                p = self._get_principal()
+                return self._do_update_frontmatter(p, path, patch, reason)
+
+            @mcp.tool()
+            def delete_note(path: str, reason: str) -> dict:
+                """Delete a single existing note file. Only ever operates on
+                exactly one existing file — no directory deletes, no globs.
+                Write-scope-checked. The delete itself is committed to git, so
+                the note's last content is always recoverable (e.g. `git show
+                HEAD~1:<path>`, or `git revert` the commit) even after
+                deletion. Refreshes the search index."""
+                p = self._get_principal()
+                return self._do_delete_note(p, path, reason)
 
     # -- run ---------------------------------------------------------------
 

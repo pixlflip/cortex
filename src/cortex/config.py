@@ -81,6 +81,11 @@ class Principal:
     token_env: str | None = None
     # Resolved token value (populated at load; never written back to disk).
     token: str | None = None
+    # Scopes a principal may *mutate* (write/delete). Empty/unset => falls back
+    # to `scopes` (read scopes), so writes work immediately with no extra
+    # config. Set this to narrow the writable area independent of what's
+    # readable — the hook for per-principal write permissioning later.
+    write_scopes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -146,6 +151,17 @@ class JanitorConfig:
 
 
 @dataclass
+class WritesConfig:
+    # Single global switch for the mutating MCP tools (write_note, patch_note,
+    # append_note, update_frontmatter, delete_note). Default false: Cortex is a
+    # public "anyone can spin one up" project, so destructive-by-default would
+    # be a footgun. Flip on in your own cortex.yaml once you're ready — every
+    # mutation is still a single git commit (via GitAudit), so it's always
+    # revertible with ordinary `git revert`.
+    enabled: bool = False
+
+
+@dataclass
 class CortexConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
@@ -156,6 +172,7 @@ class CortexConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     janitor: JanitorConfig = field(default_factory=JanitorConfig)
+    writes: WritesConfig = field(default_factory=WritesConfig)
 
     def principal(self, name: str) -> Principal | None:
         for p in self.principals:
@@ -205,6 +222,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
                 scopes=list(p_raw.get("scopes", []) or []),
                 token_env=token_env,
                 token=token,
+                write_scopes=list(p_raw.get("write_scopes", []) or []),
             )
         )
 
@@ -267,6 +285,11 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         forbidden_paths=list(jan_raw.get("forbidden_paths", []) or []),
     )
 
+    writes_raw = raw.get("writes", {}) or {}
+    writes = WritesConfig(
+        enabled=writes_raw.get("enabled", False),
+    )
+
     cfg = CortexConfig(
         vault=vault,
         sync=sync,
@@ -277,6 +300,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         server=server,
         llm=llm,
         janitor=janitor,
+        writes=writes,
     )
     _validate(cfg)
     return cfg
