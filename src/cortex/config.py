@@ -322,6 +322,13 @@ def _validate(cfg: CortexConfig) -> None:
         raise ConfigError("auth.oauth_enabled requires server.transport: http")
     if cfg.server.transport not in ("stdio", "http"):
         raise ConfigError(f"unknown server.transport '{cfg.server.transport}'")
+    if cfg.writes.enabled and not cfg.vault.git.enabled:
+        raise ConfigError(
+            "writes.enabled requires vault.git.enabled: every mutation must be a "
+            "git commit (the audit trail and the only rollback mechanism), so "
+            "enabling writes without git audit — which would allow unaudited, "
+            "unrecoverable changes — is not permitted."
+        )
 
 
 def load_config(path: str | os.PathLike[str]) -> CortexConfig:

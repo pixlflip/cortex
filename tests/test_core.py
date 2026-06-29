@@ -240,3 +240,19 @@ def test_writes_enabled_and_write_scopes_parsed_from_yaml(tmp_path: Path):
     # write_scopes omitted in YAML => defaults to empty list (caller falls
     # back to read `scopes`; see CortexServer._require_writable).
     assert cfg.principal("fallback").write_scopes == []
+
+
+def test_writes_require_git_audit(tmp_path: Path):
+    # Enabling writes without git audit would allow unaudited, unrecoverable
+    # mutations — the safety model rests on every write being a git commit.
+    (tmp_path / "vault").mkdir()
+    cfg_file = tmp_path / "cortex.yaml"
+    cfg_file.write_text(
+        "vault:\n  path: ./vault\n  git:\n    enabled: false\n"
+        "writes:\n  enabled: true\n"
+        "auth:\n  local_principal: local\n"
+        "principals:\n  - name: local\n    scopes: ['**']\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_config(cfg_file)
