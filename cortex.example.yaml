@@ -57,6 +57,22 @@ admin:
   # Keep this local and out of git; the generated admin password is shown once.
   path: ./cortex.admin.json
 
+index:
+  # SQLite FTS5/BM25 ranked search over the vault, used by `search`,
+  # `context_pack`, and `semantic_search`. Built/refreshed by `cortex index`
+  # and `cortex sync`, and lazily kept fresh on each query. Falls back to
+  # plain substring search transparently if FTS5 isn't available locally.
+  enabled: true
+  # A rebuildable cache derived from the vault — never commit this; keep it
+  # out of git (gitignored by default). Relative paths resolve next to this
+  # file. Delete it any time; the next `cortex index`/`cortex sync` rebuilds it.
+  path: ./cortex.index.sqlite
+  # Target size (characters) for each indexed chunk, and how much trailing
+  # context (characters) carries forward across a chunk boundary so a
+  # relevant phrase is never severed mid-sentence.
+  chunk_chars: 1500
+  overlap: 150
+
 server:
   transport: stdio             # stdio (local) | http (remote, Streamable HTTP)
   host: 127.0.0.1

@@ -39,6 +39,11 @@ docker compose run --rm cortex check        # validate setup
 docker compose run --rm cortex init         # create the git audit baseline
 ```
 
+Run `cortex sync` any time (or on a schedule — see
+[`docs/bare-metal.md`](docs/bare-metal.md)) to snapshot pending human edits
+into the git audit trail and refresh the search index, so the `status` tool's
+freshness numbers stay current.
+
 ### Bare metal (Debian / Proxmox / laptop)
 
 ```bash
@@ -62,6 +67,7 @@ For a stdio client (e.g. Claude Desktop), register Cortex as a server that runs
 | Tool | What it does |
 |---|---|
 | `discover_scopes` | What can I (this principal) see? |
+| `status` | Freshness signal: git HEAD/commit time, last index refresh, visible note count |
 | `list_notes` | List visible note paths |
 | `search` | Substring/regex search over visible notes |
 | `read_note` | Read a full note (scope-checked) |

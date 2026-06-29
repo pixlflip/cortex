@@ -206,6 +206,25 @@ class CortexServer:
             # "absent" from "not in scope".
             raise ValueError(f"not found or not in scope: {path}")
 
+    def _status_payload(self, principal: Principal) -> dict:
+        """Deterministic freshness/visibility snapshot for ``principal``, the
+        payload behind the ``status`` MCP tool. Lets a caller judge whether
+        what it's about to read is current — e.g. before trusting a
+        ``search``/``context_pack`` result — without spending a model call.
+        ``head_commit``/``last_commit_iso`` are None when the vault isn't (or
+        isn't yet) a git repo; ``index_note_count``/``last_indexed_iso`` are 0
+        / None when the search index is disabled."""
+        visible = filter_paths(self.vault.list_notes(), principal.scopes)
+        stats = self.index.stats()
+        return {
+            "principal": principal.name,
+            "visible_note_count": len(visible),
+            "head_commit": self.git.head(),
+            "last_commit_iso": self.git.head_time(),
+            "last_indexed_iso": stats["last_indexed"],
+            "index_note_count": stats["note_count"],
+        }
+
     def _commit_and_reindex(self, principal: Principal, reason: str, path: str) -> str | None:
         """Commit the single mutated path under a consistent actor convention,
         then refresh the search index so subsequent reads see the change.
@@ -371,6 +390,20 @@ class CortexServer:
                 "scopes": p.scopes,
                 "visible_note_count": len(visible),
             }
+
+        @mcp.tool()
+        def status() -> dict:
+            """Deterministic freshness/visibility signal — no model spend.
+            Lets a caller judge whether what it's about to read is current:
+            ``head_commit``/``last_commit_iso`` are the git audit trail's HEAD
+            and its committer date (None if the vault isn't a git repo yet);
+            ``last_indexed_iso``/``index_note_count`` describe the search
+            index's last refresh; ``visible_note_count`` is this principal's
+            current visible note count. Call this before trusting a stale-
+            looking ``search``/``context_pack`` result, or to confirm a
+            periodic ``cortex sync`` actually ran recently."""
+            p = self._get_principal()
+            return self._status_payload(p)
 
         @mcp.tool()
         def list_notes() -> list[str]:

@@ -1,0 +1,14 @@
+# Drives deploy/cortex-sync.service on a cadence. Copy to
+# /etc/systemd/system/cortex-sync.timer alongside cortex-sync.service. See
+# docs/bare-metal.md.
+
+[Unit]
+Description=Run cortex sync periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
