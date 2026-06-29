@@ -94,6 +94,12 @@ class AuthConfig:
     # http is a bearer-only resource server.
     oauth_enabled: bool = False
 
+@dataclass
+class AdminConfig:
+    enabled: bool = True
+    # Local JSON state containing the generated admin password hash, roles, and
+    # hashed AI-client tokens. Relative paths resolve next to cortex.yaml.
+    path: Path = Path("./cortex.admin.json")
 
 @dataclass
 class ServerConfig:
@@ -135,6 +141,7 @@ class CortexConfig:
     sync: SyncConfig = field(default_factory=SyncConfig)
     principals: list[Principal] = field(default_factory=list)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    admin: AdminConfig = field(default_factory=AdminConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     janitor: JanitorConfig = field(default_factory=JanitorConfig)
@@ -197,6 +204,15 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         oauth_enabled=auth_raw.get("oauth_enabled", False),
     )
 
+    admin_raw = raw.get("admin", {}) or {}
+    admin_path = Path(admin_raw.get("path", "./cortex.admin.json"))
+    if not admin_path.is_absolute():
+        admin_path = (base_dir / admin_path).resolve()
+    admin = AdminConfig(
+        enabled=admin_raw.get("enabled", True),
+        path=admin_path,
+    )
+
     server_raw = raw.get("server", {}) or {}
     server = ServerConfig(
         transport=server_raw.get("transport", "stdio"),
@@ -234,6 +250,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         sync=sync,
         principals=principals,
         auth=auth,
+        admin=admin,
         server=server,
         llm=llm,
         janitor=janitor,
@@ -249,9 +266,9 @@ def _validate(cfg: CortexConfig) -> None:
         )
     if cfg.server.transport == "http" and not cfg.auth.enabled:
         raise ConfigError("auth must be enabled for http transport (no public exposure unmapped)")
-    if cfg.server.transport == "http" and not any(p.token for p in cfg.principals):
+    if cfg.server.transport == "http" and not any(p.token for p in cfg.principals) and not cfg.admin.enabled:
         raise ConfigError(
-            "http transport requires at least one principal with a token_env; "
+            "http transport requires at least one principal with a token_env or admin.enabled; "
             "otherwise no client can authenticate."
         )
     if cfg.auth.oauth_enabled and cfg.server.transport != "http":

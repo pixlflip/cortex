@@ -19,6 +19,7 @@ import os
 import sys
 
 from . import __version__
+from .admin import AdminStore
 from .config import ConfigError, load_config
 from .gitlog import GitAudit
 from .vault import VaultStore
@@ -45,6 +46,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"  git audit:    {'on' if cfg.vault.git.enabled else 'off'}")
     print(f"  sync adapter: {cfg.sync.adapter}")
     print(f"  transport:    {cfg.server.transport}")
+    print(f"  admin UI:     {'enabled' if cfg.admin.enabled else 'off'}"
+          f" ({cfg.admin.path})" if cfg.admin.enabled else "")
     print(f"  llm provider: {cfg.llm.provider or 'none'} ({cfg.llm.model or '-'})")
     print(f"  janitor:      {'enabled' if cfg.janitor.enabled else 'dark'}"
           f"{' (dry-run)' if cfg.janitor.enabled and cfg.janitor.dry_run else ''}")
@@ -67,6 +70,15 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"bootstrap snapshot committed: {sha[:10]}")
     else:
         print("nothing to commit (vault already snapshotted / empty)")
+    if cfg.admin.enabled:
+        password = AdminStore(cfg.admin.path).ensure_initialized()
+        if password:
+            print(f"admin UI initialized at {cfg.admin.path}")
+            print(f"admin username: admin")
+            print(f"admin password: {password}")
+            print("save this password now; Cortex stores only its hash.")
+        else:
+            print(f"admin UI already initialized at {cfg.admin.path}")
     return 0
 
 
