@@ -35,7 +35,23 @@ Each request must send `Authorization: Bearer <token>`. The token maps to its
 principal; the principal's scopes are enforced on every tool call. An unknown or
 missing token gets `401`.
 
-## 2. Put TLS in front (reverse proxy)
+## 2. Admin UI
+
+Run `cortex init` once before exposing HTTP. It initializes the git audit
+baseline and creates the admin UI state file with a generated password:
+
+```bash
+cortex init
+# admin username: admin
+# admin password: <shown once>
+```
+
+When `admin.enabled: true`, HTTP deployments expose `/admin`. Sign in there to
+create roles (scope lists like `Projects/Alpha/**`) and AI clients. Each AI
+client gets its own bearer token and resolves to its own principal, so clients
+can be individually scoped without editing `cortex.yaml` for every connector.
+
+## 3. Put TLS in front (reverse proxy)
 
 Cortex speaks plain HTTP and expects a proxy to terminate TLS. Example (Caddy):
 
@@ -51,7 +67,7 @@ nginx is equivalent — proxy `https://cortex.example.com/mcp` →
 `allowed_origins`/`allowed_hosts` empty; for direct exposure, set them so
 DNS-rebinding protection is enabled.
 
-## 3. Two auth modes
+## 4. Two auth modes
 
 Cortex supports both, on the same Streamable HTTP transport. Pick by who needs
 to connect.
@@ -99,7 +115,7 @@ you want that connector to have.
 > planned enhancement. Principal tokens should be high-entropy
 > (`openssl rand -hex 32`) — at the consent step they are the login credential.
 
-## 4. Verify
+## 5. Verify
 
 ```bash
 # 401 without a token:

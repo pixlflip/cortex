@@ -96,6 +96,7 @@ def test_http_requires_token_bearing_principal(tmp_path: Path, monkeypatch):
     cfg_file.write_text(
         "vault:\n  path: ./vault\n"
         "server:\n  transport: http\n"
+        "admin:\n  enabled: false\n"
         "principals:\n  - name: web\n    scopes: ['**']\n",  # no token_env
         encoding="utf-8",
     )

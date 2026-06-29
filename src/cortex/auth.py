@@ -27,8 +27,9 @@ class AuthError(Exception):
 
 
 class Authenticator:
-    def __init__(self, config: CortexConfig):
+    def __init__(self, config: CortexConfig, admin_store=None):
         self.config = config
+        self.admin_store = admin_store
         # Index principals by their (resolved) token for HTTP lookups.
         self._by_token: dict[str, Principal] = {
             p.token: p for p in config.principals if p.token
@@ -52,5 +53,9 @@ class Authenticator:
             raise AuthError("missing bearer token")
         for candidate_token, principal in self._by_token.items():
             if hmac.compare_digest(candidate_token, token):
+                return principal
+        if self.admin_store is not None:
+            principal = self.admin_store.principal_for_token(token)
+            if principal is not None:
                 return principal
         raise AuthError("invalid bearer token")

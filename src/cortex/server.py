@@ -30,6 +30,7 @@ from mcp.server.auth.settings import (
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from .admin import ADMIN_PATH, AdminStore, AdminUI
 from .auth import Authenticator, AuthError
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
@@ -90,9 +91,11 @@ class CortexServer:
         principal: Principal | None = None,
         *,
         http: HttpServe | None = None,
+        admin_store: AdminStore | None = None,
     ):
         self.config = config
         self.principal = principal  # None => resolve per-request (HTTP)
+        self.admin_store = admin_store or (AdminStore(config.admin.path) if config.admin.enabled else None)
         self.vault = VaultStore(config.vault.path)
         self.git = GitAudit(config.vault.path, config.vault.git)
         # None when llm.provider is "none"; raises at startup on misconfig.
@@ -123,6 +126,13 @@ class CortexServer:
             mcp.custom_route(LOGIN_PATH, methods=["GET", "POST"])(
                 http.oauth_provider.handle_consent
             )
+        if http is not None and self.admin_store is not None:
+            admin_ui = AdminUI(self.admin_store, self.config.server.public_url or f"http://{http.host}:{http.port}")
+            mcp.custom_route(ADMIN_PATH, methods=["GET", "POST"])(admin_ui.handle)
+            mcp.custom_route(f"{ADMIN_PATH}/login", methods=["POST"])(admin_ui.handle)
+            mcp.custom_route(f"{ADMIN_PATH}/logout", methods=["POST"])(admin_ui.handle)
+            mcp.custom_route(f"{ADMIN_PATH}/roles", methods=["POST"])(admin_ui.handle)
+            mcp.custom_route(f"{ADMIN_PATH}/clients", methods=["POST"])(admin_ui.handle)
         return mcp
 
     # -- principal resolution ---------------------------------------------
@@ -136,6 +146,8 @@ class CortexServer:
         if token is None:
             raise ValueError("unauthenticated")
         principal = self.config.principal(token.subject or "")
+        if principal is None and self.admin_store is not None:
+            principal = self.admin_store.principal_by_name(token.subject or "")
         if principal is None:
             raise ValueError("unknown principal")
         return principal
@@ -323,7 +335,7 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     """
     sc = config.server
     base = sc.public_url or f"http://{sc.host}:{sc.port}"
-    authn = Authenticator(config)
+    authn = Authenticator(config, admin_store=AdminStore(config.admin.path) if config.admin.enabled else None)
     restrict = bool(sc.allowed_hosts or sc.allowed_origins)
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=restrict,

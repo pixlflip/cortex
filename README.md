@@ -81,7 +81,9 @@ runs locally with no API key and the LLM disabled (deterministic tools only).
 Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 
 - `vault.path` — your Obsidian vault folder.
-- `principals` — identities, their `scopes` (path globs), and `token_env`.
+- `principals` — static identities, their `scopes` (path globs), and `token_env`.
+- `admin` — optional web UI state path. `cortex init` generates the admin
+  password; the UI creates roles and per-client tokens for scoped AI clients.
 - `sync.adapter` — `none` (default, local-only) · `git` · `nextcloud` · `s3`.
 - `llm.provider` — `none` (default) · `openrouter` · `openai` · `anthropic` ·
   `ollama`. OpenRouter (one key, many models; defaulting to the latest Claude
@@ -107,6 +109,9 @@ This repo is built in dependency order (see the build sequence in
   sees notes the principal may read)
 - ✅ Remote **Streamable HTTP** transport with bearer-token → principal auth,
   per-request scoping, and Host/Origin protection (TLS via reverse proxy).
+- ✅ Admin web UI for HTTP deployments — `cortex init` generates an admin
+  password, then the UI can create roles and per-client tokens for scoped AI
+  clients.
 - ✅ **OAuth 2.1** authorization server (dynamic client registration + PKCE +
   consent) so the one-click **Claude.ai / ChatGPT / Grok** connector UIs can
   authorize. See [`docs/http-exposure.md`](docs/http-exposure.md).

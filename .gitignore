@@ -11,6 +11,7 @@ venv/
 
 # Local config & secrets (never commit these)
 cortex.yaml
+cortex.admin.json
 .env
 *.netrc
 
