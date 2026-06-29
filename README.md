@@ -2,11 +2,14 @@
 
 > Every mind needs a memory that is dynamic, not stationary.
 
-Cortex is a **dynamic, governed memory layer** for your notes. Point it at a
-folder of Markdown (Obsidian, Logseq, plain text — anything) and it serves that
-knowledge to AI clients and humans through a secure
-[Model Context Protocol](https://modelcontextprotocol.io) (MCP) server:
+Cortex is a **dynamic, governed memory layer for AI agents, assistants, and
+chatbots**, backed by a real **Obsidian vault**. Humans keep using ordinary
+Obsidian-compatible Markdown files; AI clients access that same memory only
+through a secure [Model Context Protocol](https://modelcontextprotocol.io)
+(MCP) server:
 
+- **Obsidian-native** — the source of truth is a normal Obsidian vault: Markdown
+  notes, YAML frontmatter, folders, links, and your editor of choice.
 - **Scoped** — each caller (principal) sees only the slice you grant; a path
   out of scope is *invisible*, not just unreadable.
 - **Audited** — every change is a git commit tagged with *actor* and *reason*.
@@ -17,7 +20,8 @@ knowledge to AI clients and humans through a secure
   watches the vault on a heartbeat, never able to edit its own limits.
 
 Anyone can spin one up — locally, in Docker, or on a homelab — and keep their
-memory *theirs* while still letting AI tools retrieve from it safely.
+memory *theirs*: a fully working Obsidian vault for humans, a governed memory
+API for agents.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
 
@@ -30,7 +34,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
 ```bash
 git clone https://github.com/pixlflip/cortex.git && cd cortex
 cp cortex.example.yaml cortex.yaml          # edit to taste
-# put your notes in ./vault (or point vault.path elsewhere)
+# put your Obsidian vault in ./vault (or point vault.path at one)
 docker compose run --rm cortex check        # validate setup
 docker compose run --rm cortex init         # create the git audit baseline
 ```
@@ -76,7 +80,7 @@ runs locally with no API key and the LLM disabled (deterministic tools only).
 
 Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 
-- `vault.path` — your notes folder.
+- `vault.path` — your Obsidian vault folder.
 - `principals` — identities, their `scopes` (path globs), and `token_env`.
 - `sync.adapter` — `none` (default, local-only) · `git` · `nextcloud` · `s3`.
 - `llm.provider` — `none` (default) · `openrouter` · `openai` · `anthropic` ·
@@ -92,7 +96,7 @@ This repo is built in dependency order (see the build sequence in
 [`ARCHITECTURE.md`](ARCHITECTURE.md)). **Working today:**
 
 - ✅ Config system (public-safe, env-injected secrets)
-- ✅ Vault store (list / read / frontmatter / section / search) with
+- ✅ Obsidian vault store (list / read / frontmatter / section / search) with
   path-traversal safety
 - ✅ Git audit layer (commit-on-mutation with actor + reason)
 - ✅ Scoping + auth (token → principal → scopes; directory-bounded globs)
