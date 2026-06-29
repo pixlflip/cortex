@@ -27,6 +27,13 @@ principals:
   - name: local
     scopes: ["**"]             # everything; tighten per principal as needed
     # token_env: CORTEX_TOKEN_LOCAL   # required only for http transport
+    # write_scopes narrows where this principal may *mutate* (write_note,
+    # patch_note, append_note, update_frontmatter, delete_note), independent
+    # of what it can read. Only relevant when writes.enabled: true below.
+    # Unset (the default) => writes fall back to this principal's read
+    # `scopes` above, so writes work immediately with no extra config.
+    # Set it to narrow the writable area further than what's readable, e.g.:
+    # write_scopes: ["Inbox/**", "Daily/**"]
 
   # Example of a scoped remote agent (uncomment + set the env var to use):
   # - name: web-assistant
@@ -49,6 +56,22 @@ admin:
   # Created by `cortex init`. Contains only password/token hashes plus roles.
   # Keep this local and out of git; the generated admin password is shown once.
   path: ./cortex.admin.json
+
+index:
+  # SQLite FTS5/BM25 ranked search over the vault, used by `search`,
+  # `context_pack`, and `semantic_search`. Built/refreshed by `cortex index`
+  # and `cortex sync`, and lazily kept fresh on each query. Falls back to
+  # plain substring search transparently if FTS5 isn't available locally.
+  enabled: true
+  # A rebuildable cache derived from the vault — never commit this; keep it
+  # out of git (gitignored by default). Relative paths resolve next to this
+  # file. Delete it any time; the next `cortex index`/`cortex sync` rebuilds it.
+  path: ./cortex.index.sqlite
+  # Target size (characters) for each indexed chunk, and how much trailing
+  # context (characters) carries forward across a chunk boundary so a
+  # relevant phrase is never severed mid-sentence.
+  chunk_chars: 1500
+  overlap: 150
 
 server:
   transport: stdio             # stdio (local) | http (remote, Streamable HTTP)
@@ -85,6 +108,21 @@ llm:
   # Other providers: openai (needs model), ollama (local, no key, needs model),
   # anthropic (needs the 'anthropic' extra; model defaults to claude-sonnet-4-6).
   provider: none               # none | openrouter | openai | anthropic | ollama
+
+writes:
+  # Single global switch for the mutating MCP tools (write_note, patch_note,
+  # append_note, update_frontmatter, delete_note — yes, delete too). Default
+  # false: Cortex is a public "anyone can spin one up" project, so
+  # destructive-by-default would be a footgun. Flip this on only once you're
+  # ready to let a connected agent write into your vault.
+  #
+  # Every mutation — including delete — is still exactly one git commit
+  # (actor + reason), so nothing is ever truly destroyed: a bad write or
+  # delete is always recoverable with `git revert` or `git show <sha>:<path>`.
+  # Per-principal write permissioning is intentionally minimal for now (see
+  # `write_scopes` on a principal, above) — heavier permissioning is planned
+  # for later; this switch plus git history is the safety net in the meantime.
+  enabled: false
 
 janitor:
   enabled: false               # dark by default — keep it off until spec'd

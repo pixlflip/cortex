@@ -11,6 +11,7 @@ Frontmatter is the optional leading ``---`` YAML block, Obsidian-compatible.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,3 +192,52 @@ class VaultStore:
                     if len(hits) >= limit:
                         return hits
         return hits
+
+    # -- writing -------------------------------------------------------------
+    #
+    # These are the deterministic primitives the mutating MCP tools build on
+    # (server.py). They carry no notion of scope or audit themselves — they're
+    # purely "do this filesystem operation safely" (path-traversal safe, and
+    # atomic where it matters). Scope checks and git-commit-per-mutation are
+    # the caller's job (CortexServer), same separation read-only tools follow.
+
+    def write_text(self, rel_path: str, text: str) -> Path:
+        """Write ``text`` to ``rel_path``, creating parent dirs as needed.
+
+        Atomic: written to a temp file in the same directory first, then
+        ``os.replace`` swaps it into place, so a crash mid-write can never
+        leave a partially-written note on disk.
+        """
+        path = self._resolve(rel_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return path
+
+    def create_note(self, rel_path: str, content: str) -> Path:
+        """Write a brand-new note. Raises if one already exists at this path."""
+        path = self._resolve(rel_path)
+        if path.exists():
+            raise VaultError(f"note already exists: {rel_path}")
+        return self.write_text(rel_path, content)
+
+    def append(self, rel_path: str, text: str, separator: str = "\n\n") -> Path:
+        """Append ``text`` to an existing note, joined by ``separator``."""
+        existing = self.read_text(rel_path)  # raises VaultError if missing
+        return self.write_text(rel_path, existing + separator + text)
+
+    def delete_note(self, rel_path: str) -> None:
+        """Delete an existing note file. Raises if missing or not a file (no
+        directory deletes — that's a deliberate restriction, not an oversight).
+        """
+        path = self._resolve(rel_path)
+        if not path.exists():
+            raise VaultError(f"note not found: {rel_path}")
+        if not path.is_file():
+            raise VaultError(f"not a file: {rel_path}")
+        path.unlink()

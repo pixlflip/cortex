@@ -10,6 +10,9 @@ Commands:
     cortex init      Initialize the vault git repo + bootstrap snapshot commit.
     cortex log       Show recent audit commits.
     cortex check     Validate config and report the resolved setup.
+    cortex index     Build/refresh the FTS5 search index and report stats.
+    cortex sync      Snapshot pending vault changes, reindex, and (adapter:
+                     git) pull/push. Intended to be run on a timer.
 """
 
 from __future__ import annotations
@@ -20,8 +23,9 @@ import sys
 
 from . import __version__
 from .admin import AdminStore
-from .config import ConfigError, load_config
-from .gitlog import GitAudit
+from .config import ConfigError, CortexConfig, load_config
+from .gitlog import GitAudit, GitError
+from .search_index import SearchIndex
 from .vault import VaultStore
 
 
@@ -48,11 +52,151 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"  transport:    {cfg.server.transport}")
     print(f"  admin UI:     {'enabled' if cfg.admin.enabled else 'off'}"
           f" ({cfg.admin.path})" if cfg.admin.enabled else "")
+    if cfg.index.enabled:
+        idx = SearchIndex(
+            store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
+        )
+        idx.ensure_fresh()
+        stats = idx.stats()
+        backend = "fts5+bm25" if idx.fts_available else "substring-fallback (FTS5 unavailable)"
+        print(
+            f"  search index: enabled ({cfg.index.path}) [{backend}] "
+            f"— {stats['note_count']} notes, {stats['chunk_count']} chunks, "
+            f"last indexed {stats['last_indexed'] or 'never'}"
+        )
+        idx.close()
+    else:
+        print("  search index: disabled (falling back to substring search)")
     print(f"  llm provider: {cfg.llm.provider or 'none'} ({cfg.llm.model or '-'})")
     print(f"  janitor:      {'enabled' if cfg.janitor.enabled else 'dark'}"
           f"{' (dry-run)' if cfg.janitor.enabled and cfg.janitor.dry_run else ''}")
     print(f"  principals:   {', '.join(p.name for p in cfg.principals) or '(none)'}")
     print(f"  local principal: {cfg.auth.local_principal or '(none — stdio denied)'}")
+    return 0
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    store = VaultStore(cfg.vault.path)
+    if not cfg.index.enabled:
+        print("search index is disabled in config (index.enabled: false); nothing to build.")
+        return 0
+    idx = SearchIndex(
+        store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
+    )
+    if not idx.fts_available:
+        print(
+            "warning: SQLite FTS5 is not available in this environment; "
+            "ranked search will fall back to substring search.",
+            file=sys.stderr,
+        )
+    if args.rebuild:
+        idx.rebuild()
+        print(f"rebuilt search index at {cfg.index.path}")
+    else:
+        idx.sync()
+        print(f"refreshed search index at {cfg.index.path}")
+    stats = idx.stats()
+    print(f"  notes:        {stats['note_count']}")
+    print(f"  chunks:       {stats['chunk_count']}")
+    print(f"  last indexed: {stats['last_indexed'] or 'never'}")
+    idx.close()
+    return 0
+
+
+def run_sync(cfg: CortexConfig) -> dict:
+    """Snapshot any pending vault changes into the git audit trail, refresh
+    the search index, and (adapter: git) best-effort pull/push. This is the
+    core of ``cortex sync``, factored out so it's directly unit-testable
+    without going through argparse/stdout — the timer-driven systemd path and
+    the test suite both call this.
+
+    Returns a summary dict:
+        {
+          "commit": str | None,        # sha of the snapshot commit, or None
+                                        # if nothing had changed
+          "index": dict | None,        # SearchIndex.stats(), or None if
+                                        # index.enabled is false
+          "remote": str,                # "skipped" | "ok" | "error" | "unsupported"
+          "remote_detail": str | None,  # human-readable detail for the above
+        }
+
+    A remote failure (adapter: git, pull/push raises) is recorded but never
+    raised — the local snapshot + reindex already succeeded and that's the
+    durable, important half of the job.
+    """
+    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    commit_sha: str | None = None
+    if cfg.vault.git.enabled:
+        git.ensure_repo()
+        commit_sha = git.commit(actor="cortex-sync", reason="periodic snapshot")
+
+    index_stats: dict | None = None
+    if cfg.index.enabled:
+        idx = SearchIndex(
+            VaultStore(cfg.vault.path),
+            cfg.index.path,
+            chunk_chars=cfg.index.chunk_chars,
+            overlap=cfg.index.overlap,
+        )
+        idx.sync()
+        index_stats = idx.stats()
+        idx.close()
+
+    remote = "skipped"
+    remote_detail: str | None = None
+    adapter = cfg.sync.adapter
+    if adapter == "none":
+        remote = "skipped"
+    elif adapter == "git":
+        options = cfg.sync.options or {}
+        remote_name = options.get("remote", "origin")
+        branch = options.get("branch")
+        try:
+            git.pull_rebase(remote_name, branch)
+            git.push(remote_name, branch)
+            remote = "ok"
+        except GitError as exc:
+            remote = "error"
+            remote_detail = str(exc)
+    elif adapter in ("nextcloud", "s3"):
+        remote = "unsupported"
+        remote_detail = f"adapter '{adapter}' not implemented; local snapshot only"
+    else:
+        remote = "unsupported"
+        remote_detail = f"unknown sync adapter '{adapter}'; local snapshot only"
+
+    return {
+        "commit": commit_sha,
+        "index": index_stats,
+        "remote": remote,
+        "remote_detail": remote_detail,
+    }
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    summary = run_sync(cfg)
+    if summary["commit"]:
+        print(f"snapshot committed: {summary['commit'][:10]}")
+    else:
+        print("nothing to commit (vault unchanged since last sync)")
+    if summary["index"] is not None:
+        idx = summary["index"]
+        print(
+            f"  index: {idx['note_count']} notes, {idx['chunk_count']} chunks, "
+            f"last indexed {idx['last_indexed'] or 'never'}"
+        )
+    else:
+        print("  index: disabled")
+    if summary["remote"] == "ok":
+        print(f"  remote: pulled/pushed ({cfg.sync.adapter})")
+    elif summary["remote"] == "skipped":
+        print("  remote: skipped (sync.adapter: none)")
+    elif summary["remote"] == "error":
+        print(f"  remote: FAILED — {summary['remote_detail']}", file=sys.stderr)
+    elif summary["remote"] == "unsupported":
+        print(f"  remote: {summary['remote_detail']}")
     return 0
 
 
@@ -138,6 +282,14 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("log", help="show recent audit commits")
     pl.add_argument("-n", "--limit", type=int, default=20)
     pl.set_defaults(func=cmd_log)
+
+    pi = sub.add_parser("index", help="build/refresh the FTS5 search index")
+    pi.add_argument("--rebuild", action="store_true", help="drop and rebuild the index from scratch")
+    pi.set_defaults(func=cmd_index)
+
+    sub.add_parser(
+        "sync", help="snapshot pending vault changes, reindex, and (adapter: git) pull/push"
+    ).set_defaults(func=cmd_sync)
 
     return p
 

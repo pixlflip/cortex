@@ -1,0 +1,26 @@
+# systemd unit template for periodic Cortex sync (snapshot + reindex + push).
+# Copy to /etc/systemd/system/cortex-sync.service and adjust paths to your
+# install. Driven by deploy/cortex-sync.timer, not run directly. See
+# docs/bare-metal.md.
+
+[Unit]
+Description=Cortex periodic sync (snapshot + reindex + push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cortex
+Group=cortex
+WorkingDirectory=/srv/cortex/app
+Environment=CORTEX_CONFIG=/srv/cortex/cortex.yaml
+# Secrets (tokens, API keys) live here, not in the config file. Optional.
+EnvironmentFile=-/srv/cortex/cortex.env
+ExecStart=/srv/cortex/app/.venv/bin/cortex sync
+
+# Hardening: Cortex only needs its own data dir writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/cortex
+PrivateTmp=true

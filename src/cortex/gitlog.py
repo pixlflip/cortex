@@ -145,3 +145,34 @@ class GitAudit:
             return _run(["rev-parse", "HEAD"], self.root).strip()
         except GitError:
             return None  # no commits yet
+
+    def head_time(self) -> str | None:
+        """ISO 8601 committer date of HEAD, or None if there's no repo / no
+        commits yet. This is the freshness signal ``status()`` exposes: when
+        this was written, the snapshot on disk is at least that current."""
+        try:
+            commits = self.log(limit=1)
+        except GitError:
+            return None  # repo exists but has zero commits yet
+        return commits[0].iso_date if commits else None
+
+    # -- remote sync (best-effort; caller decides whether failure is fatal) --
+
+    def pull_rebase(self, remote: str = "origin", branch: str | None = None) -> None:
+        """Best-effort ``git pull --rebase`` so a periodic sync picks up
+        commits made elsewhere before pushing its own. Raises ``GitError`` on
+        failure (e.g. no such remote, conflicts) — the caller decides whether
+        that's fatal; a local snapshot + reindex can still have succeeded."""
+        args = ["pull", "--rebase", remote]
+        if branch:
+            args.append(branch)
+        _run(args, self.root)
+
+    def push(self, remote: str = "origin", branch: str | None = None) -> None:
+        """Best-effort ``git push``. Raises ``GitError`` on failure (e.g. no
+        remote configured, rejected push) — the caller decides whether that's
+        fatal."""
+        args = ["push", remote]
+        if branch:
+            args.append(branch)
+        _run(args, self.root)

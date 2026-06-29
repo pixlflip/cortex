@@ -74,6 +74,39 @@ spawn the process; for a long-running background service you'll typically use
 the **http** transport (a later build step) so clients connect over the network.
 Until HTTP lands, use the unit for `cortex check`/health and run stdio on demand.
 
+## Periodic sync & audit
+
+Humans editing notes directly in the Obsidian vault — outside any MCP tool
+call — don't go through `GitAudit.commit()`, so those edits sit uncommitted
+until something else triggers a commit. `cortex sync` closes that gap: it
+snapshots any pending vault changes into the git audit trail (actor
+`cortex-sync`, so it's distinguishable from MCP-driven commits in `cortex
+log`), refreshes the search index so ranked search reflects the latest
+content, and — only when `sync.adapter: git` is configured — best-effort
+pulls then pushes so the vault stays in sync with a remote. With the default
+`sync.adapter: none` the remote step is simply skipped; the local snapshot +
+reindex still happens.
+
+Run it on a timer with the shipped unit + timer pair:
+
+```bash
+cp /srv/cortex/app/deploy/cortex-sync.service /etc/systemd/system/cortex-sync.service
+cp /srv/cortex/app/deploy/cortex-sync.timer /etc/systemd/system/cortex-sync.timer
+# edit the unit if your paths differ from the defaults
+systemctl daemon-reload
+systemctl enable --now cortex-sync.timer
+systemctl list-timers cortex-sync.timer
+```
+
+The timer fires 5 minutes after boot and every 10 minutes thereafter
+(`Persistent=true`, so a missed run while the host was off still happens on
+the next boot). Each run is a single `cortex sync` invocation (`Type=oneshot`)
+— check `journalctl -u cortex-sync.service` for its output, or call the
+`status` MCP tool from a client to see `last_commit_iso` / `last_indexed_iso`
+move forward. A failed remote pull/push (adapter: git) is logged but never
+fails the unit: the local snapshot and reindex are the durable, important
+half of the job, and a transient remote failure self-heals on the next tick.
+
 ## 6. Secrets
 
 Never put tokens or API keys in `cortex.yaml`. Supply them via the environment.

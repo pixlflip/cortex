@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+import yaml
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import (
@@ -36,7 +37,32 @@ from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
-from .vault import VaultError, VaultStore
+from .search_index import IndexHit, SearchIndex
+from .vault import VaultError, VaultStore, _FRONTMATTER_RE
+
+
+def _validate_frontmatter_block(content: str, path: str) -> None:
+    """Reject content whose leading ``---`` frontmatter block fails to parse as
+    YAML, or parses to something other than a mapping.
+
+    ``vault.split_frontmatter`` is deliberately lenient (malformed frontmatter
+    falls back to treating the whole document as body, rather than raising) —
+    that's the right behavior for *reading* an existing note someone else may
+    have hand-edited. But ``write_note`` is creating/replacing content fresh,
+    so it can afford to be strict and catch a mistake before it lands. Reuses
+    the exact frontmatter-block regex from vault.py so "is this a frontmatter
+    block" is decided identically in both places.
+    """
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
+        return  # no leading --- block at all; nothing to validate
+    raw_fm = match.group(1)
+    try:
+        data = yaml.safe_load(raw_fm)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"malformed frontmatter in {path}: {exc}") from exc
+    if data is not None and not isinstance(data, dict):
+        raise ValueError(f"malformed frontmatter in {path}: must be a mapping")
 
 
 class CortexTokenVerifier(TokenVerifier):
@@ -97,6 +123,13 @@ class CortexServer:
         self.principal = principal  # None => resolve per-request (HTTP)
         self.admin_store = admin_store or (AdminStore(config.admin.path) if config.admin.enabled else None)
         self.vault = VaultStore(config.vault.path)
+        self.index = SearchIndex(
+            self.vault,
+            config.index.path,
+            chunk_chars=config.index.chunk_chars,
+            overlap=config.index.overlap,
+            enabled=config.index.enabled,
+        )
         self.git = GitAudit(config.vault.path, config.vault.git)
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
@@ -160,41 +193,186 @@ class CortexServer:
             # Do not distinguish "absent" from "out of scope".
             raise ValueError(f"note not found or not in scope: {path}")
 
+    @staticmethod
+    def _require_writable(principal: Principal, path: str) -> None:
+        """A principal may mutate ``path`` iff it's in ``write_scopes`` —
+        falling back to its read ``scopes`` when ``write_scopes`` is unset, so
+        writes work immediately with no extra config. Setting ``write_scopes``
+        narrows the writable area independent of what's readable; this is the
+        hook for per-principal write permissioning, deferred for now."""
+        scopes = principal.write_scopes or principal.scopes
+        if not path_allowed(path, scopes):
+            # Same non-leaking wording as _require_visible: don't distinguish
+            # "absent" from "not in scope".
+            raise ValueError(f"not found or not in scope: {path}")
+
+    def _status_payload(self, principal: Principal) -> dict:
+        """Deterministic freshness/visibility snapshot for ``principal``, the
+        payload behind the ``status`` MCP tool. Lets a caller judge whether
+        what it's about to read is current — e.g. before trusting a
+        ``search``/``context_pack`` result — without spending a model call.
+        ``head_commit``/``last_commit_iso`` are None when the vault isn't (or
+        isn't yet) a git repo; ``index_note_count``/``last_indexed_iso`` are 0
+        / None when the search index is disabled."""
+        visible = filter_paths(self.vault.list_notes(), principal.scopes)
+        stats = self.index.stats()
+        return {
+            "principal": principal.name,
+            "visible_note_count": len(visible),
+            "head_commit": self.git.head(),
+            "last_commit_iso": self.git.head_time(),
+            "last_indexed_iso": stats["last_indexed"],
+            "index_note_count": stats["note_count"],
+        }
+
+    def _commit_and_reindex(self, principal: Principal, reason: str, path: str) -> str | None:
+        """Commit the single mutated path under a consistent actor convention,
+        then refresh the search index so subsequent reads see the change.
+        Returns the commit sha, or None if nothing actually changed on disk
+        (e.g. a write that reproduced the existing content byte-for-byte)."""
+        actor = f"principal:{principal.name} via mcp"
+        sha = self.git.commit(actor=actor, reason=reason, paths=[path])
+        self.index.ensure_fresh()
+        return sha
+
     def _gather_context(
         self, principal: Principal, query: str, max_notes: int, budget_chars: int
     ) -> tuple[list[str], str]:
-        """Deterministically gather the top *visible* notes for a query into a
+        """Deterministically gather the top *visible* chunks for a query into a
         compact, budgeted context string. Shared by context_pack and
         semantic_search so retrieval stays scoped and model-free — the model (if
-        any) only ever sees notes this principal is allowed to read."""
-        hits = self.vault.search(query, limit=200)
-        seen: list[str] = []
-        for h in hits:
-            if h.path in seen:
-                continue
-            if path_allowed(h.path, principal.scopes):
-                seen.append(h.path)
-            if len(seen) >= max(1, max_notes):
+        any) only ever sees notes this principal is allowed to read.
+
+        Ranking comes from the SQLite FTS5/BM25 search index (falling back to
+        VaultStore substring search transparently if FTS5 is unavailable), so
+        natural-language phrasing — not just literal substrings — finds the
+        right note. Candidates are over-fetched at a generous, non-scaling-down
+        floor and only then scope-filtered, so a narrowly-scoped principal in a
+        large vault — who may have dozens of higher-ranked out-of-scope hits
+        ahead of their first visible one — never has an out-of-scope note
+        counted toward max_notes nor surfaced."""
+        self.index.ensure_fresh()
+        over_fetch = max(max(1, max_notes) * 20, 500)
+        hits = self.index.search(query, limit=over_fetch)
+        scoped = [h for h in hits if path_allowed(h.path, principal.scopes)]
+
+        # Dedup to the single best (top-ranked) chunk per note, preserving rank
+        # order, then cap to max_notes distinct notes.
+        best_per_note: dict[str, IndexHit] = {}
+        order: list[str] = []
+        for h in scoped:
+            if h.path not in best_per_note:
+                best_per_note[h.path] = h
+                order.append(h.path)
+            if len(order) >= max(1, max_notes):
                 break
+
         chunks: list[str] = []
         used_paths: list[str] = []
         used = 0
-        for rel in seen:
-            try:
-                note = self.vault.read_note(rel)
-            except VaultError:
-                continue
-            header = f"\n## {rel}\n"
+        for rel in order:
+            hit: IndexHit = best_per_note[rel]
+            breadcrumb = f" — {hit.headings}" if hit.headings else ""
+            header = f"\n## {rel}{breadcrumb}\n"
             remaining = budget_chars - used - len(header)
             if remaining <= 0:
                 break
-            body = note.body.strip()
+            body = (hit.body or hit.snippet or "").strip()
+            if not body:
+                # Defensive fallback: pull the note body directly if neither
+                # the chunk text nor the snippet came back populated.
+                try:
+                    body = self.vault.read_note(rel).body.strip()
+                except VaultError:
+                    continue
             if len(body) > remaining:
                 body = body[:remaining].rstrip() + "\n…(truncated)"
             chunks.append(header + body + "\n")
             used += len(header) + len(body)
             used_paths.append(rel)
         return used_paths, "".join(chunks)
+
+    # -- write orchestration -------------------------------------------------
+    #
+    # These private methods hold the actual mutation logic so it's directly
+    # unit-testable without going through the MCP tool-call machinery; the
+    # `@mcp.tool()` closures registered below are thin wrappers that resolve
+    # the principal and delegate here. Every one of them: checks write scope,
+    # performs exactly one VaultStore mutation, commits it (actor + reason)
+    # via GitAudit, and refreshes the search index.
+
+    def _do_write_note(
+        self,
+        principal: Principal,
+        path: str,
+        content: str,
+        reason: str,
+        *,
+        overwrite: bool = False,
+        validate_frontmatter: bool = True,
+    ) -> dict:
+        self._require_writable(principal, path)
+        if validate_frontmatter:
+            _validate_frontmatter_block(content, path)
+        exists = self.vault.exists(path)
+        if exists and not overwrite:
+            raise ValueError(f"note already exists (pass overwrite=True to replace): {path}")
+        self.vault.write_text(path, content)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "created": not exists, "commit": sha}
+
+    def _do_patch_note(
+        self, principal: Principal, path: str, old_string: str, new_string: str, reason: str
+    ) -> dict:
+        self._require_writable(principal, path)
+        try:
+            text = self.vault.read_text(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        count = text.count(old_string)
+        if count == 0:
+            raise ValueError(f"not found in {path}: {old_string!r}")
+        if count > 1:
+            raise ValueError(f"ambiguous: {count} matches in {path}")
+        new_text = text.replace(old_string, new_string, 1)
+        self.vault.write_text(path, new_text)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "commit": sha}
+
+    def _do_append_note(
+        self, principal: Principal, path: str, text: str, reason: str, *, separator: str = "\n\n"
+    ) -> dict:
+        self._require_writable(principal, path)
+        try:
+            self.vault.append(path, text, separator=separator)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "commit": sha}
+
+    def _do_update_frontmatter(
+        self, principal: Principal, path: str, patch: dict, reason: str
+    ) -> dict:
+        self._require_writable(principal, path)
+        if not isinstance(patch, dict):
+            raise ValueError("patch must be a mapping")
+        try:
+            note = self.vault.read_note(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        note.frontmatter.update(patch)
+        self.vault.write_text(path, note.raw)
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "frontmatter": note.frontmatter, "commit": sha}
+
+    def _do_delete_note(self, principal: Principal, path: str, reason: str) -> dict:
+        self._require_writable(principal, path)
+        try:
+            self.vault.delete_note(path)
+        except VaultError as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+        sha = self._commit_and_reindex(principal, reason, path)
+        return {"path": path, "deleted": True, "commit": sha}
 
     # -- tools -------------------------------------------------------------
 
@@ -214,6 +392,20 @@ class CortexServer:
             }
 
         @mcp.tool()
+        def status() -> dict:
+            """Deterministic freshness/visibility signal — no model spend.
+            Lets a caller judge whether what it's about to read is current:
+            ``head_commit``/``last_commit_iso`` are the git audit trail's HEAD
+            and its committer date (None if the vault isn't a git repo yet);
+            ``last_indexed_iso``/``index_note_count`` describe the search
+            index's last refresh; ``visible_note_count`` is this principal's
+            current visible note count. Call this before trusting a stale-
+            looking ``search``/``context_pack`` result, or to confirm a
+            periodic ``cortex sync`` actually ran recently."""
+            p = self._get_principal()
+            return self._status_payload(p)
+
+        @mcp.tool()
         def list_notes() -> list[str]:
             """List the relative paths of all notes visible to this principal."""
             p = self._get_principal()
@@ -221,13 +413,33 @@ class CortexServer:
 
         @mcp.tool()
         def search(query: str, regex: bool = False, limit: int = 50) -> list[dict]:
-            """Search visible notes for a substring (or regex). Returns matching
-            notes with line numbers and trimmed snippets. Deterministic; no model
-            spend."""
+            """Search visible notes. By default, ranked keyword/natural-language
+            search over an FTS5/BM25 index (porter-stemmed, heading-aware) —
+            returns matching chunks with line numbers, trimmed snippets, and a
+            relevance score (lower is better). Pass regex=True for a literal
+            substring/regex scan instead (no ranking; score omitted).
+            Deterministic; no model spend."""
             p = self._get_principal()
-            hits = self.vault.search(query, regex=regex, limit=max(1, min(limit, 200)))
-            scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
-            return [asdict(h) for h in scoped]
+            capped = max(1, min(limit, 200))
+            if regex:
+                hits = self.vault.search(query, regex=True, limit=capped)
+                scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
+                return [asdict(h) for h in scoped[:capped]]
+            # Over-fetch ranked candidates *before* scope-filtering so an
+            # out-of-scope note is never counted toward the requested limit —
+            # only truncate to `limit` after filtering. The over-fetch floor is
+            # intentionally NOT scaled down for small `limit`: a principal with
+            # a narrow scope inside a large vault can have dozens of
+            # higher-ranked out-of-scope hits ahead of their first visible one,
+            # so a small limit must not shrink the candidate pool.
+            self.index.ensure_fresh()
+            over_fetch = max(capped * 5, 500)
+            hits = self.index.search(query, limit=over_fetch)
+            scoped = [h for h in hits if path_allowed(h.path, p.scopes)][:capped]
+            return [
+                {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score}
+                for h in scoped
+            ]
 
         @mcp.tool()
         def read_note(path: str, include_frontmatter: bool = True) -> str:
@@ -307,6 +519,80 @@ class CortexServer:
                 raise ValueError(f"semantic_search failed: {exc}") from exc
             footer = f"\n\n— synthesized by {result.model} from: {', '.join(used)}"
             return result.text.rstrip() + footer
+
+        # -- mutating tools --------------------------------------------------
+        #
+        # Registered ONLY when config.writes.enabled is true (default false).
+        # This is the single global switch: an operator who never sets
+        # `writes.enabled: true` in their cortex.yaml gets a server with no
+        # mutating tools in its MCP registry at all — not just tools that
+        # refuse at call time. Every tool here requires `reason: str` (no
+        # default), is scope-checked via `_require_writable`, and on success
+        # produces exactly one git commit (so it's always `git revert`-able)
+        # before the search index is refreshed. All real logic lives in the
+        # `_do_*` methods above so it's unit-testable without MCP plumbing.
+        if self.config.writes.enabled:
+
+            @mcp.tool()
+            def write_note(
+                path: str,
+                content: str,
+                reason: str,
+                overwrite: bool = False,
+                validate_frontmatter: bool = True,
+            ) -> dict:
+                """Create a new note, or replace an existing one if
+                overwrite=True. Refuses to clobber an existing note unless
+                overwrite is set. By default validates that any leading YAML
+                frontmatter block parses to a mapping (rejects malformed
+                frontmatter) — pass validate_frontmatter=False to skip.
+                Write-scope-checked. Commits to git (revertible) and refreshes
+                the search index. `reason` is required for the audit trail."""
+                p = self._get_principal()
+                return self._do_write_note(
+                    p, path, content, reason,
+                    overwrite=overwrite, validate_frontmatter=validate_frontmatter,
+                )
+
+            @mcp.tool()
+            def patch_note(path: str, old_string: str, new_string: str, reason: str) -> dict:
+                """Replace a single unique occurrence of old_string with
+                new_string in an existing note. Refuses if old_string isn't
+                found, or if it matches more than once (ambiguous — narrow the
+                string first). Write-scope-checked. Commits to git and
+                refreshes the search index."""
+                p = self._get_principal()
+                return self._do_patch_note(p, path, old_string, new_string, reason)
+
+            @mcp.tool()
+            def append_note(path: str, text: str, reason: str, separator: str = "\n\n") -> dict:
+                """Append text to the end of an existing note, joined by
+                separator (default a blank line). Requires the note to
+                already exist (use write_note to create one). Write-scope-
+                checked. Commits to git and refreshes the search index."""
+                p = self._get_principal()
+                return self._do_append_note(p, path, text, reason, separator=separator)
+
+            @mcp.tool()
+            def update_frontmatter(path: str, patch: dict, reason: str) -> dict:
+                """Merge patch into an existing note's YAML frontmatter,
+                leaving the body untouched. patch must be a mapping; keys in
+                patch overwrite existing frontmatter keys, other existing keys
+                are preserved. Write-scope-checked. Commits to git and
+                refreshes the search index."""
+                p = self._get_principal()
+                return self._do_update_frontmatter(p, path, patch, reason)
+
+            @mcp.tool()
+            def delete_note(path: str, reason: str) -> dict:
+                """Delete a single existing note file. Only ever operates on
+                exactly one existing file — no directory deletes, no globs.
+                Write-scope-checked. The delete itself is committed to git, so
+                the note's last content is always recoverable (e.g. `git show
+                HEAD~1:<path>`, or `git revert` the commit) even after
+                deletion. Refreshes the search index."""
+                p = self._get_principal()
+                return self._do_delete_note(p, path, reason)
 
     # -- run ---------------------------------------------------------------
 
