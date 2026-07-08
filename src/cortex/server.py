@@ -225,13 +225,15 @@ class CortexServer:
             "index_note_count": stats["note_count"],
         }
 
-    def _commit_and_reindex(self, principal: Principal, reason: str, path: str) -> str | None:
-        """Commit the single mutated path under a consistent actor convention,
-        then refresh the search index so subsequent reads see the change.
+    def _commit_and_reindex(self, principal: Principal, reason: str, *paths: str) -> str | None:
+        """Commit the mutated path(s) under a consistent actor convention, then
+        refresh the search index so subsequent reads see the change. Most
+        mutations touch one path; a move touches two (source removal + dest
+        creation) and commits them together as a single revertible commit.
         Returns the commit sha, or None if nothing actually changed on disk
         (e.g. a write that reproduced the existing content byte-for-byte)."""
         actor = f"principal:{principal.name} via mcp"
-        sha = self.git.commit(actor=actor, reason=reason, paths=[path])
+        sha = self.git.commit(actor=actor, reason=reason, paths=list(paths))
         self.index.ensure_fresh()
         return sha
 
@@ -373,6 +375,30 @@ class CortexServer:
             raise ValueError(f"not found or not in scope: {path}") from exc
         sha = self._commit_and_reindex(principal, reason, path)
         return {"path": path, "deleted": True, "commit": sha}
+
+    def _do_move_note(
+        self, principal: Principal, src: str, dest: str, reason: str, *, overwrite: bool = False
+    ) -> dict:
+        # A move is both a removal at `src` and a creation at `dest`, so both
+        # ends must be within the writable area — the check mirrors delete for
+        # the source and write for the destination.
+        self._require_writable(principal, src)
+        self._require_writable(principal, dest)
+        try:
+            self.vault.move_note(src, dest, overwrite=overwrite)
+        except VaultError as exc:
+            # "note already exists"/"destination is a directory" describe dest,
+            # which the caller can already write, so surfacing them leaks
+            # nothing; a missing/absent source is reported the same non-leaking
+            # way the other mutating tools report an out-of-scope source.
+            msg = str(exc)
+            if "not found" in msg or "not a file" in msg:
+                raise ValueError(f"not found or not in scope: {src}") from exc
+            raise ValueError(msg) from exc
+        # Stage both paths in one commit so the rename is a single revertible
+        # unit in the audit trail.
+        sha = self._commit_and_reindex(principal, reason, src, dest)
+        return {"src": src, "dest": dest, "moved": True, "commit": sha}
 
     # -- tools -------------------------------------------------------------
 
@@ -593,6 +619,19 @@ class CortexServer:
                 deletion. Refreshes the search index."""
                 p = self._get_principal()
                 return self._do_delete_note(p, path, reason)
+
+            @mcp.tool()
+            def move_note(src: str, dest: str, reason: str, overwrite: bool = False) -> dict:
+                """Move or rename a single existing note from src to dest (both
+                vault-relative paths). Refuses to clobber an existing note at
+                dest unless overwrite=True, and never moves directories. BOTH
+                src and dest must be within write scope, so a note can't be
+                moved out of (or into) an area this principal can't write.
+                Records the rename as a single git commit staging both paths —
+                revertible as one unit — then refreshes the search index.
+                `reason` is required for the audit trail."""
+                p = self._get_principal()
+                return self._do_move_note(p, src, dest, reason, overwrite=overwrite)
 
     # -- run ---------------------------------------------------------------
 
