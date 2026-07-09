@@ -15,6 +15,10 @@ Commands:
                      git) pull/push. Intended to be run on a timer.
     cortex db        Manage the SQLite identity/gateway database:
                      init | migrate | status | import-admin.
+    cortex user      Manage local user accounts:
+                     add | list | disable | enable | passwd | delete.
+    cortex token     Manage per-user API bearer tokens:
+                     mint | list | revoke.
 """
 
 from __future__ import annotations
@@ -202,30 +206,48 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bootstrap_identity(cfg: CortexConfig) -> int:
+    """Shared first-run identity bootstrap for ``cortex init`` and
+    ``cortex db init``: create/migrate the database, import any legacy
+    cortex.admin.json state, then ensure an admin user exists — printing the
+    generated password exactly once. The DB is the source of truth for users
+    (A4); the legacy admin.json is import-only from here on."""
+    from .db import Database, import_admin_state
+    from .users import IdentityService, bootstrap_admin
+
+    db = Database(cfg.database.path)
+    if cfg.admin.enabled and AdminStore(cfg.admin.path).exists():
+        report = import_admin_state(db, cfg.admin.path)
+        if report.changed:
+            print(f"imported legacy admin state from {cfg.admin.path}")
+    identity = IdentityService(db, cfg)
+    password = bootstrap_admin(identity)
+    if password:
+        print(f"admin user created in {cfg.database.path}")
+        print("admin username: admin")
+        print(f"admin password: {password}")
+        print("save this password now; Cortex stores only its hash.")
+        print("(change it anytime with: cortex user passwd admin)")
+    else:
+        print("admin user already present in database.")
+    return 0
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     cfg = _load(args)
     git = GitAudit(cfg.vault.path, cfg.vault.git)
-    if not cfg.vault.git.enabled:
-        print("git audit is disabled in config; nothing to initialize.")
-        return 0
-    created = git.ensure_repo()
-    sha = git.commit("cortex-bootstrap", "initial vault snapshot")
-    if created:
-        print(f"initialized git repo at {cfg.vault.path}")
-    if sha:
-        print(f"bootstrap snapshot committed: {sha[:10]}")
-    else:
-        print("nothing to commit (vault already snapshotted / empty)")
-    if cfg.admin.enabled:
-        password = AdminStore(cfg.admin.path).ensure_initialized()
-        if password:
-            print(f"admin UI initialized at {cfg.admin.path}")
-            print(f"admin username: admin")
-            print(f"admin password: {password}")
-            print("save this password now; Cortex stores only its hash.")
+    if cfg.vault.git.enabled:
+        created = git.ensure_repo()
+        sha = git.commit("cortex-bootstrap", "initial vault snapshot")
+        if created:
+            print(f"initialized git repo at {cfg.vault.path}")
+        if sha:
+            print(f"bootstrap snapshot committed: {sha[:10]}")
         else:
-            print(f"admin UI already initialized at {cfg.admin.path}")
-    return 0
+            print("nothing to commit (vault already snapshotted / empty)")
+    else:
+        print("git audit is disabled in config; skipping vault repo init.")
+    return _bootstrap_identity(cfg)
 
 
 def cmd_db(args: argparse.Namespace) -> int:
@@ -278,6 +300,15 @@ def cmd_db(args: argparse.Namespace) -> int:
                 )
             elif not report.warnings:
                 print("legacy admin state already imported (or empty).")
+            # First-run admin bootstrap (A4): the DB is the source of truth
+            # for users, so `db init` guarantees an admin exists.
+            from .users import IdentityService, bootstrap_admin
+
+            password = bootstrap_admin(IdentityService(db, cfg))
+            if password:
+                print("admin username: admin")
+                print(f"admin password: {password}")
+                print("save this password now; Cortex stores only its hash.")
         return 0
 
     if action == "import-admin":
@@ -305,6 +336,134 @@ def cmd_db(args: argparse.Namespace) -> int:
         return 0
 
     print(f"unknown db command: {action}", file=sys.stderr)
+    return 2
+
+
+def _identity(cfg: CortexConfig):
+    """Open the identity service over the configured database. The CLI acts
+    as the trusted local operator (cortex.users.OPERATOR) — running it on
+    the server box is the same trust level as editing cortex.yaml."""
+    from .db import Database
+    from .users import IdentityService
+
+    if not cfg.database.path.exists():
+        print(
+            f"database not found: {cfg.database.path} (run 'cortex db init' first)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return IdentityService(Database(cfg.database.path), cfg)
+
+
+def _read_password(args: argparse.Namespace, *, confirm: bool) -> str:
+    """Password from --password, else an interactive prompt."""
+    if getattr(args, "password", None):
+        return args.password
+    import getpass
+
+    first = getpass.getpass("Password: ")
+    if confirm and getpass.getpass("Repeat password: ") != first:
+        print("passwords do not match", file=sys.stderr)
+        raise SystemExit(2)
+    return first
+
+
+def cmd_user(args: argparse.Namespace) -> int:
+    from .users import AuthzError, IdentityError
+
+    cfg = _load(args)
+    identity = _identity(cfg)
+    action = args.user_command
+    try:
+        if action == "add":
+            password = _read_password(args, confirm=True)
+            user = identity.create_user(
+                args.username,
+                password=password,
+                display_name=args.display_name,
+                email=args.email,
+                is_admin=args.admin,
+            )
+            kind = "admin user" if user["is_admin"] else "user"
+            print(f"created {kind} '{user['username']}' (id {user['id']})")
+            return 0
+        if action == "list":
+            users = identity.list_users()
+            if not users:
+                print("no users.")
+                return 0
+            for u in users:
+                flags = []
+                if u["is_admin"]:
+                    flags.append("admin")
+                if u["disabled"]:
+                    flags.append("disabled")
+                suffix = f" [{', '.join(flags)}]" if flags else ""
+                print(f"{u['username']}  ({u['auth_source']}){suffix}")
+            return 0
+        if action == "disable":
+            identity.disable_user(args.username)
+            print(f"disabled user '{args.username}' (sessions revoked)")
+            return 0
+        if action == "enable":
+            identity.enable_user(args.username)
+            print(f"enabled user '{args.username}'")
+            return 0
+        if action == "passwd":
+            identity.set_password(args.username, _read_password(args, confirm=True))
+            print(f"password updated for '{args.username}'")
+            return 0
+        if action == "delete":
+            identity.delete_user(args.username)
+            print(f"deleted user '{args.username}' (sessions and tokens removed)")
+            return 0
+    except (IdentityError, AuthzError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"unknown user command: {action}", file=sys.stderr)
+    return 2
+
+
+def cmd_token(args: argparse.Namespace) -> int:
+    from .users import AuthzError, IdentityError
+
+    cfg = _load(args)
+    identity = _identity(cfg)
+    action = args.token_command
+    try:
+        if action == "mint":
+            created = identity.mint_token(
+                args.username,
+                args.name,
+                scopes=args.scope or None,
+                expires_in=args.expires_in,
+            )
+            print(f"token '{created.name}' minted for '{args.username}'.")
+            print("copy it now; Cortex stores only its hash and will not show it again:")
+            print(created.token)
+            return 0
+        if action == "list":
+            rows = identity.list_tokens(args.username)
+            if not rows:
+                print(f"no tokens for '{args.username}'.")
+                return 0
+            for t in rows:
+                state = "revoked" if t["revoked_at"] else "active"
+                if state == "active" and t["expires_at"]:
+                    state = f"expires at {t['expires_at']}"
+                print(f"{t['name']}  {t['token_prefix']}…  [{state}]")
+            return 0
+        if action == "revoke":
+            revoked = identity.revoke_token(args.username, args.name)
+            if revoked:
+                print(f"revoked {revoked} token(s) named '{args.name}' for '{args.username}'")
+                return 0
+            print(f"no active token named '{args.name}' for '{args.username}'", file=sys.stderr)
+            return 1
+    except (IdentityError, AuthzError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"unknown token command: {action}", file=sys.stderr)
     return 2
 
 
@@ -389,6 +548,52 @@ def build_parser() -> argparse.ArgumentParser:
         "import-admin",
         help="import cortex.admin.json (admin login, roles, AI clients) into the database",
     ).set_defaults(func=cmd_db)
+
+    pu = sub.add_parser("user", help="manage local user accounts")
+    pu_sub = pu.add_subparsers(dest="user_command", required=True)
+    pu_add = pu_sub.add_parser("add", help="create a local user")
+    pu_add.add_argument("username")
+    pu_add.add_argument("--admin", action="store_true", help="grant the admin flag")
+    pu_add.add_argument("--display-name")
+    pu_add.add_argument("--email")
+    pu_add.add_argument("--password", help="password (omit to be prompted)")
+    pu_add.set_defaults(func=cmd_user)
+    pu_sub.add_parser("list", help="list users").set_defaults(func=cmd_user)
+    for verb, help_text in (
+        ("disable", "disable a user (revokes live sessions)"),
+        ("enable", "re-enable a disabled user"),
+        ("delete", "delete a user (sessions and tokens removed)"),
+    ):
+        sp = pu_sub.add_parser(verb, help=help_text)
+        sp.add_argument("username")
+        sp.set_defaults(func=cmd_user)
+    pu_passwd = pu_sub.add_parser("passwd", help="set/reset a user's password")
+    pu_passwd.add_argument("username")
+    pu_passwd.add_argument("--password", help="new password (omit to be prompted)")
+    pu_passwd.set_defaults(func=cmd_user)
+
+    pt = sub.add_parser("token", help="manage per-user API bearer tokens")
+    pt_sub = pt.add_subparsers(dest="token_command", required=True)
+    pt_mint = pt_sub.add_parser("mint", help="mint a named token (shown once)")
+    pt_mint.add_argument("username")
+    pt_mint.add_argument("name", help="token label, e.g. 'claude-desktop'")
+    pt_mint.add_argument(
+        "--expires-in", type=int, help="lifetime in seconds (default: no expiry)"
+    )
+    pt_mint.add_argument(
+        "--scope",
+        action="append",
+        help="optional narrowing path glob (repeatable); must be within the "
+        "user's granted scopes to have any effect",
+    )
+    pt_mint.set_defaults(func=cmd_token)
+    pt_list = pt_sub.add_parser("list", help="list a user's tokens")
+    pt_list.add_argument("username")
+    pt_list.set_defaults(func=cmd_token)
+    pt_revoke = pt_sub.add_parser("revoke", help="revoke a user's token by name")
+    pt_revoke.add_argument("username")
+    pt_revoke.add_argument("name")
+    pt_revoke.set_defaults(func=cmd_token)
 
     return p
 
