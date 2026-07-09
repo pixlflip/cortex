@@ -76,6 +76,19 @@ For a stdio client (e.g. Claude Desktop), register Cortex as a server that runs
 | `context_pack` | Compact, budgeted bundle for a query |
 | `semantic_search` | Fuzzy "comb & synthesize" — the only tool that uses an LLM |
 
+With `writes.enabled: true` in `cortex.yaml` (default **false** — otherwise
+these tools are not registered at all), the mutating tools appear. Each one
+requires a `reason`, is write-scope-checked, and lands as exactly one git
+commit (always `git revert`-able):
+
+| Tool (gated by `writes.enabled`) | What it does |
+|---|---|
+| `write_note` | Create a note (or replace one, only with `overwrite=True`) |
+| `patch_note` | Replace a single unique string in an existing note |
+| `append_note` | Append text to an existing note |
+| `update_frontmatter` | Merge a patch into a note's YAML frontmatter |
+| `delete_note` | Delete one note file (committed, so still recoverable) |
+
 ---
 
 ## Configuration
@@ -121,9 +134,17 @@ This repo is built in dependency order (see the build sequence in
 - ✅ **OAuth 2.1** authorization server (dynamic client registration + PKCE +
   consent) so the one-click **Claude.ai / ChatGPT / Grok** connector UIs can
   authorize. See [`docs/http-exposure.md`](docs/http-exposure.md).
+- ✅ Opt-in **write tools** (`write_note` / `patch_note` / `append_note` /
+  `update_frontmatter` / `delete_note`) behind `writes.enabled` — every
+  mutation write-scope-checked and committed to git with actor + reason
+- ✅ `cortex sync` snapshotting + the **git** sync adapter (opt-in;
+  Nextcloud/WebDAV and S3 adapters still to come)
 - ✅ Docker image + Compose, and a bare-metal/systemd path
 
-**Next on the roadmap:** sync adapters (opt-in) → the bounded janitor.
+**Next on the roadmap:** the **v2 multi-user expansion** — user accounts
+(local + LDAP/AD), one vault per user, a web admin panel + vault viewer, and
+an MCP gateway. See [`docs/v2-design.md`](docs/v2-design.md). Remaining
+sync adapters and the bounded janitor follow.
 
 ---
 

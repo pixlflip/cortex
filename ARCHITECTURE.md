@@ -16,6 +16,12 @@ This document is the canonical design. It is intentionally
 infrastructure-agnostic: no IP addresses, no hostnames, no secrets. Everything
 environment-specific is a config value with a sane default.
 
+> **v2 (multi-user expansion):** the canonical design for users, groups,
+> per-user vaults, the web app, and the MCP gateway lives in
+> [`docs/v2-design.md`](docs/v2-design.md). It extends — never replaces —
+> everything below; where the two disagree, the v2 document wins for v2 work.
+> See also §7.
+
 ---
 
 ## 1. The problem
@@ -149,8 +155,14 @@ Deterministic and cheap (no model spend) unless marked:
 | `context_pack` | Compact, token-budgeted bundle assembled for a query |
 | `semantic_search` * | Fuzzy "comb the vault and synthesize" — *delegates to the LLM/Janitor backend*. The **only** tool that spends model tokens. |
 
-**v2** adds writes (append/patch/create) once v1 scoping and audit are proven —
-path-restricted, never deletes-by-default, every write → a git commit.
+**Writes have since shipped, opt-in.** With the single global switch
+`writes.enabled: true` (default **false** — a server that never sets it
+registers no mutating tools at all), the tool set gains `write_note`,
+`patch_note`, `append_note`, `update_frontmatter`, and a gated `delete_note`.
+Every mutating tool requires a `reason` for the audit trail, is
+write-scope-checked (`write_scopes`, falling back to read scopes), and
+produces exactly one git commit — so every mutation, including a delete, is
+`git revert`-able.
 
 ### 3.6 LLM Provider (pluggable)
 
@@ -188,7 +200,10 @@ the actors it watches.
 ## 4. Safety model (summary)
 
 1. Safety is enforced **server-side at the tool layer**, never at the client.
-2. **Writes off in v1; deletes off by default forever.**
+2. **Writes are opt-in** (`writes.enabled`, default off; a server that never
+   enables them registers no mutating tools at all); deletes are the
+   most-gated mutation and, like every write, always land as a revertible
+   git commit.
 3. Reads are **principal-scoped**; no scope match → not visible, not just
    not-readable.
 4. **Credential→principal mapping is mandatory** before any non-local exposure.
@@ -237,3 +252,21 @@ last, behind its boundaries.
 - Not a general database — it's a memory layer over files, with git as truth.
 - Not autonomous on day one — the Janitor stays dark until boundaries are spec'd
   and proven in dry-run.
+
+---
+
+## 7. v2 — the multi-user expansion
+
+v1 above is a single-vault server with config-file principals. v2 grows it
+into a small multi-user memory host — real **user accounts** (local password
+and LDAP/AD) with groups, sessions, and per-user tokens in SQLite; **one
+vault + one git repo per user** alongside the shared main vault; a
+**React/Vite web app** (admin panel + Obsidian vault viewer) over a JSON
+`/api/v1` API; and an **MCP gateway** that proxies registered external MCP
+servers behind per-user/group permission gating with central call auditing —
+all without changing the v1 core: scoped, deterministic, git-audited memory.
+
+The canonical v2 design — data model, on-disk layout, request flows, the
+generalized scoping and safety models, and the A/B/C/D/E build order mapping
+issues #35–#55 — is [`docs/v2-design.md`](docs/v2-design.md). Agents working
+on v2 issues start there.
