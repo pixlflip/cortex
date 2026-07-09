@@ -554,6 +554,14 @@ class SessionsRepo:
             row["last_seen_at"] = now
         return row
 
+    def extend(self, session_id: int, expires_at: int) -> None:
+        """Move a session's expiry forward (sliding renewal — A4)."""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE sessions SET expires_at = ? WHERE id = ?",
+                (expires_at, session_id),
+            )
+
     def get(self, session_id: int) -> dict | None:
         with self.db.connection() as conn:
             return _row(
@@ -574,6 +582,14 @@ class SessionsRepo:
     def delete(self, session_id: int) -> bool:
         with self.db.transaction() as conn:
             cur = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return cur.rowcount > 0
+
+    def delete_by_token(self, token: str) -> bool:
+        """Delete the session identified by its (plaintext) token — logout."""
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE token_hash = ?", (sha256_hex(token),)
+            )
             return cur.rowcount > 0
 
     def delete_for_user(self, user_id: int) -> int:
