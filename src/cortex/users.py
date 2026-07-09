@@ -254,6 +254,25 @@ class IdentityService:
             raise IdentityError(f"no such group: {name}")
         return group
 
+    def list_groups(self) -> list[dict]:
+        return self.groups.list()
+
+    def delete_group(self, name: str, *, actor: dict | None = OPERATOR) -> None:
+        """Delete a group; memberships go with it (FK CASCADE). Scope grants
+        the group carried disappear with it — users lose that access."""
+        self._require_admin(actor)
+        group = self.get_group(name)
+        self.groups.delete(group["id"])
+
+    def set_group_scopes(
+        self, name: str, scopes: list[str], *, actor: dict | None = OPERATOR
+    ) -> dict:
+        """Replace a group's shared-vault scope grants (design §6.4)."""
+        self._require_admin(actor)
+        group = self.get_group(name)
+        self.groups.set_scopes(group["id"], list(scopes))
+        return self.get_group(name)
+
     def add_to_group(
         self, username: str, group_name: str, *, actor: dict | None = OPERATOR
     ) -> bool:

@@ -138,6 +138,11 @@ class ServerConfig:
     # (fine behind a trusted reverse proxy; set these for direct exposure).
     allowed_hosts: list[str] = field(default_factory=list)
     allowed_origins: list[str] = field(default_factory=list)
+    # Structured per-request access logging for the /api/v1 surface (#30
+    # direction): one log record per request — method, path, principal,
+    # status, latency. Never bodies, never tokens, never note content.
+    # Off by default; a single boolean check when disabled.
+    request_log: bool = False
 
 
 @dataclass
@@ -336,6 +341,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         public_url=server_raw.get("public_url"),
         allowed_hosts=list(server_raw.get("allowed_hosts", []) or []),
         allowed_origins=list(server_raw.get("allowed_origins", []) or []),
+        request_log=bool(server_raw.get("request_log", False)),
     )
 
     llm_raw = raw.get("llm", {}) or {}

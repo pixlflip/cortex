@@ -188,6 +188,9 @@ class CortexServer:
             enabled=config.index.enabled,
         )
         self.git = GitAudit(config.vault.path, config.vault.git)
+        # The /api/v1 route group (cortex.api.ApiV1); attached by
+        # build_http_server when the identity DB exists, else None.
+        self.api = None
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
         self.mcp = self._build_mcp(http)
@@ -765,4 +768,12 @@ def build_http_server(config: CortexConfig) -> CortexServer:
             auth_settings, transport_security, sc.host, sc.port, sc.path,
             token_verifier=CortexTokenVerifier(authn),
         )
-    return CortexServer(config, principal=None, http=http, identity=identity)
+    server = CortexServer(config, principal=None, http=http, identity=identity)
+    # The /api/v1 JSON surface (A6) rides the same Starlette app, but only
+    # when the identity DB exists — a pure-v1 setup grows no new routes.
+    if identity is not None:
+        from .api import build_api
+
+        server.api = build_api(config, identity)
+        server.api.register(server.mcp)
+    return server
