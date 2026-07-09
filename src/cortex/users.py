@@ -104,6 +104,7 @@ class IdentityService:
         config: CortexConfig | None = None,
         *,
         session_ttl: int = DEFAULT_SESSION_TTL,
+        vault_manager=None,
     ):
         self.db = db
         self.config = config
@@ -112,6 +113,12 @@ class IdentityService:
         self.groups = GroupsRepo(db)
         self.tokens = ApiTokensRepo(db)
         self.sessions = SessionsRepo(db)
+        # Optional VaultManager (cortex.vaults). When set, creating a user
+        # provisions their per-user vault (B1). Left None in pure-v1 / DB-only
+        # flows so nothing touches the filesystem. Wired via
+        # :func:`attach_vault_manager` to avoid an import cycle (vaults imports
+        # config; users need not import vaults).
+        self.vault_manager = vault_manager
 
     # -- authorization ------------------------------------------------------
 
@@ -173,7 +180,7 @@ class IdentityService:
         self._require_admin(actor)
         username = self._validate_username(username)
         try:
-            return self.users.create(
+            user = self.users.create(
                 username,
                 display_name=display_name,
                 email=email,
@@ -183,6 +190,21 @@ class IdentityService:
             )
         except sqlite3.IntegrityError as exc:
             raise IdentityError(f"username already exists: {username}") from exc
+        self._provision_vault(username)
+        return user
+
+    def _provision_vault(self, username: str) -> None:
+        """Provision the user's per-user vault on creation (B1), when a
+        VaultManager is attached and auto-provision is enabled. Provisioning
+        is idempotent, so this is also safe on a create that re-runs. Failure
+        to provision must not orphan the just-created user row silently — it
+        propagates so the operator sees it."""
+        manager = self.vault_manager
+        if manager is None:
+            return
+        if self.config is not None and not self.config.vaults.auto_provision:
+            return
+        manager.provision(username)
 
     def get_user(self, username: str) -> dict:
         user = self.users.get_by_username(username)

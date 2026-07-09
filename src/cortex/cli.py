@@ -12,7 +12,9 @@ Commands:
     cortex check     Validate config and report the resolved setup.
     cortex index     Build/refresh the FTS5 search index and report stats.
     cortex sync      Snapshot pending vault changes, reindex, and (adapter:
-                     git) pull/push. Intended to be run on a timer.
+                     git) pull/push across ALL vaults. Run on a timer.
+    cortex vault     Manage per-user vaults (registry & provisioning):
+                     list | provision | archive | delete.
     cortex db        Manage the SQLite identity/gateway database:
                      init | migrate | status | import-admin.
     cortex user      Manage local user accounts:
@@ -82,32 +84,48 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_index(args: argparse.Namespace) -> int:
+    """Build/refresh the FTS5 search index for EVERY registered vault (main +
+    per-user). One vault failing is reported but never aborts the others."""
     cfg = _load(args)
-    store = VaultStore(cfg.vault.path)
     if not cfg.index.enabled:
         print("search index is disabled in config (index.enabled: false); nothing to build.")
         return 0
-    idx = SearchIndex(
-        store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
-    )
-    if not idx.fts_available:
-        print(
-            "warning: SQLite FTS5 is not available in this environment; "
-            "ranked search will fall back to substring search.",
-            file=sys.stderr,
-        )
-    if args.rebuild:
-        idx.rebuild()
-        print(f"rebuilt search index at {cfg.index.path}")
-    else:
-        idx.sync()
-        print(f"refreshed search index at {cfg.index.path}")
-    stats = idx.stats()
-    print(f"  notes:        {stats['note_count']}")
-    print(f"  chunks:       {stats['chunk_count']}")
-    print(f"  last indexed: {stats['last_indexed'] or 'never'}")
-    idx.close()
-    return 0
+    from .vaults import VaultManager
+
+    manager = VaultManager(cfg)
+    warned_fts = False
+    failed = False
+    try:
+        for vault_id in manager.vault_ids():
+            try:
+                idx = manager.index_for(vault_id)
+            except Exception as exc:  # noqa: BLE001 - isolate per-vault failure
+                failed = True
+                print(f"vault '{vault_id}': ERROR: {exc}", file=sys.stderr)
+                continue
+            if not idx.fts_available and not warned_fts:
+                print(
+                    "warning: SQLite FTS5 is not available in this environment; "
+                    "ranked search will fall back to substring search.",
+                    file=sys.stderr,
+                )
+                warned_fts = True
+            if args.rebuild:
+                idx.rebuild()
+                verb = "rebuilt"
+            else:
+                idx.sync()
+                verb = "refreshed"
+            stats = idx.stats()
+            print(
+                f"vault '{vault_id}': {verb} index at {manager.index_path_for(vault_id)}"
+            )
+            print(f"  notes:        {stats['note_count']}")
+            print(f"  chunks:       {stats['chunk_count']}")
+            print(f"  last indexed: {stats['last_indexed'] or 'never'}")
+    finally:
+        manager.close()
+    return 1 if failed else 0
 
 
 def run_sync(cfg: CortexConfig) -> dict:
@@ -132,30 +150,58 @@ def run_sync(cfg: CortexConfig) -> dict:
     durable, important half of the job.
     """
     git = GitAudit(cfg.vault.path, cfg.vault.git)
-    commit_sha: str | None = None
-    if cfg.vault.git.enabled:
-        git.ensure_repo()
-        commit_sha = git.commit(actor="cortex-sync", reason="periodic snapshot")
-
-    index_stats: dict | None = None
+    index = None
     if cfg.index.enabled:
-        idx = SearchIndex(
+        index = SearchIndex(
             VaultStore(cfg.vault.path),
             cfg.index.path,
             chunk_chars=cfg.index.chunk_chars,
             overlap=cfg.index.overlap,
         )
-        idx.sync()
-        index_stats = idx.stats()
-        idx.close()
+    try:
+        return _sync_core(
+            git,
+            index,
+            git_enabled=cfg.vault.git.enabled,
+            index_enabled=cfg.index.enabled,
+            adapter=cfg.sync.adapter,
+            options=cfg.sync.options or {},
+        )
+    finally:
+        if index is not None:
+            index.close()
+
+
+def _sync_core(
+    git: GitAudit,
+    index,
+    *,
+    git_enabled: bool,
+    index_enabled: bool,
+    adapter: str,
+    options: dict,
+    actor: str = "cortex-sync",
+    reason: str = "periodic snapshot",
+) -> dict:
+    """Snapshot + reindex + (adapter: git) pull/push for ONE vault's
+    git/index pair. Factored out of :func:`run_sync` so both the single-vault
+    path and the all-vaults iteration (:func:`run_sync_all`) share identical
+    semantics. The caller owns the index's lifetime (open/close)."""
+    commit_sha: str | None = None
+    if git_enabled:
+        git.ensure_repo()
+        commit_sha = git.commit(actor=actor, reason=reason)
+
+    index_stats: dict | None = None
+    if index_enabled and index is not None:
+        index.sync()
+        index_stats = index.stats()
 
     remote = "skipped"
     remote_detail: str | None = None
-    adapter = cfg.sync.adapter
     if adapter == "none":
         remote = "skipped"
     elif adapter == "git":
-        options = cfg.sync.options or {}
         remote_name = options.get("remote", "origin")
         branch = options.get("branch")
         try:
@@ -180,13 +226,46 @@ def run_sync(cfg: CortexConfig) -> dict:
     }
 
 
-def cmd_sync(args: argparse.Namespace) -> int:
-    cfg = _load(args)
-    summary = run_sync(cfg)
+def run_sync_all(cfg: CortexConfig) -> list[tuple[str, dict | Exception]]:
+    """Run :func:`_sync_core` over EVERY registered vault (main + per-user),
+    returning ``(vault_id, summary_or_exception)`` pairs in registry order.
+
+    A failure in one vault is captured and reported, never raised — so one
+    broken user vault can't abort the sync of the rest (B4 leans on this).
+    The per-vault sync adapter is the main vault's ``sync:`` block for the
+    main vault and ``vaults.sync`` for each user vault."""
+    from .vaults import VaultManager
+
+    manager = VaultManager(cfg)
+    results: list[tuple[str, dict | Exception]] = []
+    try:
+        for vault_id in manager.vault_ids():
+            try:
+                bundle = manager.get(vault_id)
+                sc = manager.sync_config_for(vault_id)
+                summary = _sync_core(
+                    bundle.git,
+                    bundle.index,
+                    git_enabled=cfg.vault.git.enabled,
+                    index_enabled=cfg.index.enabled,
+                    adapter=sc.adapter,
+                    options=sc.options or {},
+                )
+                results.append((vault_id, summary))
+            except Exception as exc:  # noqa: BLE001 - isolate per-vault failure
+                results.append((vault_id, exc))
+    finally:
+        manager.close()
+    return results
+
+
+def _print_sync_summary(vault_id: str, summary: dict) -> bool:
+    """Print one vault's sync summary. Returns True if its remote errored."""
+    print(f"vault '{vault_id}':")
     if summary["commit"]:
-        print(f"snapshot committed: {summary['commit'][:10]}")
+        print(f"  snapshot committed: {summary['commit'][:10]}")
     else:
-        print("nothing to commit (vault unchanged since last sync)")
+        print("  nothing to commit (vault unchanged since last sync)")
     if summary["index"] is not None:
         idx = summary["index"]
         print(
@@ -196,14 +275,33 @@ def cmd_sync(args: argparse.Namespace) -> int:
     else:
         print("  index: disabled")
     if summary["remote"] == "ok":
-        print(f"  remote: pulled/pushed ({cfg.sync.adapter})")
+        print("  remote: pulled/pushed")
     elif summary["remote"] == "skipped":
-        print("  remote: skipped (sync.adapter: none)")
+        print("  remote: skipped (adapter: none)")
     elif summary["remote"] == "error":
         print(f"  remote: FAILED — {summary['remote_detail']}", file=sys.stderr)
+        return True
     elif summary["remote"] == "unsupported":
         print(f"  remote: {summary['remote_detail']}")
-    return 0
+    return False
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Snapshot + reindex + (adapter: git) pull/push across ALL registered
+    vaults (main + per-user). One vault failing is reported but never aborts
+    the others."""
+    cfg = _load(args)
+    results = run_sync_all(cfg)
+    failed = False
+    for vault_id, outcome in results:
+        if isinstance(outcome, Exception):
+            failed = True
+            print(f"vault '{vault_id}':")
+            print(f"  ERROR: {outcome}", file=sys.stderr)
+            continue
+        if _print_sync_summary(vault_id, outcome):
+            failed = True
+    return 1 if failed else 0
 
 
 def _bootstrap_identity(cfg: CortexConfig) -> int:
@@ -352,7 +450,14 @@ def _identity(cfg: CortexConfig):
             file=sys.stderr,
         )
         raise SystemExit(2)
-    return IdentityService(Database(cfg.database.path), cfg)
+    identity = IdentityService(Database(cfg.database.path), cfg)
+    # Attach the vault registry so `cortex user add` provisions the new user's
+    # per-user vault (B1). Cheap: constructs no directories until a user is
+    # actually created.
+    from .vaults import attach_vault_manager
+
+    attach_vault_manager(identity, cfg)
+    return identity
 
 
 def _read_password(args: argparse.Namespace, *, confirm: bool) -> str:
@@ -464,6 +569,65 @@ def cmd_token(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"unknown token command: {action}", file=sys.stderr)
+    return 2
+
+
+def cmd_vault(args: argparse.Namespace) -> int:
+    """Manage per-user vaults: provision (create/repair), list, archive (move
+    aside, keeping git history), delete (guarded — needs --force)."""
+    cfg = _load(args)
+    from .vaults import VaultManager, VaultManagerError
+
+    manager = VaultManager(cfg)
+    action = args.vault_command
+    try:
+        if action == "list":
+            ids = manager.vault_ids()
+            for vault_id in ids:
+                root = manager.root_for(vault_id)
+                present = "provisioned" if manager.exists(vault_id) else "MISSING"
+                tag = " (main/shared)" if vault_id == "main" else ""
+                print(f"{vault_id}{tag}  {root}  [{present}]")
+            return 0
+        if action == "provision":
+            result = manager.provision(args.username)
+            if result.created_dir or result.seeded or result.commit:
+                print(f"provisioned vault '{result.vault_id}' at {result.root}")
+                if result.initialized_git:
+                    print("  git repo initialized")
+                if result.seeded:
+                    print("  seeded initial skeleton")
+                if result.commit:
+                    print(f"  baseline commit: {result.commit[:10]}")
+            else:
+                print(
+                    f"vault '{result.vault_id}' already provisioned at "
+                    f"{result.root} (no changes)"
+                )
+            return 0
+        if action == "archive":
+            dest = manager.archive(args.username)
+            print(f"archived vault '{args.username}' to {dest}")
+            print("(git history preserved; the vault is out of the live registry)")
+            return 0
+        if action == "delete":
+            if not args.force:
+                print(
+                    f"refusing to delete vault '{args.username}' without --force. "
+                    "Prefer 'cortex vault archive' (moves it aside, keeps git "
+                    "history); pass --force to destroy it irreversibly.",
+                    file=sys.stderr,
+                )
+                return 2
+            manager.delete(args.username, force=True)
+            print(f"permanently deleted vault '{args.username}' and its index")
+            return 0
+    except VaultManagerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        manager.close()
+    print(f"unknown vault command: {action}", file=sys.stderr)
     return 2
 
 
@@ -640,6 +804,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="report adds/updates/disables/group changes without writing",
     )
     pld_sync.set_defaults(func=cmd_ldap)
+
+    pv = sub.add_parser("vault", help="manage per-user vaults (registry & provisioning)")
+    pv_sub = pv.add_subparsers(dest="vault_command", required=True)
+    pv_sub.add_parser(
+        "list", help="list registered vaults (main + per-user) and their paths"
+    ).set_defaults(func=cmd_vault)
+    pv_prov = pv_sub.add_parser(
+        "provision", help="create/repair a user's vault (idempotent)"
+    )
+    pv_prov.add_argument("username")
+    pv_prov.set_defaults(func=cmd_vault)
+    pv_arch = pv_sub.add_parser(
+        "archive",
+        help="move a user's vault aside (archive_dir/<user>-<ts>), keeping git history",
+    )
+    pv_arch.add_argument("username")
+    pv_arch.set_defaults(func=cmd_vault)
+    pv_del = pv_sub.add_parser(
+        "delete", help="permanently delete a user's vault (guarded — needs --force)"
+    )
+    pv_del.add_argument("username")
+    pv_del.add_argument(
+        "--force",
+        action="store_true",
+        help="required: without it, delete refuses and points you at archive",
+    )
+    pv_del.set_defaults(func=cmd_vault)
 
     pt = sub.add_parser("token", help="manage per-user API bearer tokens")
     pt_sub = pt.add_subparsers(dest="token_command", required=True)

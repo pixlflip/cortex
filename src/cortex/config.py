@@ -72,6 +72,40 @@ class SyncConfig:
 
 
 @dataclass
+class VaultsConfig:
+    """Per-user (multi-)vault registry settings (v2 design §5, B1).
+
+    Public-safe: paths only, no secrets. Entirely optional — when the
+    ``vaults:`` block is absent this whole dataclass takes its defaults and a
+    pure-v1 single-vault deployment behaves exactly as before, because nothing
+    provisions or iterates per-user vaults until a user is actually created.
+
+    * ``root`` — where per-user vault directories live (``root/<username>/``),
+      each its own Obsidian vault + git repo.
+    * ``index_dir`` — where the per-user search-index SQLite caches live
+      (``index_dir/<username>.index.sqlite``). Kept OUTSIDE the vaults so an
+      index is never committed or synced. The main/shared vault keeps using
+      ``index.path`` for backward compatibility.
+    * ``template_dir`` — optional skeleton copied into a freshly provisioned
+      vault (welcome note, folder structure). Unset ⇒ a single welcome note.
+    * ``archive_dir`` — where ``cortex vault archive`` MOVES a vault to
+      (``archive_dir/<username>-<timestamp>/``). Deletes are off by default;
+      archiving preserves the git history rather than destroying it.
+    * ``auto_provision`` — provision a user's vault automatically on user
+      creation. When false, run ``cortex vault provision <user>`` explicitly.
+    * ``sync`` — the default sync adapter inherited by every per-user vault
+      (the main vault keeps using the top-level ``sync:`` block).
+    """
+
+    root: Path = Path("./data/vaults")
+    index_dir: Path = Path("./data/indexes")
+    template_dir: Path | None = None
+    archive_dir: Path = Path("./data/archive")
+    auto_provision: bool = True
+    sync: SyncConfig = field(default_factory=SyncConfig)
+
+
+@dataclass
 class Principal:
     """A named identity that may be granted scoped access to the vault."""
 
@@ -235,6 +269,7 @@ class WritesConfig:
 class CortexConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    vaults: VaultsConfig = field(default_factory=VaultsConfig)
     principals: list[Principal] = field(default_factory=list)
     auth: AuthConfig = field(default_factory=AuthConfig)
     admin: AdminConfig = field(default_factory=AdminConfig)
@@ -273,6 +308,29 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     sync = SyncConfig(
         adapter=sync_raw.get("adapter", "none"),
         options=sync_raw.get("options", {}) or {},
+    )
+
+    def _resolve_dir(value: Any, default: str) -> Path:
+        p = Path(value if value is not None else default)
+        return p if p.is_absolute() else (base_dir / p).resolve()
+
+    vaults_raw = raw.get("vaults", {}) or {}
+    if not isinstance(vaults_raw, dict):
+        raise ConfigError("'vaults' must be a mapping")
+    template_raw = vaults_raw.get("template_dir")
+    vaults_sync_raw = vaults_raw.get("sync", {}) or {}
+    if not isinstance(vaults_sync_raw, dict):
+        raise ConfigError("vaults.sync must be a mapping")
+    vaults = VaultsConfig(
+        root=_resolve_dir(vaults_raw.get("root"), "./data/vaults"),
+        index_dir=_resolve_dir(vaults_raw.get("index_dir"), "./data/indexes"),
+        template_dir=(_resolve_dir(template_raw, "") if template_raw else None),
+        archive_dir=_resolve_dir(vaults_raw.get("archive_dir"), "./data/archive"),
+        auto_provision=bool(vaults_raw.get("auto_provision", True)),
+        sync=SyncConfig(
+            adapter=vaults_sync_raw.get("adapter", "none"),
+            options=vaults_sync_raw.get("options", {}) or {},
+        ),
     )
 
     principals: list[Principal] = []
@@ -375,6 +433,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     cfg = CortexConfig(
         vault=vault,
         sync=sync,
+        vaults=vaults,
         principals=principals,
         auth=auth,
         admin=admin,

@@ -731,8 +731,13 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     if config.database.path.exists():
         from .db import Database
         from .users import IdentityService
+        from .vaults import attach_vault_manager
 
         identity = IdentityService(Database(config.database.path), config)
+        # Attach the vault registry (B1) so a user created through the running
+        # server (admin API) is provisioned a per-user vault. This is the
+        # storage layer only — request-time vault routing/scoping is B2.
+        attach_vault_manager(identity, config)
     authn = Authenticator(
         config,
         admin_store=AdminStore(config.admin.path) if config.admin.enabled else None,
