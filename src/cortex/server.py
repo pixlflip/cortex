@@ -32,7 +32,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .admin import ADMIN_PATH, AdminStore, AdminUI
-from .auth import ADMIN_SUBJECT_PREFIX, Authenticator, AuthError
+from .auth import (
+    ADMIN_SUBJECT_PREFIX,
+    USER_SUBJECT_PREFIX,
+    Authenticator,
+    AuthError,
+)
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .llm import LLMError, build_provider
@@ -166,10 +171,14 @@ class CortexServer:
         *,
         http: HttpServe | None = None,
         admin_store: AdminStore | None = None,
+        identity=None,
     ):
         self.config = config
         self.principal = principal  # None => resolve per-request (HTTP)
         self.admin_store = admin_store or (AdminStore(config.admin.path) if config.admin.enabled else None)
+        # IdentityService (cortex.users) over the SQLite identity DB, when it
+        # exists — the store behind `user:` subjects. None for pure-v1 setups.
+        self.identity = identity
         self.vault = VaultStore(config.vault.path)
         self.index = SearchIndex(
             self.vault,
@@ -228,10 +237,27 @@ class CortexServer:
             raise ValueError("unauthenticated")
         subject = token.subject or ""
         # Resolve against exactly the store that authenticated the token —
-        # never fall through from one to the other. An admin client named
-        # like a config principal must not inherit that principal's scopes,
-        # and vice versa (#9).
-        if subject.startswith(ADMIN_SUBJECT_PREFIX):
+        # never fall through from one to the other. An admin client or DB
+        # user named like a config principal must not inherit that
+        # principal's scopes, and vice versa (#9, generalized).
+        if subject.startswith(USER_SUBJECT_PREFIX):
+            # Re-resolve the *raw bearer token* against the user store on
+            # every call, not just the username: this re-applies the token's
+            # mint-time scope narrowing and makes revocation, expiry, and
+            # user-disable take effect immediately, mid-connection.
+            resolved = (
+                self.identity.resolve_api_token(getattr(token, "token", None))
+                if self.identity is not None
+                else None
+            )
+            principal = None
+            if resolved is not None:
+                candidate, username = resolved
+                # Defense in depth: the token must still belong to the
+                # subject it originally authenticated as.
+                if f"{USER_SUBJECT_PREFIX}{username}" == subject:
+                    principal = candidate
+        elif subject.startswith(ADMIN_SUBJECT_PREFIX):
             principal = (
                 self.admin_store.principal_by_name(subject[len(ADMIN_SUBJECT_PREFIX):])
                 if self.admin_store is not None
@@ -694,7 +720,21 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     """
     sc = config.server
     base = sc.public_url or f"http://{sc.host}:{sc.port}"
-    authn = Authenticator(config, admin_store=AdminStore(config.admin.path) if config.admin.enabled else None)
+    # The SQLite identity store (users, groups, api_tokens, sessions) joins
+    # token resolution when its database exists — created via `cortex init` /
+    # `cortex db init`. Its absence means a pure-v1 setup; nothing is created
+    # implicitly here.
+    identity = None
+    if config.database.path.exists():
+        from .db import Database
+        from .users import IdentityService
+
+        identity = IdentityService(Database(config.database.path), config)
+    authn = Authenticator(
+        config,
+        admin_store=AdminStore(config.admin.path) if config.admin.enabled else None,
+        user_service=identity,
+    )
     restrict = bool(sc.allowed_hosts or sc.allowed_origins)
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=restrict,
@@ -725,4 +765,4 @@ def build_http_server(config: CortexConfig) -> CortexServer:
             auth_settings, transport_security, sc.host, sc.port, sc.path,
             token_verifier=CortexTokenVerifier(authn),
         )
-    return CortexServer(config, principal=None, http=http)
+    return CortexServer(config, principal=None, http=http, identity=identity)

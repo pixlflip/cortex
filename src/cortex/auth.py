@@ -32,11 +32,22 @@ class AuthError(Exception):
 # namespaced subject can never be forged by either side (#9).
 ADMIN_SUBJECT_PREFIX = "client:"
 
+# Subject namespace for identities resolved from SQLite user API tokens (v2
+# design §3.1). Config principal names may not start with this, and the
+# username charset (cortex.users) admits no ':', so a user can never forge a
+# foreign subject — the generalized #9 model.
+USER_SUBJECT_PREFIX = "user:"
+
+_RESERVED_SUBJECT_PREFIXES = (ADMIN_SUBJECT_PREFIX, USER_SUBJECT_PREFIX)
+
 
 class Authenticator:
-    def __init__(self, config: CortexConfig, admin_store=None):
+    def __init__(self, config: CortexConfig, admin_store=None, user_service=None):
         self.config = config
         self.admin_store = admin_store
+        # An IdentityService (cortex.users) when the SQLite identity DB is in
+        # play; duck-typed here to keep this module import-light.
+        self.user_service = user_service
         # Index principals by their (resolved) token for HTTP lookups.
         self._by_token: dict[str, Principal] = {
             p.token: p for p in config.principals if p.token
@@ -44,19 +55,21 @@ class Authenticator:
         self._guard_collisions()
 
     def _guard_collisions(self) -> None:
-        """Refuse to start when an admin-store client shares a name with a
-        config principal, or a config principal squats on the ``client:``
-        subject namespace. Subject namespacing already prevents an admin
-        client from *resolving* to the config principal's scopes, but a
-        collision is always operator error and silently keeping two
-        identically-named identities invites confusion in the audit trail."""
+        """Refuse to start when identities collide across sources: an
+        admin-store client or a DB user sharing a name with a config
+        principal, or a config principal squatting on a reserved subject
+        namespace. Subject namespacing already prevents *resolving* across
+        stores, but a collision is always operator error and silently keeping
+        two identically-named identities invites confusion in the audit
+        trail (#9, generalized to the ``user:`` source)."""
         config_names = {p.name for p in self.config.principals}
         for name in config_names:
-            if name.startswith(ADMIN_SUBJECT_PREFIX):
-                raise AuthError(
-                    f"config principal name {name!r} is reserved: names may not "
-                    f"start with {ADMIN_SUBJECT_PREFIX!r}"
-                )
+            for prefix in _RESERVED_SUBJECT_PREFIXES:
+                if name.startswith(prefix):
+                    raise AuthError(
+                        f"config principal name {name!r} is reserved: names may "
+                        f"not start with {prefix!r}"
+                    )
         if self.admin_store is not None and self.admin_store.exists():
             colliding = sorted(config_names & set(self.admin_store.clients()))
             if colliding:
@@ -64,6 +77,14 @@ class Authenticator:
                     "admin-store client name(s) collide with config principals: "
                     + ", ".join(colliding)
                     + " — rename the client or the principal"
+                )
+        if self.user_service is not None:
+            colliding = sorted(config_names & self.user_service.usernames())
+            if colliding:
+                raise AuthError(
+                    "database username(s) collide with config principals: "
+                    + ", ".join(colliding)
+                    + " — rename the user or the principal"
                 )
 
     def for_stdio(self) -> Principal:
@@ -85,17 +106,25 @@ class Authenticator:
     def resolve_token(self, token: str | None) -> tuple[Principal, str]:
         """Resolve a bearer token to ``(principal, subject)``.
 
-        The subject carries the auth *source*: config principals use their
-        plain name, admin-store clients are namespaced ``client:<name>``.
+        Resolution walks the fixed v2 §3.1 order, stopping at the first
+        match: config principals → SQLite user API tokens → legacy
+        admin-store clients. The subject carries the auth *source*: config
+        principals use their plain name, user tokens are namespaced
+        ``user:<username>``, admin-store clients ``client:<name>``.
         Subject-based resolution later (``_get_principal``) must consult the
-        same store that authenticated the token — otherwise an admin client
-        named like a config principal inherits that principal's scopes (#9).
+        same store that authenticated the token — otherwise an identity in
+        one store named like an identity in another inherits its scopes (#9).
         """
         if not token:
             raise AuthError("missing bearer token")
         for candidate_token, principal in self._by_token.items():
             if hmac.compare_digest(candidate_token, token):
                 return principal, principal.name
+        if self.user_service is not None:
+            resolved = self.user_service.resolve_api_token(token)
+            if resolved is not None:
+                principal, username = resolved
+                return principal, f"{USER_SUBJECT_PREFIX}{username}"
         if self.admin_store is not None:
             principal = self.admin_store.principal_for_token(token)
             if principal is not None:

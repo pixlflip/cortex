@@ -325,10 +325,17 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
 
 def _validate(cfg: CortexConfig) -> None:
     for p in cfg.principals:
+        # Reserved subject namespaces (kept in sync with cortex.auth): a
+        # config principal may not squat on another identity source's prefix.
         if p.name.startswith("client:"):
             raise ConfigError(
                 f"principal name {p.name!r} is invalid: the 'client:' prefix is "
                 "reserved for admin-store AI clients"
+            )
+        if p.name.startswith("user:"):
+            raise ConfigError(
+                f"principal name {p.name!r} is invalid: the 'user:' prefix is "
+                "reserved for database user accounts"
             )
     if cfg.auth.local_principal and cfg.principal(cfg.auth.local_principal) is None:
         raise ConfigError(
