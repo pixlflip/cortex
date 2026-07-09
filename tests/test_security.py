@@ -316,3 +316,87 @@ def test_admin_state_written_owner_only_and_atomically(tmp_path: Path):
     # No stray temp files left behind.
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".cortex.admin")]
     assert leftovers == []
+
+
+# -- #9: admin client colliding with a config principal ----------------------------
+
+def _admin_http_server(tmp_path: Path, vault: Path):
+    from cortex.admin import AdminStore
+    from cortex.config import AdminConfig, ServerConfig
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    store.add_role("public", ["Public/**"])
+    cfg = CortexConfig(
+        vault=VaultConfig(path=vault),
+        index=IndexConfig(enabled=False),
+        principals=[Principal(name="alice", scopes=["**"], token="tok-alice")],
+        admin=AdminConfig(enabled=True, path=store.path),
+        server=ServerConfig(transport="http"),
+    )
+    return store, cfg
+
+
+def test_admin_client_subject_is_namespaced(tmp_path: Path, vault: Path):
+    from cortex.auth import Authenticator
+    from cortex.server import CortexTokenVerifier
+
+    store, cfg = _admin_http_server(tmp_path, vault)
+    token = store.create_client("bot", "public").token
+    v = CortexTokenVerifier(Authenticator(cfg, admin_store=store))
+
+    admin_at = asyncio.run(v.verify_token(token))
+    assert admin_at is not None and admin_at.subject == "client:bot"
+    config_at = asyncio.run(v.verify_token("tok-alice"))
+    assert config_at is not None and config_at.subject == "alice"
+
+
+def test_admin_client_named_like_config_principal_cannot_inherit_its_scopes(
+    tmp_path: Path, vault: Path, monkeypatch
+):
+    """Even if a client named 'alice' exists in the admin store, a token
+    authenticated by the admin store resolves through the admin store only —
+    it never picks up the config principal alice's '**' scopes."""
+    from cortex.server import build_http_server
+    import cortex.server as server_mod
+    from types import SimpleNamespace
+
+    store, cfg = _admin_http_server(tmp_path, vault)
+    srv = build_http_server(cfg)  # no collision yet: builds fine
+    # Collision created at runtime through the admin UI path.
+    store.create_client("alice", "public")
+
+    monkeypatch.setattr(
+        server_mod, "get_access_token", lambda: SimpleNamespace(subject="client:alice")
+    )
+    p = srv._get_principal()
+    assert p.scopes == ["Public/**"]  # the admin role, NOT the config '**'
+
+    # And the plain subject still resolves to the config principal only.
+    monkeypatch.setattr(
+        server_mod, "get_access_token", lambda: SimpleNamespace(subject="alice")
+    )
+    assert srv._get_principal().scopes == ["**"]
+
+
+def test_authenticator_rejects_colliding_names_at_startup(tmp_path: Path, vault: Path):
+    from cortex.auth import AuthError, Authenticator
+
+    store, cfg = _admin_http_server(tmp_path, vault)
+    store.create_client("alice", "public")  # collides with config principal
+    with pytest.raises(AuthError, match="collide"):
+        Authenticator(cfg, admin_store=store)
+
+
+def test_config_rejects_reserved_client_prefix(tmp_path: Path):
+    from cortex.config import ConfigError, load_config
+
+    (tmp_path / "vault").mkdir()
+    cfg_file = tmp_path / "cortex.yaml"
+    cfg_file.write_text(
+        "vault:\n  path: ./vault\n"
+        "principals:\n  - name: 'client:evil'\n    scopes: ['**']\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="reserved"):
+        load_config(cfg_file)

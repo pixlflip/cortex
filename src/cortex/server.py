@@ -32,7 +32,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .admin import ADMIN_PATH, AdminStore, AdminUI
-from .auth import Authenticator, AuthError
+from .auth import ADMIN_SUBJECT_PREFIX, Authenticator, AuthError
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .llm import LLMError, build_provider
@@ -123,14 +123,17 @@ class CortexTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            principal = self._auth.for_token(token)
+            principal, subject = self._auth.resolve_token(token)
         except AuthError:
             return None
         return AccessToken(
             token=token,
             client_id=principal.name,
             scopes=[],
-            subject=principal.name,
+            # Namespaced for admin-store clients (client:<name>) so the
+            # per-call principal resolution consults the same store that
+            # authenticated the token (#9).
+            subject=subject,
             expires_at=None,
         )
 
@@ -223,9 +226,19 @@ class CortexServer:
         token = get_access_token()
         if token is None:
             raise ValueError("unauthenticated")
-        principal = self.config.principal(token.subject or "")
-        if principal is None and self.admin_store is not None:
-            principal = self.admin_store.principal_by_name(token.subject or "")
+        subject = token.subject or ""
+        # Resolve against exactly the store that authenticated the token —
+        # never fall through from one to the other. An admin client named
+        # like a config principal must not inherit that principal's scopes,
+        # and vice versa (#9).
+        if subject.startswith(ADMIN_SUBJECT_PREFIX):
+            principal = (
+                self.admin_store.principal_by_name(subject[len(ADMIN_SUBJECT_PREFIX):])
+                if self.admin_store is not None
+                else None
+            )
+        else:
+            principal = self.config.principal(subject)
         if principal is None:
             raise ValueError("unknown principal")
         return principal

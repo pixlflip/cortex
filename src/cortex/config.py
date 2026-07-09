@@ -307,6 +307,12 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
 
 
 def _validate(cfg: CortexConfig) -> None:
+    for p in cfg.principals:
+        if p.name.startswith("client:"):
+            raise ConfigError(
+                f"principal name {p.name!r} is invalid: the 'client:' prefix is "
+                "reserved for admin-store AI clients"
+            )
     if cfg.auth.local_principal and cfg.principal(cfg.auth.local_principal) is None:
         raise ConfigError(
             f"auth.local_principal '{cfg.auth.local_principal}' is not a defined principal"
