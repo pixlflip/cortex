@@ -467,6 +467,58 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_ldap(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    if cfg.ldap is None:
+        print(
+            "ldap is not configured — add an 'ldap:' block to cortex.yaml "
+            "(see cortex.example.yaml)",
+            file=sys.stderr,
+        )
+        return 2
+    from .ldap import DirectoryService, LdapClient, LdapError, LdapUnavailableError
+
+    action = args.ldap_command
+    try:
+        if action == "check":
+            LdapClient(cfg.ldap).check()
+            print(f"ok: service-account bind to {cfg.ldap.server_uri} succeeded")
+            return 0
+        if action == "sync":
+            identity = _identity(cfg)
+            report = DirectoryService(identity, cfg.ldap).sync(dry_run=args.dry_run)
+            prefix = "would " if report.dry_run else ""
+            sections = (
+                (f"{prefix}add", "+", report.added),
+                (f"{prefix}update", "~", report.updated),
+                (f"{prefix}disable", "-", report.disabled),
+                ("group changes", "", report.group_changes),
+            )
+            for label, marker, items in sections:
+                print(f"{label}: {len(items)}")
+                for item in items:
+                    print(f"  {marker}{' ' if marker else ''}{item}")
+            for reason in report.skipped:
+                print(f"  skipped: {reason}", file=sys.stderr)
+            if report.dry_run:
+                print("dry run: nothing was written.")
+            elif not report.changed:
+                print("already in sync.")
+            return 0
+    except LdapUnavailableError as exc:
+        print(
+            f"error: {exc}\n(directory unreachable — nothing was changed; "
+            "local logins are unaffected)",
+            file=sys.stderr,
+        )
+        return 1
+    except LdapError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"unknown ldap command: {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     cfg = _load(args)
     git = GitAudit(cfg.vault.path, cfg.vault.git)
@@ -571,6 +623,23 @@ def build_parser() -> argparse.ArgumentParser:
     pu_passwd.add_argument("username")
     pu_passwd.add_argument("--password", help="new password (omit to be prompted)")
     pu_passwd.set_defaults(func=cmd_user)
+
+    pld = sub.add_parser("ldap", help="LDAP / Active Directory integration")
+    pld_sub = pld.add_subparsers(dest="ldap_command", required=True)
+    pld_sub.add_parser(
+        "check", help="verify directory connectivity (service-account bind)"
+    ).set_defaults(func=cmd_ldap)
+    pld_sync = pld_sub.add_parser(
+        "sync",
+        help="pull directory users into the DB and reconcile mapped groups "
+        "(vanished users are disabled, never deleted; local users untouched)",
+    )
+    pld_sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report adds/updates/disables/group changes without writing",
+    )
+    pld_sync.set_defaults(func=cmd_ldap)
 
     pt = sub.add_parser("token", help="manage per-user API bearer tokens")
     pt_sub = pt.add_subparsers(dest="token_command", required=True)

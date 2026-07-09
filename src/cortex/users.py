@@ -384,6 +384,18 @@ class IdentityService:
         user = self.users.verify_password(username, password)
         if user is None:
             return None
+        return self.start_session(user)
+
+    def start_session(self, user: dict) -> LoginResult:
+        """Mint a session for an *already-authenticated*, enabled user row.
+
+        Two callers: :meth:`login` (after local PBKDF2 verify) and the A5
+        LDAP path (:class:`cortex.ldap.DirectoryService`, after a successful
+        directory bind — design §9.2 step 4: from here on, LDAP and local
+        users are indistinguishable). Callers own authentication; this owns
+        only session minting."""
+        if user.get("disabled"):
+            raise IdentityError(f"user is disabled: {user['username']}")
         created = self.sessions.create(user["id"], ttl_seconds=self.session_ttl)
         self.users.touch_last_login(user["id"])
         return LoginResult(
