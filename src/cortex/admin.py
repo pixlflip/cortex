@@ -26,12 +26,13 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Principal
+from .pwhash import PASSWORD_ITERS, TOKEN_PREFIX_LEN, check_secret, hash_secret
 
 ADMIN_PATH = "/admin"
-_PASSWORD_ITERS = 200_000
+_PASSWORD_ITERS = PASSWORD_ITERS
 # Length of the persisted token_prefix used to index client-token lookups.
 # Must match what create_client stores (token[:_TOKEN_PREFIX_LEN]).
-_TOKEN_PREFIX_LEN = 12
+_TOKEN_PREFIX_LEN = TOKEN_PREFIX_LEN
 # Admin session cookie lifetime. Sessions silently expire after this.
 COOKIE_TTL = 12 * 3600
 
@@ -44,17 +45,15 @@ def _now() -> int:
     return int(time.time())
 
 
+# Hashing primitives are shared with the SQLite identity store (cortex.pwhash)
+# so admin/client hashes import into SQLite verbatim. The module-level aliases
+# stay because callers (and tests) patch/refer to them by these names.
 def _hash_secret(secret: str, salt: str | None = None) -> tuple[str, str]:
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", secret.encode("utf-8"), bytes.fromhex(salt), _PASSWORD_ITERS
-    ).hex()
-    return salt, digest
+    return hash_secret(secret, salt)
 
 
 def _check_secret(secret: str, *, salt: str, digest: str) -> bool:
-    _, candidate = _hash_secret(secret, salt)
-    return hmac.compare_digest(candidate, digest)
+    return check_secret(secret, salt=salt, digest=digest)
 
 
 @dataclass
