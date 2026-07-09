@@ -38,7 +38,52 @@ from .gitlog import GitAudit
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .search_index import IndexHit, SearchIndex
-from .vault import VaultError, VaultStore, _FRONTMATTER_RE
+from .vault import NOTE_SUFFIXES, VaultError, VaultStore, _FRONTMATTER_RE
+
+
+def _canonical_note_path(path: str) -> str | None:
+    """Canonicalize a caller-supplied path to its vault-relative POSIX form.
+
+    Returns the normalized path, or None if the path must be rejected. This
+    runs BEFORE any scope check so scopes are always evaluated against the
+    exact path the filesystem layer will resolve — a raw string like
+    ``Projects/../Private/secret.md`` matches a ``Projects/**`` scope
+    textually while resolving inside ``Private/``, which is a scope bypass,
+    not a cosmetic mismatch (#5).
+
+    Rejected outright (never notes, or ambiguous under scoping):
+
+    * empty paths, NUL bytes;
+    * absolute paths (``/etc/...``, ``C:...``) and backslash separators;
+    * any ``..`` segment — even one that stays inside the vault crosses
+      scope boundaries;
+    * any hidden component (``.git``, ``.obsidian``, ``.trash`` ...), the
+      same exclusion ``iter_notes`` applies when listing (#6);
+    * non-note suffixes — path-addressed tools only ever serve notes, so
+      ``.git/config``-style exfiltration targets are out of the address
+      space entirely (#6).
+
+    ``.``/empty segments are dropped, so ``Public//./open.md`` canonicalizes
+    to ``Public/open.md`` and is scope-checked as such.
+    """
+    if not path or "\x00" in path or "\\" in path:
+        return None
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return None
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == ".." or segment.startswith("."):
+            return None
+        parts.append(segment)
+    if not parts:
+        return None
+    dot = parts[-1].rfind(".")
+    suffix = parts[-1][dot:].lower() if dot > 0 else ""
+    if suffix not in NOTE_SUFFIXES:
+        return None
+    return "/".join(parts)
 
 
 def _validate_frontmatter_block(content: str, path: str) -> None:
@@ -188,23 +233,38 @@ class CortexServer:
     # -- scope helpers -----------------------------------------------------
 
     @staticmethod
-    def _require_visible(principal: Principal, path: str) -> None:
-        if not path_allowed(path, principal.scopes):
+    def _require_visible(principal: Principal, path: str) -> str:
+        """Canonicalize ``path`` and check it against the read scopes.
+
+        Returns the canonical vault-relative path, which the caller MUST use
+        for the actual vault operation — checking the raw string and then
+        resolving it independently is exactly the check/use gap that allowed
+        the ``..`` scope bypass (#5). A malformed path (traversal, hidden
+        component, non-note suffix) gets the same non-leaking wording as an
+        out-of-scope one, so nothing is distinguishable from "absent"."""
+        norm = _canonical_note_path(path)
+        if norm is None or not path_allowed(norm, principal.scopes):
             # Do not distinguish "absent" from "out of scope".
             raise ValueError(f"note not found or not in scope: {path}")
+        return norm
 
     @staticmethod
-    def _require_writable(principal: Principal, path: str) -> None:
+    def _require_writable(principal: Principal, path: str) -> str:
         """A principal may mutate ``path`` iff it's in ``write_scopes`` —
         falling back to its read ``scopes`` when ``write_scopes`` is unset, so
         writes work immediately with no extra config. Setting ``write_scopes``
         narrows the writable area independent of what's readable; this is the
-        hook for per-principal write permissioning, deferred for now."""
+        hook for per-principal write permissioning, deferred for now.
+
+        Like ``_require_visible``, canonicalizes first and returns the
+        canonical path the caller must operate on."""
+        norm = _canonical_note_path(path)
         scopes = principal.write_scopes or principal.scopes
-        if not path_allowed(path, scopes):
+        if norm is None or not path_allowed(norm, scopes):
             # Same non-leaking wording as _require_visible: don't distinguish
             # "absent" from "not in scope".
             raise ValueError(f"not found or not in scope: {path}")
+        return norm
 
     def _status_payload(self, principal: Principal) -> dict:
         """Deterministic freshness/visibility snapshot for ``principal``, the
@@ -311,7 +371,7 @@ class CortexServer:
         overwrite: bool = False,
         validate_frontmatter: bool = True,
     ) -> dict:
-        self._require_writable(principal, path)
+        path = self._require_writable(principal, path)
         if validate_frontmatter:
             _validate_frontmatter_block(content, path)
         exists = self.vault.exists(path)
@@ -324,7 +384,7 @@ class CortexServer:
     def _do_patch_note(
         self, principal: Principal, path: str, old_string: str, new_string: str, reason: str
     ) -> dict:
-        self._require_writable(principal, path)
+        path = self._require_writable(principal, path)
         try:
             text = self.vault.read_text(path)
         except VaultError as exc:
@@ -342,7 +402,7 @@ class CortexServer:
     def _do_append_note(
         self, principal: Principal, path: str, text: str, reason: str, *, separator: str = "\n\n"
     ) -> dict:
-        self._require_writable(principal, path)
+        path = self._require_writable(principal, path)
         try:
             self.vault.append(path, text, separator=separator)
         except VaultError as exc:
@@ -353,7 +413,7 @@ class CortexServer:
     def _do_update_frontmatter(
         self, principal: Principal, path: str, patch: dict, reason: str
     ) -> dict:
-        self._require_writable(principal, path)
+        path = self._require_writable(principal, path)
         if not isinstance(patch, dict):
             raise ValueError("patch must be a mapping")
         try:
@@ -366,7 +426,7 @@ class CortexServer:
         return {"path": path, "frontmatter": note.frontmatter, "commit": sha}
 
     def _do_delete_note(self, principal: Principal, path: str, reason: str) -> dict:
-        self._require_writable(principal, path)
+        path = self._require_writable(principal, path)
         try:
             self.vault.delete_note(path)
         except VaultError as exc:
@@ -445,7 +505,7 @@ class CortexServer:
         def read_note(path: str, include_frontmatter: bool = True) -> str:
             """Read a full note by its vault-relative path. Scope-checked."""
             p = self._get_principal()
-            self._require_visible(p, path)
+            path = self._require_visible(p, path)
             try:
                 note = self.vault.read_note(path)
             except VaultError as exc:
@@ -456,7 +516,7 @@ class CortexServer:
         def read_frontmatter(path: str) -> dict:
             """Read just the YAML frontmatter of a note. Scope-checked."""
             p = self._get_principal()
-            self._require_visible(p, path)
+            path = self._require_visible(p, path)
             try:
                 return self.vault.read_frontmatter(path)
             except VaultError as exc:
@@ -467,7 +527,7 @@ class CortexServer:
             """Read a single section of a note, identified by its heading text.
             Scope-checked."""
             p = self._get_principal()
-            self._require_visible(p, path)
+            path = self._require_visible(p, path)
             try:
                 return self.vault.read_section(path, heading)
             except VaultError as exc:
