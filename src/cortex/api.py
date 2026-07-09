@@ -54,7 +54,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .config import CortexConfig
-from .ldap import DirectoryService, LdapUnavailableError
+from .ldap import DirectoryService, LdapError
 from .sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from .users import AuthzError, IdentityError, IdentityService
 
@@ -228,7 +228,14 @@ class ApiV1:
                 response = error_response(403, "forbidden", str(exc))
             except IdentityError as exc:
                 response = error_response(400, "invalid_request", str(exc))
-            except LdapUnavailableError:
+            except LdapError:
+                # Covers LdapUnavailableError (outage) and configuration/
+                # protocol failures alike: callers get one non-revealing 503
+                # and the details stay in the server log. Local logins never
+                # reach the directory path, so they are unaffected (§7.4).
+                log.warning(
+                    "directory failure on %s %s", request.method, request.url.path
+                )
                 response = error_response(
                     503,
                     "directory_unavailable",
