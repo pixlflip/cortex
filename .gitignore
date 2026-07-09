@@ -24,6 +24,10 @@ cortex.admin.json
 ._sync_*.db*
 *.~lock*
 
+# v2 stateful data dir: the SQLite identity/gateway DB, per-vault indexes,
+# and per-user vaults (design §5). Never commit any of it.
+/data/
+
 # Search index — a rebuildable SQLite FTS5 cache derived from the vault.
 # Never commit this; 'cortex index' regenerates it from the notes on disk.
 cortex.index.sqlite*

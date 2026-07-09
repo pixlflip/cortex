@@ -13,6 +13,8 @@ Commands:
     cortex index     Build/refresh the FTS5 search index and report stats.
     cortex sync      Snapshot pending vault changes, reindex, and (adapter:
                      git) pull/push. Intended to be run on a timer.
+    cortex db        Manage the SQLite identity/gateway database:
+                     init | migrate | status | import-admin.
 """
 
 from __future__ import annotations
@@ -226,6 +228,86 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_db(args: argparse.Namespace) -> int:
+    cfg = _load(args)
+    # Imported here (like serve) to keep unrelated commands lean.
+    from .db import Database, MigrationsPendingError, import_admin_state, latest_version
+    from .db.core import schema_version_of
+
+    path = cfg.database.path
+    action = args.db_command
+
+    if action == "status":
+        if not path.exists():
+            print(f"database: {path} (absent — run 'cortex db init')")
+            return 0
+        try:
+            db = Database(path, auto_migrate=False)
+        except MigrationsPendingError as exc:
+            print(f"database: {path}")
+            print(f"  schema:  BEHIND — {exc}")
+            return 1
+        print(f"database: {path}")
+        print(f"  schema:  version {db.schema_version()} (latest {latest_version()})")
+        for table, count in db.table_counts().items():
+            print(f"  {table}: {count} row(s)")
+        return 0
+
+    if action in ("init", "migrate"):
+        existed = path.exists()
+        version_before = schema_version_of(path)
+        db = Database(path)  # opens, checks version, applies pending forward
+        version_after = db.schema_version()
+        if not existed:
+            print(f"created database at {path}")
+        if version_after > version_before:
+            print(f"applied migrations: {version_before} -> {version_after}")
+        else:
+            print(f"schema up to date (version {version_after})")
+        if action == "init":
+            report = import_admin_state(db, cfg.admin.path)
+            if report.changed:
+                created = (
+                    len(report.users_created)
+                    + len(report.groups_created)
+                    + len(report.tokens_created)
+                )
+                print(
+                    f"imported legacy admin state from {cfg.admin.path}: "
+                    f"{created} row(s) created"
+                )
+            elif not report.warnings:
+                print("legacy admin state already imported (or empty).")
+        return 0
+
+    if action == "import-admin":
+        db = Database(path)
+        report = import_admin_state(db, cfg.admin.path)
+        for name in report.users_created:
+            print(f"  user created:  {name}")
+        for name in report.groups_created:
+            print(f"  group created: {name} (from role)")
+        for name in report.tokens_created:
+            print(f"  token imported: {name}")
+        for name in report.memberships_added:
+            print(f"  membership:    {name}")
+        skipped = (
+            len(report.users_skipped)
+            + len(report.groups_skipped)
+            + len(report.tokens_skipped)
+        )
+        if skipped:
+            print(f"  skipped (already present): {skipped}")
+        for warning in report.warnings:
+            print(f"  warning: {warning}", file=sys.stderr)
+        if not report.changed and not report.warnings:
+            print("nothing to import (already up to date).")
+        return 0
+
+    print(f"unknown db command: {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     cfg = _load(args)
     git = GitAudit(cfg.vault.path, cfg.vault.git)
@@ -290,6 +372,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "sync", help="snapshot pending vault changes, reindex, and (adapter: git) pull/push"
     ).set_defaults(func=cmd_sync)
+
+    pd = sub.add_parser("db", help="manage the SQLite identity/gateway database")
+    pd_sub = pd.add_subparsers(dest="db_command", required=True)
+    pd_sub.add_parser(
+        "init",
+        help="create the database, apply migrations, and import legacy admin state",
+    ).set_defaults(func=cmd_db)
+    pd_sub.add_parser("migrate", help="apply pending schema migrations").set_defaults(
+        func=cmd_db
+    )
+    pd_sub.add_parser(
+        "status", help="show schema version and table row counts"
+    ).set_defaults(func=cmd_db)
+    pd_sub.add_parser(
+        "import-admin",
+        help="import cortex.admin.json (admin login, roles, AI clients) into the database",
+    ).set_defaults(func=cmd_db)
 
     return p
 

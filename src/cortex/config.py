@@ -108,6 +108,15 @@ class AdminConfig:
 
 
 @dataclass
+class DatabaseConfig:
+    # SQLite identity/gateway database (v2 design §4/§5): users, groups,
+    # sessions, API tokens, MCP server registry, tool permissions, tool-call
+    # audit. Holds salted hashes only — never plaintext secrets, never note
+    # content. Relative paths resolve next to cortex.yaml. Never commit this.
+    path: Path = Path("./data/cortex.sqlite")
+
+
+@dataclass
 class IndexConfig:
     enabled: bool = True
     # SQLite FTS5 ranked-search cache, derived from the vault. Relative paths
@@ -168,6 +177,7 @@ class CortexConfig:
     principals: list[Principal] = field(default_factory=list)
     auth: AuthConfig = field(default_factory=AuthConfig)
     admin: AdminConfig = field(default_factory=AdminConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
@@ -242,6 +252,12 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         path=admin_path,
     )
 
+    database_raw = raw.get("database", {}) or {}
+    database_path = Path(database_raw.get("path", "./data/cortex.sqlite"))
+    if not database_path.is_absolute():
+        database_path = (base_dir / database_path).resolve()
+    database = DatabaseConfig(path=database_path)
+
     index_raw = raw.get("index", {}) or {}
     index_path = Path(index_raw.get("path", "./cortex.index.sqlite"))
     if not index_path.is_absolute():
@@ -296,6 +312,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         principals=principals,
         auth=auth,
         admin=admin,
+        database=database,
         index=index,
         server=server,
         llm=llm,

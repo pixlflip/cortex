@@ -57,6 +57,14 @@ admin:
   # Keep this local and out of git; the generated admin password is shown once.
   path: ./cortex.admin.json
 
+database:
+  # SQLite identity/gateway database (v2): users, groups, sessions, API
+  # tokens, MCP server registry, tool permissions, tool-call audit. Created
+  # by `cortex db init`. Stores salted hashes only — never plaintext secrets,
+  # never note content. Keep it local and out of git (gitignored by default).
+  # Relative paths resolve next to this file.
+  path: ./data/cortex.sqlite
+
 index:
   # SQLite FTS5/BM25 ranked search over the vault, used by `search`,
   # `context_pack`, and `semantic_search`. Built/refreshed by `cortex index`
