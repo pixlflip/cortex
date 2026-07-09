@@ -137,3 +137,182 @@ def test_write_tools_cannot_target_hidden_paths(vault: Path):
     with pytest.raises(ValueError, match="not found or not in scope"):
         srv._do_delete_note(p, ".git/config", "hidden delete")
     assert (vault / ".git" / "config").exists()
+
+
+# -- #7 / #19: admin auth + cookie hardening -------------------------------------
+
+def _fake_request(path: str = "/admin", cookie: str | None = None):
+    from starlette.requests import Request
+
+    headers = []
+    if cookie is not None:
+        headers.append((b"cookie", f"cortex_admin={cookie}".encode()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "headers": headers,
+        "query_string": b"",
+        "scheme": "http",
+        "server": ("testserver", 80),
+    }
+    return Request(scope)
+
+
+def test_uninitialized_store_has_no_cookie_secret(tmp_path: Path):
+    from cortex.admin import AdminNotInitializedError, AdminStore
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    with pytest.raises(AdminNotInitializedError):
+        store.cookie_secret()
+
+
+def test_admin_ui_refuses_until_initialized(tmp_path: Path):
+    from cortex.admin import AdminStore, AdminUI
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    ui = AdminUI(store, "http://127.0.0.1:8765")
+    resp = asyncio.run(ui.handle(_fake_request()))
+    assert resp.status_code == 503
+
+    store.ensure_initialized()
+    resp = asyncio.run(ui.handle(_fake_request()))
+    assert resp.status_code == 200  # login page now served
+
+
+def test_cookie_secret_is_random_not_password_hash(tmp_path: Path):
+    from cortex.admin import AdminStore
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    data = store.load()
+    secret = store.cookie_secret()
+    assert secret
+    assert secret != data["admin"]["password_hash"]
+    assert secret != "uninitialized"
+    # Two installs never share a secret.
+    other = AdminStore(tmp_path / "other.admin.json")
+    other.ensure_initialized()
+    assert other.cookie_secret() != secret
+
+
+def test_cookie_secret_migrated_for_legacy_state(tmp_path: Path):
+    """A pre-hardening state file (no cookie_secret) gets a random one minted
+    on first use instead of falling back to the password hash."""
+    from cortex.admin import AdminStore
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    data = store.load()
+    del data["admin"]["cookie_secret"]
+    store.save(data)
+    secret = store.cookie_secret()
+    assert secret and secret != data["admin"]["password_hash"]
+    assert store.load()["admin"]["cookie_secret"] == secret  # persisted
+
+
+def test_admin_cookie_expires_and_rejects_tampering(tmp_path: Path, monkeypatch):
+    import cortex.admin as admin_mod
+    from cortex.admin import AdminStore, AdminUI, COOKIE_TTL
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    ui = AdminUI(store, "http://127.0.0.1:8765")
+
+    cookie = ui._sign("admin")
+    assert ui._is_logged_in(_fake_request(cookie=cookie))
+
+    # No cookie / garbage / legacy deterministic format: rejected.
+    assert not ui._is_logged_in(_fake_request())
+    assert not ui._is_logged_in(_fake_request(cookie="admin.deadbeef"))
+    legacy_sig = __import__("hmac").new(
+        store.load()["admin"]["password_hash"].encode(), b"admin", __import__("hashlib").sha256
+    ).hexdigest()
+    assert not ui._is_logged_in(_fake_request(cookie=f"admin.{legacy_sig}"))
+
+    # Tampered payload (extended expiry) fails signature verification.
+    payload, sig = cookie.rsplit(".", 1)
+    value, issued, exp = payload.split(".")
+    forged = f"{value}.{issued}.{int(exp) + 9999}.{sig}"
+    assert not ui._is_logged_in(_fake_request(cookie=forged))
+
+    # Past its expiry the same genuine cookie stops working.
+    real_now = admin_mod._now
+    monkeypatch.setattr(admin_mod, "_now", lambda: real_now() + COOKIE_TTL + 1)
+    assert not ui._is_logged_in(_fake_request(cookie=cookie))
+
+
+# -- #14: PBKDF2-per-client token lookup DoS --------------------------------------
+
+def test_token_lookup_hashes_at_most_one_candidate(tmp_path: Path, monkeypatch):
+    import cortex.admin as admin_mod
+    from cortex.admin import AdminStore
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    store.add_role("r", ["Public/**"])
+    tokens = [store.create_client(f"c{i}", "r").token for i in range(5)]
+
+    calls = []
+    real_check = admin_mod._check_secret
+
+    def counting_check(secret, *, salt, digest):
+        calls.append(secret)
+        return real_check(secret, salt=salt, digest=digest)
+
+    monkeypatch.setattr(admin_mod, "_check_secret", counting_check)
+
+    # A bogus token matching no stored prefix costs zero PBKDF2 runs.
+    assert store.principal_for_token("ctx_totally-bogus-token") is None
+    assert len(calls) == 0
+
+    # A valid token verifies against exactly one candidate, not all five.
+    p = store.principal_for_token(tokens[3])
+    assert p is not None and p.name == "c3"
+    assert len(calls) == 1
+
+
+# -- #17: admin store lost updates -------------------------------------------------
+
+def test_concurrent_role_and_client_creation_loses_nothing(tmp_path: Path):
+    import threading
+
+    from cortex.admin import AdminStore
+
+    path = tmp_path / "cortex.admin.json"
+    AdminStore(path).ensure_initialized()
+    # Separate store instances (separate fds/caches) hammering the same file.
+    errors: list[Exception] = []
+
+    def add(i: int):
+        try:
+            AdminStore(path).add_role(f"role-{i}", [f"Area{i}/**"])
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=add, args=(i,)) for i in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    roles = AdminStore(path).roles()
+    for i in range(12):
+        assert roles[f"role-{i}"] == [f"Area{i}/**"]
+
+
+# -- #18: state file is 0600 from the first byte -----------------------------------
+
+def test_admin_state_written_owner_only_and_atomically(tmp_path: Path):
+    from cortex.admin import AdminStore
+
+    store = AdminStore(tmp_path / "cortex.admin.json")
+    store.ensure_initialized()
+    assert store.path.stat().st_mode & 0o777 == 0o600
+
+    store.add_role("x", ["X/**"])
+    assert store.path.stat().st_mode & 0o777 == 0o600
+    # No stray temp files left behind.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".cortex.admin")]
+    assert leftovers == []

@@ -7,15 +7,20 @@ password/token hashes and should never be committed.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import hashlib
 import hmac
 import html
 import json
+import os
 import secrets
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -24,6 +29,15 @@ from .config import Principal
 
 ADMIN_PATH = "/admin"
 _PASSWORD_ITERS = 200_000
+# Length of the persisted token_prefix used to index client-token lookups.
+# Must match what create_client stores (token[:_TOKEN_PREFIX_LEN]).
+_TOKEN_PREFIX_LEN = 12
+# Admin session cookie lifetime. Sessions silently expire after this.
+COOKIE_TTL = 12 * 3600
+
+
+class AdminNotInitializedError(Exception):
+    """The admin state file does not exist yet (run ``cortex init``)."""
 
 
 def _now() -> int:
@@ -56,38 +70,97 @@ class AdminStore:
     def __init__(self, path: Path):
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # In-process guard around read-modify-write cycles; the flock in
+        # _locked() extends the same guarantee across processes (#17).
+        self._mutex = threading.Lock()
+        # Parsed-state cache keyed by (mtime_ns, size) so hot paths (every
+        # bearer-token lookup) don't re-read and re-parse the JSON file (#14).
+        self._cache_sig: tuple[int, int] | None = None
+        self._cache_data: dict[str, Any] | None = None
 
     # -- persistence -----------------------------------------------------
     def exists(self) -> bool:
         return self.path.exists()
 
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize read-modify-write cycles: a threading lock for callers in
+        this process plus an ``flock`` on a sidecar lock file for other
+        processes sharing the state file (#17)."""
+        with self._mutex:
+            lock_path = self.path.with_name(self.path.name + ".lock")
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                try:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except ImportError:  # pragma: no cover - non-POSIX fallback
+                    pass
+                yield
+            finally:
+                os.close(fd)
+
     def load(self) -> dict[str, Any]:
         if not self.exists():
             return {}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        stat = self.path.stat()
+        sig = (stat.st_mtime_ns, stat.st_size)
+        if sig != self._cache_sig:
+            self._cache_data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._cache_sig = sig
+        # Deep-copy so callers mutating the returned dict (load→mutate→save)
+        # can't corrupt the cache behind other readers.
+        return copy.deepcopy(self._cache_data or {})
 
     def save(self, data: dict[str, Any]) -> None:
-        self.path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.path.chmod(0o600)
+        """Atomically persist state, owner-readable from the very first byte.
+
+        The temp file is created 0600 by ``mkstemp`` in the same directory and
+        swapped into place with ``os.replace``, so there is never a moment
+        where the file exists world-readable (#18) or half-written."""
+        payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=f".{self.path.name}."
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, self.path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        self._cache_sig = None
 
     def ensure_initialized(self) -> str | None:
         """Create admin state if absent. Returns the one-time password if new."""
-        if self.exists():
-            return None
-        password = secrets.token_urlsafe(18)
-        salt, digest = _hash_secret(password)
-        self.save(
-            {
-                "admin": {"username": "admin", "salt": salt, "password_hash": digest},
-                "roles": {
-                    "admin": ["**"],
-                    "public": ["Public/**"],
-                },
-                "clients": {},
-                "created_at": _now(),
-            }
-        )
-        return password
+        with self._locked():
+            if self.exists():
+                return None
+            password = secrets.token_urlsafe(18)
+            salt, digest = _hash_secret(password)
+            self.save(
+                {
+                    "admin": {
+                        "username": "admin",
+                        "salt": salt,
+                        "password_hash": digest,
+                        # Random server secret for signing admin session
+                        # cookies — never derived from a constant or from the
+                        # password hash (#7, #19).
+                        "cookie_secret": secrets.token_hex(32),
+                    },
+                    "roles": {
+                        "admin": ["**"],
+                        "public": ["Public/**"],
+                    },
+                    "clients": {},
+                    "created_at": _now(),
+                }
+            )
+            return password
 
     # -- admin auth ------------------------------------------------------
     def authenticate_admin(self, username: str, password: str) -> bool:
@@ -102,8 +175,27 @@ class AdminStore:
         return _check_secret(password, salt=salt, digest=digest)
 
     def cookie_secret(self) -> str:
+        """The random per-install secret that signs admin session cookies.
+
+        Never a constant and never derived from the password hash: an
+        uninitialized store raises instead of returning a guessable value
+        (#7), and a pre-#19 state file lacking a secret is migrated by
+        minting one on first use."""
         admin = self.load().get("admin", {})
-        return str(admin.get("password_hash") or "uninitialized")
+        if not admin:
+            raise AdminNotInitializedError(
+                f"admin store is not initialized: {self.path} (run 'cortex init')"
+            )
+        secret = admin.get("cookie_secret")
+        if secret:
+            return str(secret)
+        with self._locked():
+            data = self.load()
+            admin = data.setdefault("admin", {})
+            if not admin.get("cookie_secret"):
+                admin["cookie_secret"] = secrets.token_hex(32)
+                self.save(data)
+            return str(admin["cookie_secret"])
 
     # -- roles -----------------------------------------------------------
     def roles(self) -> dict[str, list[str]]:
@@ -116,9 +208,10 @@ class AdminStore:
             raise ValueError("role name is required")
         if not scopes:
             raise ValueError("at least one scope is required")
-        data = self.load()
-        data.setdefault("roles", {})[name] = scopes
-        self.save(data)
+        with self._locked():
+            data = self.load()
+            data.setdefault("roles", {})[name] = scopes
+            self.save(data)
 
     # -- clients ---------------------------------------------------------
     def clients(self) -> dict[str, dict[str, Any]]:
@@ -128,28 +221,37 @@ class AdminStore:
         name = _clean_name(name)
         if not name:
             raise ValueError("client name is required")
-        data = self.load()
-        roles = data.setdefault("roles", {})
-        if role not in roles:
-            raise ValueError(f"unknown role: {role}")
         token = "ctx_" + secrets.token_urlsafe(32)
         salt, digest = _hash_secret(token)
-        data.setdefault("clients", {})[name] = {
-            "role": role,
-            "salt": salt,
-            "token_hash": digest,
-            "token_prefix": token[:12],
-            "created_at": _now(),
-        }
-        self.save(data)
+        with self._locked():
+            data = self.load()
+            roles = data.setdefault("roles", {})
+            if role not in roles:
+                raise ValueError(f"unknown role: {role}")
+            data.setdefault("clients", {})[name] = {
+                "role": role,
+                "salt": salt,
+                "token_hash": digest,
+                "token_prefix": token[:_TOKEN_PREFIX_LEN],
+                "created_at": _now(),
+            }
+            self.save(data)
         return CreatedClient(name=name, role=role, token=token)
 
     def principal_for_token(self, token: str | None) -> Principal | None:
+        """Resolve a client token, running PBKDF2 only against the candidates
+        whose persisted ``token_prefix`` matches the presented token's prefix
+        — normally exactly one — instead of every client. An invalid token
+        that matches no prefix costs zero PBKDF2 iterations, closing the
+        CPU-exhaustion DoS of hashing per client per bogus request (#14)."""
         if not token:
             return None
         data = self.load()
         roles = data.get("roles", {})
+        prefix = token[:_TOKEN_PREFIX_LEN]
         for name, info in data.get("clients", {}).items():
+            if info.get("token_prefix") != prefix:
+                continue
             salt = info.get("salt")
             digest = info.get("token_hash")
             role = info.get("role")
@@ -174,6 +276,16 @@ class AdminUI:
         self.base = base_url.rstrip("/")
 
     async def handle(self, request: Request) -> Response:
+        if not self.store.exists():
+            # Refuse to serve anything until 'cortex init' has generated the
+            # admin credentials and cookie secret. Serving a login flow whose
+            # cookie key would otherwise fall back to a guessable value lets
+            # anyone mint a valid session offline (#7).
+            return HTMLResponse(
+                "Cortex admin is not initialized. Run <code>cortex init</code> "
+                "on the server first.",
+                status_code=503,
+            )
         subpath = request.url.path[len(ADMIN_PATH):] or "/"
         if request.method == "POST" and subpath == "/login":
             return await self._login(request)
@@ -196,7 +308,16 @@ class AdminUI:
         if not self.store.authenticate_admin(username, password):
             return self._login_page("Invalid username or password", status=401)
         resp = RedirectResponse(f"{self.base}{ADMIN_PATH}", status_code=303)
-        resp.set_cookie("cortex_admin", self._sign("admin"), httponly=True, samesite="lax")
+        resp.set_cookie(
+            "cortex_admin",
+            self._sign("admin"),
+            max_age=COOKIE_TTL,
+            httponly=True,
+            samesite="lax",
+            # Only mark Secure when actually served over HTTPS — otherwise a
+            # plain-HTTP localhost setup could never log in at all.
+            secure=self.base.startswith("https://"),
+        )
         return resp
 
     async def _create_role(self, request: Request) -> Response:
@@ -218,12 +339,42 @@ class AdminUI:
             return self._dashboard(error=str(exc), status=400)
 
     def _is_logged_in(self, request: Request) -> bool:
+        """Verify the session cookie: HMAC over ``value.issued_at.exp`` with
+        the store's random cookie secret, then an expiry check. A cookie
+        signed under an old secret, tampered with, or past its expiry is
+        simply not a session (#19)."""
         cookie = request.cookies.get("cortex_admin", "")
-        return hmac.compare_digest(cookie, self._sign("admin"))
+        parts = cookie.rsplit(".", 1)
+        if len(parts) != 2:
+            return False
+        payload, sig = parts
+        try:
+            expected = hmac.new(
+                self.store.cookie_secret().encode(), payload.encode(), hashlib.sha256
+            ).hexdigest()
+        except AdminNotInitializedError:
+            return False
+        if not hmac.compare_digest(sig, expected):
+            return False
+        fields = payload.split(".")
+        if len(fields) != 3 or fields[0] != "admin":
+            return False
+        try:
+            issued_at, expires_at = int(fields[1]), int(fields[2])
+        except ValueError:
+            return False
+        now = _now()
+        return issued_at <= now < expires_at
 
     def _sign(self, value: str) -> str:
-        sig = hmac.new(self.store.cookie_secret().encode(), value.encode(), hashlib.sha256).hexdigest()
-        return f"{value}.{sig}"
+        """Mint a session cookie: ``value.issued_at.exp.sig`` where sig is an
+        HMAC-SHA256 over the whole payload with the random server secret."""
+        issued_at = _now()
+        payload = f"{value}.{issued_at}.{issued_at + COOKIE_TTL}"
+        sig = hmac.new(
+            self.store.cookie_secret().encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        return f"{payload}.{sig}"
 
     def _login_page(self, error: str = "", status: int = 200) -> HTMLResponse:
         err = f'<p class="err">{html.escape(error)}</p>' if error else ""
