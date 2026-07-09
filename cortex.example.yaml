@@ -132,6 +132,44 @@ writes:
   # for later; this switch plus git history is the safety net in the meantime.
   enabled: false
 
+# LDAP / Active Directory integration (optional — the feature is fully OFF
+# while this block is absent). Requires the 'ldap' extra:
+#   pip install 'cortex-memory[ldap]'
+#
+# When configured, a login for an LDAP-backed (or unknown) username is
+# verified by binding against the directory (search-then-bind); local users
+# always keep local password auth. LDAP users are rows with
+# auth_source=ldap and NO local password material — Cortex never stores or
+# logs directory passwords. The service-account password comes from the env
+# var named by bind_password_env, never from this file. If the directory is
+# unreachable, LDAP users simply can't start new sessions; local logins
+# (including the local admin) are unaffected.
+#
+# ldap:
+#   server_uri: ldaps://ad.example.com:636    # or ldap://... with starttls
+#   starttls: false              # upgrade a plain ldap:// URI to TLS
+#   # allow_insecure: true       # lab-only escape hatch; binds carry passwords
+#   bind_dn: CN=cortex-svc,OU=Service Accounts,DC=example,DC=com
+#   bind_password_env: CORTEX_LDAP_BIND_PASSWORD   # env var NAME, not the secret
+#   user_base_dn: OU=People,DC=example,DC=com
+#   # {username} is substituted with the RFC 4515-escaped login name:
+#   user_filter: "(sAMAccountName={username})"
+#   attributes:                  # directory attribute -> Cortex user field
+#     username: sAMAccountName   # OpenLDAP: uid
+#     display_name: displayName  # OpenLDAP: cn
+#     email: mail
+#   group_base_dn: OU=Groups,DC=example,DC=com
+#   group_filter: "(objectClass=group)"        # OpenLDAP: (objectClass=groupOfNames)
+#   group_member_attr: member                  # one level deep — no nested groups
+#   # LDAP group (DN, or its name/cn) -> Cortex group. Only mapped groups are
+#   # reconciled; local-only Cortex groups are never touched by LDAP.
+#   group_mappings:
+#     "CN=Engineering,OU=Groups,DC=example,DC=com": engineering
+#     "CN=Ops,OU=Groups,DC=example,DC=com": ops
+#   # Create the Cortex user row on first successful directory login. When
+#   # false, only users pre-created by `cortex ldap sync` may log in.
+#   jit_provisioning: true
+
 janitor:
   enabled: false               # dark by default — keep it off until spec'd
   dry_run: true                # report-only before any write mode
