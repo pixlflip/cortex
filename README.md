@@ -117,6 +117,7 @@ commit (always `git revert`-able):
 | `append_note` | Append text to an existing note |
 | `update_frontmatter` | Merge a patch into a note's YAML frontmatter |
 | `delete_note` | Delete one note file (committed, so still recoverable) |
+| `move_note` | Move/rename a note when both paths are writable |
 
 ---
 

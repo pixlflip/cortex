@@ -68,7 +68,9 @@ def _tool_names(srv: CortexServer) -> set[str]:
     return {t.name for t in srv.mcp._tool_manager.list_tools()}
 
 
-MUTATING_TOOLS = {"write_note", "patch_note", "append_note", "update_frontmatter", "delete_note"}
+MUTATING_TOOLS = {
+    "write_note", "patch_note", "append_note", "update_frontmatter", "delete_note", "move_note",
+}
 
 
 # -- global enable switch -----------------------------------------------------
@@ -284,6 +286,157 @@ def test_delete_note_does_not_accept_directories(vault: Path):
     with pytest.raises(ValueError):
         srv._do_delete_note(p, "Public", "delete directory should fail")
     assert (vault / "Public").is_dir()
+
+
+# -- move / rename ---------------------------------------------------------------
+
+def test_move_note_renames_within_folder(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    original = srv.vault.read_text("Public/open.md")
+
+    res = srv._do_move_note(p, "Public/open.md", "Public/renamed.md", "rename note")
+    assert res["moved"] is True
+    assert res["src"] == "Public/open.md"
+    assert res["dest"] == "Public/renamed.md"
+    assert res["commit"]
+    # Source gone, destination has the identical bytes.
+    assert not srv.vault.exists("Public/open.md")
+    assert srv.vault.read_text("Public/renamed.md") == original
+
+
+def test_move_note_across_folders_creates_parent_dirs(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    srv._do_move_note(p, "Public/open.md", "Public/Archive/2026/open.md", "archive note")
+    assert not srv.vault.exists("Public/open.md")
+    assert srv.vault.exists("Public/Archive/2026/open.md")
+
+
+def test_move_note_requires_existing_source(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    with pytest.raises(ValueError, match="not found or not in scope"):
+        srv._do_move_note(p, "Public/missing.md", "Public/dest.md", "move missing")
+    assert not srv.vault.exists("Public/dest.md")
+
+
+def test_move_note_refuses_to_clobber_by_default(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    srv._do_write_note(p, "Public/target.md", "existing target\n", "setup target")
+    with pytest.raises(ValueError, match="already exists"):
+        srv._do_move_note(p, "Public/open.md", "Public/target.md", "should refuse")
+    # Both files untouched.
+    assert srv.vault.exists("Public/open.md")
+    assert srv.vault.read_text("Public/target.md") == "existing target\n"
+
+
+def test_move_note_overwrite_true_replaces_destination(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    srv._do_write_note(p, "Public/target.md", "existing target\n", "setup target")
+    source = srv.vault.read_text("Public/open.md")
+
+    res = srv._do_move_note(
+        p, "Public/open.md", "Public/target.md", "overwrite target", overwrite=True
+    )
+    assert res["moved"] is True
+    assert not srv.vault.exists("Public/open.md")
+    assert srv.vault.read_text("Public/target.md") == source
+
+
+def test_move_note_rejects_same_src_and_dest(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    with pytest.raises(ValueError, match="same"):
+        srv._do_move_note(p, "Public/open.md", "Public/open.md", "no-op move")
+    assert srv.vault.exists("Public/open.md")
+
+
+def test_move_note_does_not_accept_directory_source(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    with pytest.raises(ValueError):
+        srv._do_move_note(p, "Public", "Public2", "move directory should fail")
+    assert (vault / "Public").is_dir()
+
+
+def test_move_note_rejects_directory_destination(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    # Directory targets are outside the note-address space and use the same
+    # non-leaking response as an out-of-scope path.
+    with pytest.raises(ValueError, match="not found or not in scope"):
+        srv._do_move_note(p, "Public/open.md", "Private", "dest is a directory")
+    assert srv.vault.exists("Public/open.md")
+
+
+def test_move_note_is_a_single_revertible_commit(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    original = srv.vault.read_text("Public/open.md")
+    before = len(srv.git.log(limit=50))
+
+    srv._do_move_note(p, "Public/open.md", "Public/moved.md", "move note")
+    after = srv.git.log(limit=50)
+    # Exactly one commit for the whole rename, with the actor convention.
+    assert len(after) == before + 1
+    assert after[0].subject == "principal:p via mcp: move note"
+    assert after[0].actor == "principal:p via mcp"
+
+    # Reverting that one commit restores the original layout on disk.
+    subprocess.run(
+        ["git", "revert", "--no-edit", "HEAD"],
+        cwd=str(vault), capture_output=True, text=True, check=True,
+    )
+    assert srv.vault.exists("Public/open.md")
+    assert srv.vault.read_text("Public/open.md") == original
+    assert not srv.vault.exists("Public/moved.md")
+
+
+def test_move_note_via_real_mcp_tool_call(vault: Path):
+    srv = _server(vault, writes_enabled=True)
+
+    async def run():
+        return await srv.mcp.call_tool(
+            "move_note",
+            {"src": "Public/open.md", "dest": "Public/via_tool.md", "reason": "via mcp"},
+        )
+
+    result = asyncio.run(run())
+    payload = json.loads(result[0].text)
+    assert payload["moved"] is True
+    assert payload["commit"]
+    assert not srv.vault.exists("Public/open.md")
+    assert srv.vault.exists("Public/via_tool.md")
+
+
+def test_move_note_denied_when_source_outside_writable_scope(vault: Path):
+    srv = _server(vault, scopes=["**"], write_scopes=["Public/**"])
+    p = srv.config.principal("p")
+    with pytest.raises(ValueError, match="not found or not in scope"):
+        srv._do_move_note(p, "Private/secret.md", "Public/leaked.md", "exfiltrate")
+    assert srv.vault.exists("Private/secret.md")
+    assert not srv.vault.exists("Public/leaked.md")
+
+
+def test_move_note_denied_when_destination_outside_writable_scope(vault: Path):
+    srv = _server(vault, scopes=["**"], write_scopes=["Public/**"])
+    p = srv.config.principal("p")
+    with pytest.raises(ValueError, match="not found or not in scope"):
+        srv._do_move_note(p, "Public/open.md", "Private/hidden.md", "hide it")
+    # Source is left in place: the destination check fires before any move.
+    assert srv.vault.exists("Public/open.md")
+    assert not srv.vault.exists("Private/hidden.md")
+
+
+def test_move_note_rejects_path_traversal(vault: Path):
+    srv = _server(vault)
+    p = srv.config.principal("p")
+    with pytest.raises((ValueError, VaultError)):
+        srv._do_move_note(p, "Public/open.md", "../../etc/passwd", "traversal attempt")
+    assert srv.vault.exists("Public/open.md")
 
 
 # -- scope boundary: write_scopes defaults open, narrows when set ----------------

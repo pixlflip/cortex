@@ -348,11 +348,14 @@ class CortexServer:
         self,
         principal: Principal,
         reason: str,
-        path: str,
+        *paths: str,
         bundle: VaultBundle | None = None,
     ) -> str | None:
-        """Commit the single mutated path under a consistent actor convention,
-        then refresh the search index so subsequent reads see the change.
+        """Commit one or more mutated paths under the per-vault actor
+        convention, then refresh that vault's search index.
+
+        Most mutations touch one path; a move stages the source removal and
+        destination creation together as one revertible commit.
         Returns the commit sha, or None if nothing actually changed on disk
         (e.g. a write that reproduced the existing content byte-for-byte)."""
         actor = (
@@ -362,7 +365,7 @@ class CortexServer:
         )
         git = bundle.git if bundle is not None else self.git
         index = bundle.index if bundle is not None else self.index
-        sha = git.commit(actor=actor, reason=reason, paths=[path])
+        sha = git.commit(actor=actor, reason=reason, paths=list(paths))
         index.ensure_fresh()
         return sha
 
@@ -458,7 +461,7 @@ class CortexServer:
         if exists and not overwrite:
             raise ValueError(f"note already exists (pass overwrite=True to replace): {path}")
         store.write_text(path, content)
-        sha = self._commit_and_reindex(principal, reason, path, bundle)
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "created": not exists, "commit": sha}
 
     def _do_patch_note(
@@ -478,7 +481,7 @@ class CortexServer:
             raise ValueError(f"ambiguous: {count} matches in {path}")
         new_text = text.replace(old_string, new_string, 1)
         store.write_text(path, new_text)
-        sha = self._commit_and_reindex(principal, reason, path, bundle)
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "commit": sha}
 
     def _do_append_note(
@@ -490,7 +493,7 @@ class CortexServer:
             (bundle.store if bundle is not None else self.vault).append(path, text, separator=separator)
         except VaultError as exc:
             raise ValueError(f"not found or not in scope: {path}") from exc
-        sha = self._commit_and_reindex(principal, reason, path, bundle)
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "commit": sha}
 
     def _do_update_frontmatter(
@@ -507,7 +510,7 @@ class CortexServer:
             raise ValueError(f"not found or not in scope: {path}") from exc
         note.frontmatter.update(patch)
         store.write_text(path, note.raw)
-        sha = self._commit_and_reindex(principal, reason, path, bundle)
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "frontmatter": note.frontmatter, "commit": sha}
 
     def _do_delete_note(
@@ -519,8 +522,48 @@ class CortexServer:
             (bundle.store if bundle is not None else self.vault).delete_note(path)
         except VaultError as exc:
             raise ValueError(f"not found or not in scope: {path}") from exc
-        sha = self._commit_and_reindex(principal, reason, path, bundle)
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "deleted": True, "commit": sha}
+
+    def _do_move_note(
+        self,
+        principal: Principal,
+        src: str,
+        dest: str,
+        reason: str,
+        *,
+        overwrite: bool = False,
+        bundle: VaultBundle | None = None,
+    ) -> dict:
+        # A move is both a removal at `src` and a creation at `dest`, so both
+        # ends must be within the writable area — the check mirrors delete for
+        # the source and write for the destination.
+        src = self._require_writable(principal, src)
+        dest = self._require_writable(principal, dest)
+        store = bundle.store if bundle is not None else self.vault
+        try:
+            store.move_note(src, dest, overwrite=overwrite)
+        except VaultError as exc:
+            # "note already exists"/"destination is a directory" describe dest,
+            # which the caller can already write, so surfacing them leaks
+            # nothing; a missing/absent source is reported the same non-leaking
+            # way the other mutating tools report an out-of-scope source.
+            msg = str(exc)
+            if "not found" in msg or "not a file" in msg:
+                raise ValueError(f"not found or not in scope: {src}") from exc
+            raise ValueError(msg) from exc
+        # Stage both paths in one commit so the rename is a single revertible
+        # unit in the audit trail.
+        sha = self._commit_and_reindex(
+            principal, reason, src, dest, bundle=bundle
+        )
+        return {
+            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+            "src": src,
+            "dest": dest,
+            "moved": True,
+            "commit": sha,
+        }
 
     # -- tools -------------------------------------------------------------
 
@@ -816,6 +859,28 @@ class CortexServer:
                 p = self._get_principal()
                 bundle, p = self._select_vault(p, vault, write=True)
                 return self._do_delete_note(p, path, reason, bundle)
+
+            @mcp.tool()
+            def move_note(
+                src: str,
+                dest: str,
+                reason: str,
+                overwrite: bool = False,
+                vault: str | None = None,
+            ) -> dict:
+                """Move or rename a single existing note from src to dest (both
+                vault-relative paths). Refuses to clobber an existing note at
+                dest unless overwrite=True, and never moves directories. BOTH
+                src and dest must be within write scope, so a note can't be
+                moved out of (or into) an area this principal can't write.
+                Records the rename as a single git commit staging both paths —
+                revertible as one unit — then refreshes the search index.
+                `reason` is required for the audit trail."""
+                p = self._get_principal()
+                bundle, p = self._select_vault(p, vault, write=True)
+                return self._do_move_note(
+                    p, src, dest, reason, overwrite=overwrite, bundle=bundle
+                )
 
     # -- run ---------------------------------------------------------------
 

@@ -283,3 +283,29 @@ class VaultStore:
         if not path.is_file():
             raise VaultError(f"not a file: {rel_path}")
         path.unlink()
+
+    def move_note(self, src: str, dest: str, *, overwrite: bool = False) -> Path:
+        """Move (or rename) an existing note from ``src`` to ``dest``.
+
+        Both paths are vault-relative and path-traversal safe. Raises if
+        ``src`` is missing or not a file, if ``dest`` already exists (unless
+        ``overwrite=True``), or if ``dest`` names an existing directory. Parent
+        directories of ``dest`` are created as needed. The move itself is atomic
+        within the vault's filesystem via ``os.replace``. Only ever operates on
+        a single file — no directory moves.
+        """
+        src_path = self._resolve(src)
+        if not src_path.exists():
+            raise VaultError(f"note not found: {src}")
+        if not src_path.is_file():
+            raise VaultError(f"not a file: {src}")
+        dest_path = self._resolve(dest)
+        if dest_path == src_path:
+            raise VaultError(f"source and destination are the same: {src}")
+        if dest_path.is_dir():
+            raise VaultError(f"destination is a directory: {dest}")
+        if dest_path.exists() and not overwrite:
+            raise VaultError(f"note already exists: {dest}")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src_path, dest_path)
+        return dest_path

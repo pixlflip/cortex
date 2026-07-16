@@ -1206,7 +1206,10 @@ class ApiV1:
             "read_frontmatter", "read_section", "context_pack", "semantic_search",
         ]
         if self.config.writes.enabled:
-            builtin += ["write_note", "patch_note", "append_note", "update_frontmatter", "delete_note"]
+            builtin += [
+                "write_note", "patch_note", "append_note",
+                "update_frontmatter", "delete_note", "move_note",
+            ]
         items = []
         for name in builtin:
             tool_id = f"cortex.{name}"
