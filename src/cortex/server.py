@@ -18,6 +18,7 @@ tool permitted to spend model tokens.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 
 import yaml
@@ -190,8 +191,16 @@ class CortexServer:
             self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
 
     def _build_mcp(self, http: HttpServe | None) -> FastMCP:
+        @asynccontextmanager
+        async def lifespan(_server):
+            try:
+                yield {}
+            finally:
+                if self.gateway_runtime is not None:
+                    await self.gateway_runtime.aclose()
+
         if http is None:
-            return GovernedFastMCP("cortex")
+            return GovernedFastMCP("cortex", lifespan=lifespan)
         kwargs = dict(
             auth=http.auth_settings,
             transport_security=http.transport_security,
@@ -199,6 +208,7 @@ class CortexServer:
             port=http.port,
             streamable_http_path=http.path,
             stateless_http=True,
+            lifespan=lifespan,
         )
         if http.oauth_provider is not None:
             kwargs["auth_server_provider"] = http.oauth_provider

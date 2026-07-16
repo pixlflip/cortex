@@ -61,8 +61,9 @@ write: Projects/Research/Inbox/**
 ```
 
 Manage local groups, membership, and scopes under **Administration → People →
-Groups**. LDAP mappings remain in `cortex.yaml`, so directory policy changes are
-reviewable; the panel shows mappings and supports dry-run/apply sync.
+Groups**. The panel can override public-safe LDAP JIT/mapping policy in SQLite
+and supports dry-run/apply sync; connection and bind-secret settings remain
+config/environment-only.
 
 ## Vault viewer and API
 

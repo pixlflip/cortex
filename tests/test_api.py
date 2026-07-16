@@ -178,6 +178,7 @@ def test_me_anonymous_is_401(client: TestClient):
     ("method", "path"),
     [
         ("GET", "/ldap/status"),
+        ("PATCH", "/ldap/status"),
         ("GET", "/admin/tokens"),
         ("GET", "/vaults"),
         ("GET", "/vaults/main/tree"),
@@ -613,6 +614,69 @@ def test_ldap_sync_endpoint(identity: IdentityService):
 
     applied = client.post(f"{API_PREFIX}/ldap/sync", headers={CSRF_HEADER: csrf})
     assert applied.json()["dry_run"] is False
+
+
+def test_admin_can_edit_and_persist_public_ldap_policy(identity: IdentityService):
+    api = make_ldap_api(identity)
+    client = make_client(api)
+    csrf = login(client, "admin", "admin-pw")
+    response = client.patch(
+        f"{API_PREFIX}/ldap/status",
+        json={
+            "jit_provisioning": False,
+            "group_mappings": {"Directory Engineers": "engineering"},
+        },
+        headers={CSRF_HEADER: csrf},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["jit_provisioning"] is False
+    assert response.json()["group_mappings"] == {
+        "Directory Engineers": "engineering"
+    }
+
+    from test_ldap import make_config
+
+    restarted_config = CortexConfig(ldap=make_config())
+    IdentityService(identity.db, restarted_config)
+    assert restarted_config.ldap.jit_provisioning is False
+    assert restarted_config.ldap.group_mappings == {
+        "Directory Engineers": "engineering"
+    }
+
+    rejected = client.patch(
+        f"{API_PREFIX}/ldap/status",
+        json={"bind_password": "must-never-be-stored"},
+        headers={CSRF_HEADER: csrf},
+    )
+    assert_envelope(rejected, 400, "invalid_request")
+
+
+def test_permission_preview_uses_actual_enabled_tool_inventory(
+    identity: IdentityService, api: ApiV1
+):
+    server = identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp"
+    )
+    identity.mcp_servers.set_inventory(
+        server["id"],
+        [{"name": "list", "inputSchema": {"type": "object"}}],
+    )
+    disabled = identity.mcp_servers.create(
+        "disabled", url="https://disabled.example.com/mcp"
+    )
+    identity.mcp_servers.set_inventory(
+        disabled["id"],
+        [{"name": "hidden", "inputSchema": {"type": "object"}}],
+        error="offline",
+    )
+    client = make_client(api)
+    login(client, "admin", "admin-pw")
+    response = client.get(f"{API_PREFIX}/admin/permissions?user=alice")
+    assert response.status_code == 200
+    preview = {row["tool_id"]: row for row in response.json()["preview"]}
+    assert preview["cortex.search"]["allowed"] is True
+    assert preview["calendar.list"]["allowed"] is False
+    assert "disabled.hidden" not in preview
 
 
 def test_ldap_sync_without_ldap_config(client: TestClient):

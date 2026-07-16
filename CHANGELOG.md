@@ -11,10 +11,9 @@
 - Added the governed upstream MCP registry/proxy with hot schema refresh,
   deny-wins rules, SSRF defenses, bounded calls, circuit breaking, and
   value-free tool-call telemetry.
-- Added schema migration 2, `cortex migrate`, multi-stage Docker packaging,
+- Added schema migrations through version 3, `cortex migrate`, multi-stage Docker packaging,
   persistent Compose data mounts, health checks, CI web/dependency/image smoke
   validation, v2 operations documentation, and a focused security review.
 
 Existing v1 config principals, main-vault layout, stdio mode, bearer mode, and
 legacy admin import remain supported.
-

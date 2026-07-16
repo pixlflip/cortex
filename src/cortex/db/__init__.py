@@ -34,6 +34,7 @@ from .repos import (
     SessionsRepo,
     ToolAuditRepo,
     ToolPermissionsRepo,
+    SettingsRepo,
     UsersRepo,
 )
 from .admin_import import import_admin_state
@@ -52,6 +53,7 @@ __all__ = [
     "SessionsRepo",
     "McpServersRepo",
     "ToolPermissionsRepo",
+    "SettingsRepo",
     "ToolAuditRepo",
     "CreatedApiToken",
     "CreatedSession",

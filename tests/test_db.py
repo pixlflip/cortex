@@ -20,6 +20,7 @@ from cortex.db import (
     MigrationsPendingError,
     SchemaVersionError,
     SessionsRepo,
+    SettingsRepo,
     UsersRepo,
     import_admin_state,
     latest_version,
@@ -47,6 +48,7 @@ EXPECTED_TABLES = {
     "tool_permissions",
     "tool_call_audit",
     "janitor_reports",
+    "app_settings",
 }
 
 
@@ -127,6 +129,19 @@ def test_future_migration_applies_forward_on_open(tmp_path, monkeypatch):
     assert "nickname" in cols
     # and it recorded exactly once — reopening applies nothing
     assert Database(path).migrate() == []
+
+
+def test_runtime_settings_are_a_separate_forward_migration(tmp_path, monkeypatch):
+    path = tmp_path / "cortex.sqlite"
+    monkeypatch.setattr("cortex.db.core.MIGRATIONS", MIGRATIONS[:2])
+    old = Database(path)
+    assert old.schema_version() == 2
+    assert "app_settings" not in old.table_counts()
+
+    monkeypatch.setattr("cortex.db.core.MIGRATIONS", MIGRATIONS)
+    upgraded = Database(path)
+    assert upgraded.schema_version() == latest_version()
+    assert "app_settings" in upgraded.table_counts()
 
 
 def test_failed_migration_rolls_back(tmp_path, monkeypatch):
@@ -290,6 +305,17 @@ def test_cascades_on_user_delete(db):
     assert counts["api_tokens"] == 0
     assert counts["sessions"] == 0
     assert groups.get(g["id"]) is not None  # the group itself survives
+
+
+def test_public_settings_round_trip_without_credentials(db):
+    settings = SettingsRepo(db)
+    assert settings.get("ldap_policy") is None
+    policy = {
+        "jit_provisioning": False,
+        "group_mappings": {"Directory Engineers": "engineering"},
+    }
+    assert settings.set("ldap_policy", policy) == policy
+    assert settings.get("ldap_policy") == policy
 
 
 # ---------------------------------------------------------------------------

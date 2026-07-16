@@ -235,6 +235,24 @@ def _m0002_gateway_and_shared_writes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m0003_runtime_settings(conn: sqlite3.Connection) -> None:
+    """Persist public-safe policy overrides edited in the admin panel.
+
+    This is a separate migration so checkouts that already exercised v2 of
+    the feature branch still advance correctly instead of silently missing
+    the table after an in-place update.
+    """
+    conn.execute(
+        """
+        CREATE TABLE app_settings (
+            key        TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+
+
 def _split_statements(script: str) -> list[str]:
     """Split a DDL script into single statements for ``execute()``.
 
@@ -263,6 +281,7 @@ def _split_statements(script: str) -> list[str]:
 MIGRATIONS: list[Migration] = [
     Migration(1, "initial_schema", _m0001_initial_schema),
     Migration(2, "gateway_and_shared_writes", _m0002_gateway_and_shared_writes),
+    Migration(3, "runtime_settings", _m0003_runtime_settings),
 ]
 
 

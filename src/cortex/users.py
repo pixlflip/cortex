@@ -44,6 +44,7 @@ from .db.repos import (
     GroupsRepo,
     McpServersRepo,
     SessionsRepo,
+    SettingsRepo,
     ToolAuditRepo,
     ToolPermissionsRepo,
     UsersRepo,
@@ -119,12 +120,30 @@ class IdentityService:
         self.mcp_servers = McpServersRepo(db)
         self.tool_permissions = ToolPermissionsRepo(db)
         self.tool_audit = ToolAuditRepo(db)
+        self.settings = SettingsRepo(db)
         # Optional VaultManager (cortex.vaults). When set, creating a user
         # provisions their per-user vault (B1). Left None in pure-v1 / DB-only
         # flows so nothing touches the filesystem. Wired via
         # :func:`attach_vault_manager` to avoid an import cycle (vaults imports
         # config; users need not import vaults).
         self.vault_manager = vault_manager
+        self._apply_public_policy_overrides()
+
+    def _apply_public_policy_overrides(self) -> None:
+        """Apply persisted UI-editable LDAP policy, never connection secrets."""
+        if self.config is None or self.config.ldap is None:
+            return
+        policy = self.settings.get("ldap_policy")
+        if not policy:
+            return
+        if isinstance(policy.get("jit_provisioning"), bool):
+            self.config.ldap.jit_provisioning = policy["jit_provisioning"]
+        mappings = policy.get("group_mappings")
+        if isinstance(mappings, dict) and all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in mappings.items()
+        ):
+            self.config.ldap.group_mappings = dict(mappings)
 
     # -- authorization ------------------------------------------------------
 

@@ -130,8 +130,9 @@ class PermissionResolver:
         if user["is_admin"]:
             return True
         groups = self.identity.groups.groups_for_user(user["id"])
+        server_id = self._server_id(tool_id)
         rules = self.identity.tool_permissions.matching(
-            user["id"], [g["id"] for g in groups], tool_id
+            user["id"], [g["id"] for g in groups], tool_id, server_id=server_id
         )
         # Deny wins across user and group rules.  This deliberately prevents a
         # user override from escaping a group-level security boundary.
@@ -150,9 +151,19 @@ class PermissionResolver:
         allowed = bool(principal and self.allowed(principal, tool_id))
         groups = self.identity.groups.groups_for_user(user["id"])
         rules = self.identity.tool_permissions.matching(
-            user["id"], [g["id"] for g in groups], tool_id
+            user["id"],
+            [g["id"] for g in groups],
+            tool_id,
+            server_id=self._server_id(tool_id),
         )
         return {"tool_id": tool_id, "allowed": allowed, "rules": rules}
+
+    def _server_id(self, tool_id: str) -> int | None:
+        server_name = tool_id.split(".", 1)[0]
+        if server_name == "cortex":
+            return None
+        server = self.identity.mcp_servers.get_by_name(server_name)
+        return server["id"] if server is not None else None
 
 
 def _audit_argument_shape(arguments: dict[str, Any]) -> tuple[str, str, str | None]:
@@ -262,6 +273,12 @@ class CircuitState:
     opened_at: float | None = None
 
 
+@dataclass
+class ClientPoolEntry:
+    fingerprint: str
+    client: httpx.AsyncClient
+
+
 class GatewayRuntime:
     """Connection validation and bounded proxying for streamable HTTP MCP."""
 
@@ -270,6 +287,8 @@ class GatewayRuntime:
         self.identity = identity
         self._limit = anyio.Semaphore(config.gateway.max_concurrency)
         self._circuits: dict[int, CircuitState] = {}
+        self._clients: dict[int, ClientPoolEntry] = {}
+        self._client_lock = anyio.Lock()
         self._mcp: FastMCP | None = None
 
     def _headers(self, row: dict) -> dict[str, str]:
@@ -286,23 +305,72 @@ class GatewayRuntime:
             headers[str(header)] = value
         return headers
 
+    async def _pooled_client(self, row: dict) -> httpx.AsyncClient:
+        """Lazily reuse one bounded HTTP connection pool per registry row.
+
+        The fingerprint includes resolved headers so rotating an environment
+        secret replaces (and closes) the old pool without persisting the
+        credential or requiring a process restart.
+        """
+        headers = self._headers(row)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "url": row["url"],
+                    "headers": sorted(headers.items()),
+                    "timeout": self.config.gateway.timeout_seconds,
+                },
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        async with self._client_lock:
+            current = self._clients.get(row["id"])
+            if current is not None and current.fingerprint == fingerprint:
+                return current.client
+            limits = httpx.Limits(
+                max_connections=self.config.gateway.max_concurrency,
+                max_keepalive_connections=max(
+                    1, min(8, self.config.gateway.max_concurrency)
+                ),
+            )
+            client = httpx.AsyncClient(
+                headers=headers,
+                timeout=httpx.Timeout(self.config.gateway.timeout_seconds),
+                follow_redirects=False,
+                limits=limits,
+                # Keep SSRF validation and the eventual socket destination in
+                # the same trust boundary; ambient proxy variables could
+                # otherwise resolve or route the host somewhere else.
+                trust_env=False,
+            )
+            self._clients[row["id"]] = ClientPoolEntry(fingerprint, client)
+            if current is not None:
+                await current.client.aclose()
+            return client
+
+    async def aclose(self) -> None:
+        """Close all lazy upstream pools (primarily for graceful shutdown/tests)."""
+        async with self._client_lock:
+            entries = list(self._clients.values())
+            self._clients.clear()
+        for entry in entries:
+            await entry.client.aclose()
+
     async def _session_call(self, row: dict, operation):
         validate_outbound_url(row["url"], self.config)
-        headers = self._headers(row)
-        timeout = httpx.Timeout(self.config.gateway.timeout_seconds)
+        client = await self._pooled_client(row)
         async with self._limit:
-            async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
-                async with streamable_http_client(row["url"], http_client=client) as streams:
-                    read, write, _ = streams
-                    async with ClientSession(
-                        read,
-                        write,
-                        read_timeout_seconds=timedelta(
-                            seconds=self.config.gateway.timeout_seconds
-                        ),
-                    ) as session:
-                        await session.initialize()
-                        return await operation(session)
+            async with streamable_http_client(row["url"], http_client=client) as streams:
+                read, write, _ = streams
+                async with ClientSession(
+                    read,
+                    write,
+                    read_timeout_seconds=timedelta(
+                        seconds=self.config.gateway.timeout_seconds
+                    ),
+                ) as session:
+                    await session.initialize()
+                    return await operation(session)
 
     async def discover(self, row: dict) -> list[dict]:
         async def operation(session):
@@ -320,7 +388,17 @@ class GatewayRuntime:
             return inventory
 
         try:
-            tools = await self._session_call(row, operation)
+            # Discovery is idempotent, so one bounded retry is safe. Tool
+            # calls are deliberately never retried because they may mutate an
+            # upstream system and transport errors cannot prove non-delivery.
+            for attempt in range(2):
+                try:
+                    tools = await self._session_call(row, operation)
+                    break
+                except Exception:
+                    if attempt:
+                        raise
+                    await anyio.sleep(0.1)
         except Exception as exc:
             message = str(exc)[:500] or type(exc).__name__
             failed = self.identity.mcp_servers.set_inventory(row["id"], [], error=message)

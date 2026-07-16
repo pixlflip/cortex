@@ -834,7 +834,14 @@ class ToolPermissionsRepo:
             )
             return cur.rowcount > 0
 
-    def matching(self, user_id: int, group_ids: list[int], tool_id: str) -> list[dict]:
+    def matching(
+        self,
+        user_id: int,
+        group_ids: list[int],
+        tool_id: str,
+        *,
+        server_id: int | None = None,
+    ) -> list[dict]:
         rules = self.list()
         return [
             rule
@@ -846,6 +853,7 @@ class ToolPermissionsRepo:
                     and rule["subject_id"] in group_ids
                 )
             )
+            and (rule["server_id"] is None or rule["server_id"] == server_id)
             and fnmatch.fnmatchcase(tool_id, rule["tool_pattern"])
         ]
 
@@ -894,6 +902,8 @@ class ToolAuditRepo:
         server: str | None = None,
         tool: str | None = None,
         decision: str | None = None,
+        since: int | None = None,
+        until: int | None = None,
         limit: int = 200,
     ) -> list[dict]:
         clauses: list[str] = []
@@ -907,6 +917,12 @@ class ToolAuditRepo:
             if value is not None:
                 clauses.append(f"{column} = ?")
                 values.append(value)
+        if since is not None:
+            clauses.append("ts >= ?")
+            values.append(int(since))
+        if until is not None:
+            clauses.append("ts <= ?")
+            values.append(int(until))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         values.append(max(1, min(int(limit), 1000)))
         with self.db.connection() as conn:
@@ -923,3 +939,33 @@ class ToolAuditRepo:
         with self.db.transaction() as conn:
             cur = conn.execute("DELETE FROM tool_call_audit WHERE ts < ?", (before,))
             return cur.rowcount
+
+
+class SettingsRepo:
+    """Small public-safe runtime policy overrides (never credentials)."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get(self, key: str) -> dict | None:
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM app_settings WHERE key = ?", (key,)
+            ).fetchone()
+        return json.loads(row["value_json"]) if row is not None else None
+
+    def set(self, key: str, value: dict) -> dict:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        now = _now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (key, encoded, now),
+            )
+        return value

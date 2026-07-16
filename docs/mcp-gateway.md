@@ -51,9 +51,14 @@ reference. Personal server registration is off unless
   unspecified, multicast, and reserved addresses are blocked by default.
 - An optional hostname allowlist narrows egress further. HTTP redirects are not
   followed to another host.
-- Calls have configurable timeouts and a global concurrency bound. Three
-  consecutive upstream failures open a short circuit so one dead server does
-  not stall every client.
+- Calls have configurable timeouts, a global concurrency bound, and lazy
+  per-server keep-alive pools. Rotating a referenced environment secret
+  replaces its pool without persisting the credential. Safe discovery gets
+  one bounded retry; tool calls are never replayed because they may mutate an
+  upstream system. Three consecutive upstream failures open a short circuit
+  so one dead server does not stall every client.
+- Ambient HTTP proxy variables are ignored so DNS/SSRF validation and the
+  eventual socket destination remain in the same trust boundary.
 - Upstream descriptions are control-character stripped, length capped, and
   always namespaced. Results remain untrusted upstream content; registering a
   server is a trust decision.
@@ -72,4 +77,3 @@ by `gateway.audit_retention_days`.
 View/export telemetry under **Administration → Audit**. Vault mutations retain
 their separate per-vault git history, which answers what changed and how to
 revert it; tool telemetry answers who called what and whether it was allowed.
-

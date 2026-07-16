@@ -51,6 +51,7 @@ import mimetypes
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from starlette.requests import Request
@@ -222,7 +223,7 @@ class ApiV1:
             (f"{p}/tokens", ["GET", "POST"], self.tokens_collection),
             (f"{p}/tokens/{{token_id}}", ["DELETE"], self.token_item),
             (f"{p}/ldap/sync", ["POST"], self.ldap_sync),
-            (f"{p}/ldap/status", ["GET"], self.ldap_status),
+            (f"{p}/ldap/status", ["GET", "PATCH"], self.ldap_status),
             (f"{p}/admin/tokens", ["GET"], self.admin_tokens),
             (f"{p}/vaults", ["GET"], self.vaults_collection),
             (f"{p}/vaults/{{vault}}/tree", ["GET"], self.vault_tree),
@@ -430,6 +431,20 @@ class ApiV1:
         except (TypeError, ValueError):
             raise ApiError(400, "invalid_request", f"'{name}' must be an integer")
         return max(minimum, min(value, maximum))
+
+    @staticmethod
+    def _query_time(request: Request, name: str) -> int | None:
+        raw = request.query_params.get(name)
+        if not raw:
+            return None
+        try:
+            if raw.isdigit():
+                return int(raw)
+            return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+        except (ValueError, OverflowError):
+            raise ApiError(
+                400, "invalid_request", f"'{name}' must be ISO-8601 or Unix seconds"
+            )
 
     # -- serializers -------------------------------------------------------------
     #
@@ -764,6 +779,47 @@ class ApiV1:
 
     async def ldap_status(self, request: Request) -> Response:
         self._require_identity(request, admin=True)
+        if request.method == "PATCH":
+            if self.config.ldap is None:
+                raise ApiError(400, "ldap_not_configured", "LDAP is not configured")
+            body = await self._json_body(request)
+            unknown = set(body) - {"jit_provisioning", "group_mappings"}
+            if unknown:
+                raise ApiError(
+                    400,
+                    "invalid_request",
+                    f"unknown field(s): {', '.join(sorted(unknown))}",
+                )
+            jit = self._bool_field(body, "jit_provisioning")
+            mappings = body.get("group_mappings")
+            if mappings is not None and (
+                not isinstance(mappings, dict)
+                or not all(
+                    isinstance(key, str)
+                    and bool(key.strip())
+                    and isinstance(value, str)
+                    and bool(value.strip())
+                    for key, value in mappings.items()
+                )
+            ):
+                raise ApiError(
+                    400,
+                    "invalid_request",
+                    "group_mappings must map non-empty LDAP group names to Cortex groups",
+                )
+            policy = {
+                "jit_provisioning": (
+                    jit if jit is not None else self.config.ldap.jit_provisioning
+                ),
+                "group_mappings": (
+                    {key.strip(): value.strip() for key, value in mappings.items()}
+                    if mappings is not None
+                    else self.config.ldap.group_mappings
+                ),
+            }
+            self.identity.settings.set("ldap_policy", policy)
+            self.config.ldap.jit_provisioning = policy["jit_provisioning"]
+            self.config.ldap.group_mappings = dict(policy["group_mappings"])
         return JSONResponse(
             {
                 "configured": self.config.ldap is not None,
@@ -1042,16 +1098,39 @@ class ApiV1:
         ident = self._require_identity(request)
         principal = self._api_principal(ident)
         vault_filter = request.query_params.get("vault")
-        actor_filter = request.query_params.get("actor", "").lower()
+        actor_filter = (
+            request.query_params.get("user")
+            or request.query_params.get("actor", "")
+        ).lower()
         path_filter = request.query_params.get("path")
+        since = self._query_time(request, "from")
+        until = self._query_time(request, "to")
         limit = self._query_int(request, "limit", 100, minimum=1, maximum=500)
         events: list[dict] = []
         for grant in self.vault_access.grants(principal):
+            # The user endpoint is their private-vault history, even when a
+            # group grants a slice of main. A git commit can touch several
+            # paths, so exposing main's commit metadata would leak activity
+            # outside that slice. Admins retain the macro timeline.
+            if not ident.is_admin and grant.relation != "owner":
+                continue
             if vault_filter and grant.vault_id != vault_filter:
                 continue
             bundle = self.vault_manager.get(grant.vault_id)
             for commit in bundle.git.log(limit=limit, path=path_filter):
                 if actor_filter and actor_filter not in commit.actor.lower() and actor_filter not in commit.subject.lower():
+                    continue
+                try:
+                    commit_ts = int(
+                        datetime.fromisoformat(
+                            commit.iso_date.replace("Z", "+00:00")
+                        ).timestamp()
+                    )
+                except ValueError:
+                    commit_ts = 0
+                if since is not None and commit_ts < since:
+                    continue
+                if until is not None and commit_ts > until:
                     continue
                 events.append(
                     {
@@ -1198,9 +1277,8 @@ class ApiV1:
         refreshed = self.identity.mcp_servers.get(row["id"])
         return JSONResponse({"server": self._server_summary(refreshed, include_env_refs=ident.is_admin), "tools": tools})
 
-    async def mcp_tools(self, request: Request) -> Response:
-        ident = self._require_identity(request)
-        principal = self._api_principal(ident)
+    def _tool_catalog(self, user_id: int, *, is_admin: bool) -> list[dict]:
+        """Return the real tool inventory visible to one identity."""
         builtin = [
             "discover_scopes", "status", "list_notes", "search", "read_note",
             "read_frontmatter", "read_section", "context_pack", "semantic_search",
@@ -1210,24 +1288,33 @@ class ApiV1:
                 "write_note", "patch_note", "append_note",
                 "update_frontmatter", "delete_note", "move_note",
             ]
-        items = []
-        for name in builtin:
-            tool_id = f"cortex.{name}"
-            if self.permissions.allowed(principal, tool_id):
-                items.append({"id": tool_id, "server": "cortex", "name": name})
-        for row in self.identity.mcp_servers.visible_to(ident.user["id"], is_admin=ident.is_admin):
+        items = [
+            {"id": f"cortex.{name}", "server": "cortex", "name": name}
+            for name in builtin
+        ]
+        for row in self.identity.mcp_servers.visible_to(user_id, is_admin=is_admin):
+            if not row["enabled"]:
+                continue
             for tool in json.loads(row.get("tools_json") or "[]"):
-                tool_id = f"{row['name']}.{tool['name']}"
-                if self.permissions.allowed(principal, tool_id):
-                    items.append(
-                        {
-                            "id": tool_id,
-                            "server": row["name"],
-                            "name": tool["name"],
-                            "description": tool.get("description"),
-                            "inputSchema": tool.get("inputSchema"),
-                        }
-                    )
+                items.append(
+                    {
+                        "id": f"{row['name']}.{tool['name']}",
+                        "server": row["name"],
+                        "name": tool["name"],
+                        "description": tool.get("description"),
+                        "inputSchema": tool.get("inputSchema"),
+                    }
+                )
+        return items
+
+    async def mcp_tools(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        principal = self._api_principal(ident)
+        items = []
+        for item in self._tool_catalog(ident.user["id"], is_admin=ident.is_admin):
+            tool_id = item["id"]
+            if self.permissions.allowed(principal, tool_id):
+                items.append(item)
         return JSONResponse({"tools": items})
 
     async def tool_permissions(self, request: Request) -> Response:
@@ -1237,8 +1324,13 @@ class ApiV1:
             preview = []
             if preview_user:
                 user = self._get_user_or_404(preview_user)
-                tool_ids = [item["tool_pattern"] for item in self.identity.tool_permissions.list()]
-                preview = [self.permissions.explain(user, tool_id) for tool_id in sorted(set(tool_ids))]
+                catalog = self._tool_catalog(
+                    user["id"], is_admin=bool(user["is_admin"])
+                )
+                preview = [
+                    self.permissions.explain(user, item["id"])
+                    for item in catalog
+                ]
             return JSONResponse({"permissions": self.identity.tool_permissions.list(), "preview": preview})
         body = await self._json_body(request)
         subject_type = self._str_field(body, "subject_type", required=True)
@@ -1252,6 +1344,8 @@ class ApiV1:
         server_id = body.get("server_id")
         if server_id is not None and not isinstance(server_id, int):
             raise ApiError(400, "invalid_request", "server_id must be an integer")
+        if server_id is not None and self.identity.mcp_servers.get(server_id) is None:
+            raise ApiError(404, "not_found", _NOT_FOUND)
         rule = self.identity.tool_permissions.set(
             subject_type=subject_type,
             subject_id=subject["id"],
@@ -1282,6 +1376,8 @@ class ApiV1:
             server=request.query_params.get("server"),
             tool=request.query_params.get("tool"),
             decision=request.query_params.get("outcome"),
+            since=self._query_time(request, "from"),
+            until=self._query_time(request, "to"),
             limit=self._query_int(request, "limit", 200, minimum=1, maximum=1000),
         )
         return JSONResponse({"calls": rows})

@@ -39,8 +39,9 @@ authorization, and audit-value exclusion.
    correctly configured reverse proxy must terminate TLS and preserve Host and
    authorization headers for remote use.
 4. **LDAP availability and policy.** New directory sessions depend on LDAP.
-   Local admin access remains the break-glass path. Mapping/JIT policy is config
-   owned and requires service restart after change.
+   Local admin access remains the break-glass path. Mapping/JIT policy may be
+   changed by an admin and is stored as a public-safe SQLite override; LDAP
+   connection and bind-secret settings remain config/environment-only.
 5. **Telemetry metadata.** Audit rows avoid content but still reveal identity,
    tool names, timing, and vault ids. Protect and retain the SQLite database as
    security telemetry.
@@ -59,4 +60,3 @@ authorization, and audit-value exclusion.
 - Store the DB, config, env file, and all vault roots outside the source tree
   with least-privilege ownership; back up vault `.git` directories.
 - Review denied/error audit events and stale tokens regularly.
-
