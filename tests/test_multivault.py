@@ -19,6 +19,7 @@ from cortex.config import (
 )
 from cortex.db import Database
 from cortex.sessions import SessionAuth
+from cortex.server import CortexServer
 from cortex.users import IdentityService
 from cortex.vaults import MAIN_VAULT_ID, attach_vault_manager
 
@@ -117,3 +118,22 @@ def test_vault_api_never_leaks_another_users_vault(multivault):
     assert visible.status_code == 200
     assert hidden.status_code == 404
 
+
+def test_move_note_stays_in_selected_vault_and_uses_user_actor(multivault):
+    cfg, identity, manager = multivault
+    principal = identity.principal_for_username("alice")
+    bundle, scoped, _ = VaultAccessResolver(cfg, manager, identity).select(
+        principal, "alice", write=True
+    )
+    server = CortexServer(cfg, principal, identity=identity)
+    result = server._do_move_note(
+        scoped,
+        "Projects/alpha.md",
+        "Projects/renamed.md",
+        "rename project note",
+        bundle=bundle,
+    )
+    assert result["vault"] == "alice"
+    assert not (bundle.root / "Projects" / "alpha.md").exists()
+    assert (bundle.root / "Projects" / "renamed.md").is_file()
+    assert bundle.git.log(limit=1)[0].actor == "user:alice via mcp"

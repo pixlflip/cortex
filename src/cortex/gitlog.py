@@ -98,7 +98,20 @@ class GitAudit:
         if not self.config.enabled:
             return None
         if paths:
-            _run(["add", "--", *paths], self.root)
+            # A move can begin with an untracked source (for example a human
+            # created it immediately before the operation). After the rename
+            # that source path neither exists nor is tracked, and passing it
+            # directly makes `git add` abort before staging the destination.
+            # Keep existing paths plus tracked deletions, skip only truly
+            # unknown/missing pathspecs, and use -A so deletions are recorded.
+            stageable = [
+                path
+                for path in paths
+                if (self.root / path).exists()
+                or bool(_run(["ls-files", "--", path], self.root).strip())
+            ]
+            if stageable:
+                _run(["add", "-A", "--", *stageable], self.root)
         else:
             _run(["add", "-A"], self.root)
 
