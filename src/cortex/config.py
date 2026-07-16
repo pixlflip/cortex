@@ -120,6 +120,10 @@ class Principal:
     # config. Set this to narrow the writable area independent of what's
     # readable — the hook for per-principal write permissioning later.
     write_scopes: list[str] = field(default_factory=list)
+    # Present only when this principal came from a user API token. These
+    # globs narrow every vault grant the user already holds; ``None`` means a
+    # session/static credential with no token-level narrowing.
+    token_scopes: list[str] | None = None
 
 
 @dataclass
@@ -266,6 +270,24 @@ class WritesConfig:
 
 
 @dataclass
+class GatewayConfig:
+    """Governed external-MCP aggregation and audit policy (D1-D3)."""
+
+    enabled: bool = True
+    allow_user_servers: bool = False
+    allow_stdio_servers: bool = False
+    block_private_networks: bool = True
+    outbound_allowlist: list[str] = field(default_factory=list)
+    timeout_seconds: float = 20.0
+    max_concurrency: int = 16
+    audit_retention_days: int = 90
+    # With no explicit rule, deterministic Cortex reads are available while
+    # mutations and external tools require a grant.
+    default_read_allow: bool = True
+    default_write_allow: bool = False
+
+
+@dataclass
 class CortexConfig:
     vault: VaultConfig = field(default_factory=VaultConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
@@ -279,6 +301,7 @@ class CortexConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     janitor: JanitorConfig = field(default_factory=JanitorConfig)
     writes: WritesConfig = field(default_factory=WritesConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
     # None ⇒ LDAP integration fully off (the default).
     ldap: LdapConfig | None = None
 
@@ -428,6 +451,20 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         enabled=writes_raw.get("enabled", False),
     )
 
+    gateway_raw = raw.get("gateway", {}) or {}
+    gateway = GatewayConfig(
+        enabled=bool(gateway_raw.get("enabled", True)),
+        allow_user_servers=bool(gateway_raw.get("allow_user_servers", False)),
+        allow_stdio_servers=bool(gateway_raw.get("allow_stdio_servers", False)),
+        block_private_networks=bool(gateway_raw.get("block_private_networks", True)),
+        outbound_allowlist=list(gateway_raw.get("outbound_allowlist", []) or []),
+        timeout_seconds=float(gateway_raw.get("timeout_seconds", 20.0)),
+        max_concurrency=int(gateway_raw.get("max_concurrency", 16)),
+        audit_retention_days=int(gateway_raw.get("audit_retention_days", 90)),
+        default_read_allow=bool(gateway_raw.get("default_read_allow", True)),
+        default_write_allow=bool(gateway_raw.get("default_write_allow", False)),
+    )
+
     ldap = _build_ldap(raw.get("ldap"))
 
     cfg = CortexConfig(
@@ -443,6 +480,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         llm=llm,
         janitor=janitor,
         writes=writes,
+        gateway=gateway,
         ldap=ldap,
     )
     _validate(cfg)
@@ -579,6 +617,12 @@ def _validate(cfg: CortexConfig) -> None:
             "enabling writes without git audit — which would allow unaudited, "
             "unrecoverable changes — is not permitted."
         )
+    if cfg.gateway.timeout_seconds <= 0:
+        raise ConfigError("gateway.timeout_seconds must be positive")
+    if cfg.gateway.max_concurrency < 1:
+        raise ConfigError("gateway.max_concurrency must be at least 1")
+    if cfg.gateway.audit_retention_days < 1:
+        raise ConfigError("gateway.audit_retention_days must be at least 1")
 
 
 def load_config(path: str | os.PathLike[str]) -> CortexConfig:

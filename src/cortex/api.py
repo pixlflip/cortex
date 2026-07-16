@@ -45,18 +45,35 @@ costs one boolean check; the stdio path never touches this module.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import mimetypes
+import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .config import CortexConfig
+from .config import CortexConfig, Principal
+from .access import VaultAccessError, VaultAccessResolver
+from .gateway import (
+    GatewayError,
+    GatewayRuntime,
+    PermissionResolver,
+    validate_env_name,
+    validate_header_name,
+    validate_outbound_url,
+    validate_server_name,
+)
 from .ldap import DirectoryService, LdapError
+from .scopes import filter_paths, path_allowed
 from .sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from .users import AuthzError, IdentityError, IdentityService
+from .vault import VaultError, canonical_asset_path, canonical_note_path
+from .vaults import MAIN_VAULT_ID, VaultManagerError, attach_vault_manager
 
 API_PREFIX = "/api/v1"
 
@@ -107,6 +124,7 @@ class ApiIdentity:
 
     user: dict
     via: str  # "session" | "bearer"
+    principal: Principal | None = None
 
     @property
     def username(self) -> str:
@@ -170,6 +188,7 @@ class ApiV1:
         *,
         directory: DirectoryService | None = None,
         rate_limiter: LoginRateLimiter | None = None,
+        gateway_runtime: GatewayRuntime | None = None,
     ):
         self.config = config
         self.identity = identity
@@ -177,6 +196,10 @@ class ApiV1:
         self._directory = directory
         self._throttle = rate_limiter or LoginRateLimiter()
         self._log_requests = bool(config.server.request_log)
+        self.vault_manager = identity.vault_manager or attach_vault_manager(identity, config)
+        self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
+        self.gateway = gateway_runtime or GatewayRuntime(config, identity)
+        self.permissions = PermissionResolver(config, identity)
 
     # -- wiring ---------------------------------------------------------------
 
@@ -199,6 +222,25 @@ class ApiV1:
             (f"{p}/tokens", ["GET", "POST"], self.tokens_collection),
             (f"{p}/tokens/{{token_id}}", ["DELETE"], self.token_item),
             (f"{p}/ldap/sync", ["POST"], self.ldap_sync),
+            (f"{p}/ldap/status", ["GET"], self.ldap_status),
+            (f"{p}/admin/tokens", ["GET"], self.admin_tokens),
+            (f"{p}/vaults", ["GET"], self.vaults_collection),
+            (f"{p}/vaults/{{vault}}/tree", ["GET"], self.vault_tree),
+            (f"{p}/vaults/{{vault}}/search", ["GET"], self.vault_search),
+            (f"{p}/vaults/{{vault}}/tags", ["GET"], self.vault_tags),
+            (f"{p}/vaults/{{vault}}/links/{{path:path}}", ["GET"], self.vault_links),
+            (f"{p}/vaults/{{vault}}/notes/{{path:path}}", ["GET"], self.vault_note),
+            (f"{p}/vaults/{{vault}}/assets/{{path:path}}", ["GET"], self.vault_asset),
+            (f"{p}/admin/vaults/{{vault}}/{{action}}", ["POST"], self.admin_vault_action),
+            (f"{p}/audit/commits", ["GET"], self.commit_audit),
+            (f"{p}/audit/tools", ["GET"], self.tool_audit),
+            (f"{p}/mcp/tools", ["GET"], self.mcp_tools),
+            (f"{p}/mcp/servers", ["GET", "POST"], self.mcp_servers),
+            (f"{p}/mcp/servers/{{server_id}}", ["GET", "PATCH", "DELETE"], self.mcp_server_item),
+            (f"{p}/mcp/servers/{{server_id}}/{{action}}", ["POST"], self.mcp_server_action),
+            (f"{p}/admin/permissions", ["GET", "POST"], self.tool_permissions),
+            (f"{p}/admin/permissions/{{permission_id}}", ["DELETE"], self.tool_permission_item),
+            (f"{p}/admin/janitor", ["GET"], self.janitor_status),
         ]
 
     def routes(self) -> list[Route]:
@@ -228,6 +270,12 @@ class ApiV1:
                 response = error_response(403, "forbidden", str(exc))
             except IdentityError as exc:
                 response = error_response(400, "invalid_request", str(exc))
+            except VaultAccessError:
+                response = error_response(404, "not_found", _NOT_FOUND)
+            except VaultManagerError as exc:
+                response = error_response(400, "invalid_request", str(exc))
+            except GatewayError as exc:
+                response = error_response(400, "gateway_error", str(exc))
             except LdapError:
                 # Covers LdapUnavailableError (outage) and configuration/
                 # protocol failures alike: callers get one non-revealing 503
@@ -268,11 +316,11 @@ class ApiV1:
         resolved = self.identity.resolve_api_token(token)
         if resolved is None:
             raise _unauthenticated()
-        _, username = resolved
+        principal, username = resolved
         user = self.identity.users.get_by_username(username)
         if user is None or user["disabled"]:  # pragma: no cover - resolve checks
             raise _unauthenticated()
-        return ApiIdentity(user=user, via="bearer")
+        return ApiIdentity(user=user, via="bearer", principal=principal)
 
     def _origin_ok(self, request: Request) -> bool:
         """Same-origin backstop for cookie-authenticated mutations. A browser
@@ -372,6 +420,17 @@ class ApiV1:
             )
         return value
 
+    @staticmethod
+    def _query_int(
+        request: Request, name: str, default: int, *, minimum: int, maximum: int
+    ) -> int:
+        raw = request.query_params.get(name, str(default))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ApiError(400, "invalid_request", f"'{name}' must be an integer")
+        return max(minimum, min(value, maximum))
+
     # -- serializers -------------------------------------------------------------
     #
     # Summaries are the only shapes that leave the API: no password material,
@@ -393,12 +452,15 @@ class ApiV1:
         }
 
     def _group_summary(self, group: dict) -> dict:
+        read_scopes = list(json.loads(group["scopes_json"])) if group["scopes_json"] else []
+        raw_write = group.get("write_scopes_json")
         return {
             "name": group["name"],
             "source": group["source"],
-            "scopes": list(json.loads(group["scopes_json"]))
-            if group["scopes_json"]
-            else [],
+            "scopes": read_scopes,
+            "write_scopes": (
+                list(json.loads(raw_write)) if raw_write is not None else read_scopes
+            ),
             "members": [
                 u["username"] for u in self.identity.groups.members(group["id"])
             ],
@@ -490,9 +552,11 @@ class ApiV1:
     async def me(self, request: Request) -> Response:
         """``GET /api/v1/auth/me`` — the authenticated caller, or 401."""
         ident = self._require_identity(request)
-        return JSONResponse(
-            {"user": self._user_summary(ident.user), "auth": ident.via}
-        )
+        payload = {"user": self._user_summary(ident.user), "auth": ident.via}
+        if ident.via == "session":
+            session_token = self.session_auth.session_token(request)
+            payload["csrf_token"] = self.identity.csrf_token_for(session_token)
+        return JSONResponse(payload)
 
     # -- admin: users ---------------------------------------------------------------
 
@@ -573,7 +637,10 @@ class ApiV1:
         body = await self._json_body(request)
         name = self._str_field(body, "name", required=True)
         group = self.identity.create_group(
-            name, scopes=self._scopes_field(body), actor=ident.user
+            name,
+            scopes=self._scopes_field(body),
+            write_scopes=self._scopes_field(body, "write_scopes"),
+            actor=ident.user,
         )
         return JSONResponse({"group": self._group_summary(group)}, status_code=201)
 
@@ -589,7 +656,12 @@ class ApiV1:
         scopes = self._scopes_field(body)
         if scopes is None:
             raise ApiError(400, "invalid_request", "'scopes' is required")
-        group = self.identity.set_group_scopes(group["name"], scopes, actor=ident.user)
+        group = self.identity.set_group_scopes(
+            group["name"],
+            scopes,
+            write_scopes=self._scopes_field(body, "write_scopes"),
+            actor=ident.user,
+        )
         return JSONResponse({"group": self._group_summary(group)})
 
     async def group_members(self, request: Request) -> Response:
@@ -687,6 +759,559 @@ class ApiV1:
                 "disabled": report.disabled,
                 "group_changes": report.group_changes,
                 "skipped": report.skipped,
+            }
+        )
+
+    async def ldap_status(self, request: Request) -> Response:
+        self._require_identity(request, admin=True)
+        return JSONResponse(
+            {
+                "configured": self.config.ldap is not None,
+                "jit_provisioning": bool(
+                    self.config.ldap and self.config.ldap.jit_provisioning
+                ),
+                "server_uri": self.config.ldap.server_uri if self.config.ldap else None,
+                "group_mappings": self.config.ldap.group_mappings if self.config.ldap else {},
+            }
+        )
+
+    # -- B2/B3: one authorization path for every vault-facing API -------------
+
+    def _api_principal(self, ident: ApiIdentity):
+        principal = ident.principal or self.identity.principal_for_username(ident.username)
+        if principal is None:
+            raise _unauthenticated()
+        return principal
+
+    def _select_vault(self, ident: ApiIdentity, vault_id: str, *, write: bool = False):
+        return self.vault_access.select(
+            self._api_principal(ident), vault_id, write=write
+        )
+
+    async def vaults_collection(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        principal = self._api_principal(ident)
+        items: list[dict] = []
+        for grant in self.vault_access.grants(principal):
+            try:
+                bundle = self.vault_manager.get(grant.vault_id)
+            except VaultManagerError:
+                continue
+            notes = filter_paths(bundle.store.list_notes(), list(grant.scopes))
+            stats = bundle.index.stats()
+            size = 0
+            for path in notes:
+                try:
+                    size += bundle.store._resolve(path).stat().st_size
+                except OSError:
+                    pass
+            items.append(
+                {
+                    "id": grant.vault_id,
+                    "relation": grant.relation,
+                    "scopes": list(grant.scopes),
+                    "write_scopes": list(grant.write_scopes),
+                    "note_count": len(notes),
+                    "size_bytes": size,
+                    "head_commit": bundle.git.head(),
+                    "last_commit_iso": bundle.git.head_time(),
+                    "last_indexed_iso": stats["last_indexed"],
+                    "index_note_count": stats["note_count"],
+                    "sync_adapter": self.vault_manager.sync_config_for(grant.vault_id).adapter,
+                }
+            )
+        return JSONResponse({"vaults": items})
+
+    async def vault_tree(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        paths = filter_paths(bundle.store.list_notes(), scoped.scopes)
+        root: dict = {"name": "", "type": "folder", "children": {}}
+        for path in paths:
+            node = root
+            parts = path.split("/")
+            for part in parts[:-1]:
+                node = node["children"].setdefault(
+                    part, {"name": part, "type": "folder", "children": {}}
+                )
+            node["children"][parts[-1]] = {
+                "name": parts[-1],
+                "type": "note",
+                "path": path,
+            }
+
+        def freeze(node: dict) -> dict:
+            if node["type"] == "note":
+                return node
+            children = [freeze(child) for child in node["children"].values()]
+            children.sort(key=lambda item: (item["type"] != "folder", item["name"].lower()))
+            return {"name": node["name"], "type": "folder", "children": children}
+
+        return JSONResponse({"vault": bundle.vault_id, "tree": freeze(root)})
+
+    async def vault_note(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        raw_path = request.path_params["path"]
+        path = canonical_note_path(raw_path)
+        if path is None or not path_allowed(path, scoped.scopes):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        try:
+            note = bundle.store.read_note(path)
+            file_path = bundle.store._resolve(path)
+            content = file_path.read_bytes()
+        except (VaultError, OSError):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        etag = '"' + hashlib.sha256(content).hexdigest() + '"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        return JSONResponse(
+            {
+                "vault": bundle.vault_id,
+                "path": path,
+                "markdown": note.body,
+                "raw": note.raw,
+                "frontmatter": note.frontmatter,
+                "etag": etag,
+                "modified_at": int(file_path.stat().st_mtime),
+            },
+            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+        )
+
+    async def vault_search(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        query = request.query_params.get("q", "").strip()
+        if not query:
+            return JSONResponse({"results": []})
+        limit = self._query_int(request, "limit", 50, minimum=1, maximum=200)
+        bundle.index.ensure_fresh()
+        hits = bundle.index.search(query, limit=max(limit * 5, 500))
+        folder = request.query_params.get("folder")
+        tag = request.query_params.get("tag")
+        results: list[dict] = []
+        for hit in hits:
+            if not path_allowed(hit.path, scoped.scopes):
+                continue
+            if folder and not hit.path.startswith(folder.rstrip("/") + "/"):
+                continue
+            if tag:
+                try:
+                    note = bundle.store.read_note(hit.path)
+                except VaultError:
+                    continue
+                tags = note.frontmatter.get("tags", [])
+                if isinstance(tags, str):
+                    tags = [tags]
+                if tag.lstrip("#") not in [str(value).lstrip("#") for value in tags]:
+                    continue
+            results.append(
+                {
+                    "path": hit.path,
+                    "line": hit.line,
+                    "snippet": hit.snippet,
+                    "score": hit.score,
+                    "headings": hit.headings,
+                }
+            )
+            if len(results) >= limit:
+                break
+        return JSONResponse({"results": results})
+
+    async def vault_asset(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        path = canonical_asset_path(request.path_params["path"])
+        if path is None or not path_allowed(path, scoped.scopes):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        try:
+            resolved = bundle.store._resolve(path)
+            if not resolved.is_file():
+                raise OSError
+            data = resolved.read_bytes()
+        except (VaultError, OSError):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        safe_inline = media_type.startswith("image/") and media_type != "image/svg+xml"
+        disposition = "inline" if safe_inline else "attachment"
+        return Response(
+            data,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'{disposition}; filename="{Path(path).name}"',
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, max-age=300",
+            },
+        )
+
+    async def vault_tags(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        tags: dict[str, list[str]] = {}
+        inline = re.compile(r"(?<![\w/])#([A-Za-z0-9_/-]+)")
+        for path in filter_paths(bundle.store.list_notes(), scoped.scopes):
+            try:
+                note = bundle.store.read_note(path)
+            except VaultError:
+                continue
+            values = note.frontmatter.get("tags", [])
+            if isinstance(values, str):
+                values = [values]
+            found = {str(value).lstrip("#") for value in values}
+            found.update(inline.findall(note.body))
+            for tag in found:
+                if tag:
+                    tags.setdefault(tag, []).append(path)
+        return JSONResponse(
+            {
+                "tags": [
+                    {"name": tag, "count": len(paths), "paths": sorted(paths)}
+                    for tag, paths in sorted(tags.items())
+                ]
+            }
+        )
+
+    async def vault_links(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        bundle, scoped, _ = self._select_vault(ident, request.path_params["vault"])
+        path = canonical_note_path(request.path_params["path"])
+        if path is None or not path_allowed(path, scoped.scopes):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        visible = filter_paths(bundle.store.list_notes(), scoped.scopes)
+        by_key: dict[str, str] = {}
+        for candidate in visible:
+            by_key[candidate.lower()] = candidate
+            by_key[Path(candidate).stem.lower()] = candidate
+        link_re = re.compile(r"!?(?:\[\[)([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+        try:
+            note = bundle.store.read_note(path)
+        except VaultError:
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        outbound = []
+        for raw in link_re.findall(note.body):
+            target = raw.strip()
+            resolved = by_key.get(target.lower()) or by_key.get((target + ".md").lower())
+            outbound.append({"target": target, "path": resolved, "broken": resolved is None})
+        inbound = []
+        aliases = {path.lower(), Path(path).stem.lower()}
+        for candidate in visible:
+            if candidate == path:
+                continue
+            try:
+                body = bundle.store.read_note(candidate).body
+            except VaultError:
+                continue
+            if any(raw.strip().lower() in aliases for raw in link_re.findall(body)):
+                inbound.append(candidate)
+        return JSONResponse({"path": path, "outbound": outbound, "inbound": inbound})
+
+    # -- B4: lifecycle and aggregated git audit -------------------------------
+
+    async def admin_vault_action(self, request: Request) -> Response:
+        self._require_identity(request, admin=True)
+        vault = request.path_params["vault"]
+        action = request.path_params["action"]
+        if action == "provision":
+            result = self.vault_manager.provision(vault)
+            return JSONResponse(
+                {
+                    "vault": result.vault_id,
+                    "created": result.created_dir,
+                    "initialized_git": result.initialized_git,
+                    "seeded": result.seeded,
+                    "commit": result.commit,
+                }
+            )
+        if action == "repair":
+            result = self.vault_manager.repair(vault)
+            return JSONResponse(
+                {
+                    "vault": result.vault_id,
+                    "initialized_git": result.initialized_git,
+                    "baseline_commit": result.baseline_commit,
+                    "indexed_notes": result.indexed_notes,
+                }
+            )
+        if action == "archive":
+            path = self.vault_manager.archive(vault)
+            return JSONResponse({"vault": vault, "archived": True, "archive": str(path)})
+        raise ApiError(404, "not_found", _NOT_FOUND)
+
+    async def commit_audit(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        principal = self._api_principal(ident)
+        vault_filter = request.query_params.get("vault")
+        actor_filter = request.query_params.get("actor", "").lower()
+        path_filter = request.query_params.get("path")
+        limit = self._query_int(request, "limit", 100, minimum=1, maximum=500)
+        events: list[dict] = []
+        for grant in self.vault_access.grants(principal):
+            if vault_filter and grant.vault_id != vault_filter:
+                continue
+            bundle = self.vault_manager.get(grant.vault_id)
+            for commit in bundle.git.log(limit=limit, path=path_filter):
+                if actor_filter and actor_filter not in commit.actor.lower() and actor_filter not in commit.subject.lower():
+                    continue
+                events.append(
+                    {
+                        "vault": grant.vault_id,
+                        "sha": commit.sha,
+                        "actor": commit.actor,
+                        "subject": commit.subject,
+                        "date": commit.iso_date,
+                        "diff": bundle.git.diff_summary(commit.sha),
+                    }
+                )
+        events.sort(key=lambda item: item["date"], reverse=True)
+        return JSONResponse({"commits": events[:limit]})
+
+    # -- D1-D4: MCP registry, permissions, and call audit ---------------------
+
+    @staticmethod
+    def _server_summary(row: dict, *, include_env_refs: bool = False) -> dict:
+        tools = json.loads(row.get("tools_json") or "[]")
+        result = {
+            "id": row["id"],
+            "name": row["name"],
+            "description": row.get("description"),
+            "url": row.get("url"),
+            "transport": row["transport"],
+            "owner_user_id": row["owner_user_id"],
+            "visibility": row["visibility"],
+            "enabled": bool(row["enabled"]),
+            "tools": tools,
+            "tool_count": len(tools),
+            "last_error": row.get("last_error"),
+            "last_checked_at": row.get("last_checked_at"),
+            "created_at": row["created_at"],
+            "updated_at": row.get("updated_at"),
+        }
+        if include_env_refs:
+            result["auth_env"] = row.get("auth_env")
+            result["headers_env"] = json.loads(row.get("headers_env_json") or "{}")
+        return result
+
+    def _server_for_identity(self, ident: ApiIdentity, raw_id: str) -> dict:
+        try:
+            server_id = int(raw_id)
+        except ValueError:
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        row = self.identity.mcp_servers.get(server_id)
+        if row is None or (
+            not ident.is_admin and row["owner_user_id"] != ident.user["id"]
+        ):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        return row
+
+    async def mcp_servers(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        if request.method == "GET":
+            rows = self.identity.mcp_servers.visible_to(
+                ident.user["id"], is_admin=ident.is_admin
+            )
+            return JSONResponse(
+                {
+                    "servers": [
+                        self._server_summary(row, include_env_refs=ident.is_admin)
+                        for row in rows
+                    ],
+                    "allow_user_servers": self.config.gateway.allow_user_servers,
+                }
+            )
+        if not ident.is_admin and not self.config.gateway.allow_user_servers:
+            raise ApiError(403, "forbidden", "personal MCP servers are disabled")
+        body = await self._json_body(request)
+        name = validate_server_name(self._str_field(body, "name", required=True))
+        url = validate_outbound_url(self._str_field(body, "url", required=True), self.config)
+        owner = None if ident.is_admin and body.get("global", True) else ident.user["id"]
+        headers_env = body.get("headers_env", {})
+        if not isinstance(headers_env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in headers_env.items()
+        ):
+            raise ApiError(400, "invalid_request", "headers_env must map header names to env names")
+        headers_env = {
+            validate_header_name(key): validate_env_name(value)
+            for key, value in headers_env.items()
+        }
+        row = self.identity.mcp_servers.create(
+            name,
+            url=url,
+            owner_user_id=owner,
+            description=self._str_field(body, "description"),
+            auth_env=validate_env_name(self._str_field(body, "auth_env")),
+            headers_env=headers_env,
+            visibility="group" if owner is None else "personal",
+            enabled=False,
+        )
+        error = None
+        try:
+            await self.gateway.discover(row)
+        except GatewayError as exc:
+            error = str(exc)
+        row = self.identity.mcp_servers.get(row["id"])
+        return JSONResponse(
+            {"server": self._server_summary(row, include_env_refs=ident.is_admin), "validation_error": error},
+            status_code=201,
+        )
+
+    async def mcp_server_item(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        row = self._server_for_identity(ident, request.path_params["server_id"])
+        if request.method == "GET":
+            return JSONResponse({"server": self._server_summary(row, include_env_refs=ident.is_admin)})
+        if request.method == "DELETE":
+            self.gateway.unregister(row)
+            self.identity.mcp_servers.delete(row["id"])
+            return Response(status_code=204)
+        body = await self._json_body(request)
+        fields = {}
+        for key in ("description", "auth_env"):
+            if key in body:
+                fields[key] = self._str_field(body, key)
+        if "auth_env" in fields:
+            fields["auth_env"] = validate_env_name(fields["auth_env"])
+        if "enabled" in body:
+            fields["enabled"] = bool(self._bool_field(body, "enabled"))
+        if "url" in body:
+            fields["url"] = validate_outbound_url(self._str_field(body, "url", required=True), self.config)
+        if "headers_env" in body:
+            headers = body["headers_env"]
+            if not isinstance(headers, dict):
+                raise ApiError(400, "invalid_request", "headers_env must be an object")
+            fields["headers_env_json"] = json.dumps(
+                {
+                    validate_header_name(key): validate_env_name(value)
+                    for key, value in headers.items()
+                }
+            )
+        row = self.identity.mcp_servers.update(row["id"], **fields)
+        self.gateway.sync_registration(row)
+        return JSONResponse({"server": self._server_summary(row, include_env_refs=ident.is_admin)})
+
+    async def mcp_server_action(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        row = self._server_for_identity(ident, request.path_params["server_id"])
+        if request.path_params["action"] not in ("test", "refresh"):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        tools = await self.gateway.discover(row)
+        refreshed = self.identity.mcp_servers.get(row["id"])
+        return JSONResponse({"server": self._server_summary(refreshed, include_env_refs=ident.is_admin), "tools": tools})
+
+    async def mcp_tools(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        principal = self._api_principal(ident)
+        builtin = [
+            "discover_scopes", "status", "list_notes", "search", "read_note",
+            "read_frontmatter", "read_section", "context_pack", "semantic_search",
+        ]
+        if self.config.writes.enabled:
+            builtin += ["write_note", "patch_note", "append_note", "update_frontmatter", "delete_note"]
+        items = []
+        for name in builtin:
+            tool_id = f"cortex.{name}"
+            if self.permissions.allowed(principal, tool_id):
+                items.append({"id": tool_id, "server": "cortex", "name": name})
+        for row in self.identity.mcp_servers.visible_to(ident.user["id"], is_admin=ident.is_admin):
+            for tool in json.loads(row.get("tools_json") or "[]"):
+                tool_id = f"{row['name']}.{tool['name']}"
+                if self.permissions.allowed(principal, tool_id):
+                    items.append(
+                        {
+                            "id": tool_id,
+                            "server": row["name"],
+                            "name": tool["name"],
+                            "description": tool.get("description"),
+                            "inputSchema": tool.get("inputSchema"),
+                        }
+                    )
+        return JSONResponse({"tools": items})
+
+    async def tool_permissions(self, request: Request) -> Response:
+        ident = self._require_identity(request, admin=True)
+        if request.method == "GET":
+            preview_user = request.query_params.get("user")
+            preview = []
+            if preview_user:
+                user = self._get_user_or_404(preview_user)
+                tool_ids = [item["tool_pattern"] for item in self.identity.tool_permissions.list()]
+                preview = [self.permissions.explain(user, tool_id) for tool_id in sorted(set(tool_ids))]
+            return JSONResponse({"permissions": self.identity.tool_permissions.list(), "preview": preview})
+        body = await self._json_body(request)
+        subject_type = self._str_field(body, "subject_type", required=True)
+        subject_name = self._str_field(body, "subject", required=True)
+        if subject_type == "user":
+            subject = self._get_user_or_404(subject_name)
+        elif subject_type == "group":
+            subject = self._get_group_or_404(subject_name)
+        else:
+            raise ApiError(400, "invalid_request", "subject_type must be user or group")
+        server_id = body.get("server_id")
+        if server_id is not None and not isinstance(server_id, int):
+            raise ApiError(400, "invalid_request", "server_id must be an integer")
+        rule = self.identity.tool_permissions.set(
+            subject_type=subject_type,
+            subject_id=subject["id"],
+            tool_pattern=self._str_field(body, "tool_pattern", required=True),
+            effect=self._str_field(body, "effect", required=True),
+            server_id=server_id,
+            created_by=ident.user["id"],
+        )
+        return JSONResponse({"permission": rule}, status_code=201)
+
+    async def tool_permission_item(self, request: Request) -> Response:
+        self._require_identity(request, admin=True)
+        try:
+            permission_id = int(request.path_params["permission_id"])
+        except ValueError:
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        if not self.identity.tool_permissions.delete(permission_id):
+            raise ApiError(404, "not_found", _NOT_FOUND)
+        return Response(status_code=204)
+
+    async def tool_audit(self, request: Request) -> Response:
+        ident = self._require_identity(request)
+        user_id = None if ident.is_admin else ident.user["id"]
+        if ident.is_admin and request.query_params.get("user"):
+            user_id = self._get_user_or_404(request.query_params["user"])["id"]
+        rows = self.identity.tool_audit.list(
+            user_id=user_id,
+            server=request.query_params.get("server"),
+            tool=request.query_params.get("tool"),
+            decision=request.query_params.get("outcome"),
+            limit=self._query_int(request, "limit", 200, minimum=1, maximum=1000),
+        )
+        return JSONResponse({"calls": rows})
+
+    async def admin_tokens(self, request: Request) -> Response:
+        self._require_identity(request, admin=True)
+        items = []
+        for user in self.identity.list_users():
+            for row in self.identity.tokens.list_for_user(user["id"]):
+                item = self._token_summary(row)
+                item["owner"] = user["username"]
+                items.append(item)
+        items.sort(key=lambda item: (item["created_at"], item["id"]), reverse=True)
+        return JSONResponse({"tokens": items})
+
+    async def janitor_status(self, request: Request) -> Response:
+        self._require_identity(request, admin=True)
+        reports = []
+        with self.identity.db.connection() as conn:
+            reports = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM janitor_reports ORDER BY created_at DESC LIMIT 100"
+                ).fetchall()
+            ]
+        return JSONResponse(
+            {
+                "enabled": self.config.janitor.enabled,
+                "dry_run": self.config.janitor.dry_run,
+                "interval_seconds": self.config.janitor.interval_seconds,
+                "allowed_paths": self.config.janitor.allowed_paths,
+                "forbidden_paths": self.config.janitor.forbidden_paths,
+                "reports": reports,
             }
         )
 

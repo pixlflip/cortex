@@ -13,6 +13,7 @@ so callers never hold anything tied to a closed connection.
 from __future__ import annotations
 
 import json
+import fnmatch
 import secrets
 import time
 from dataclasses import dataclass
@@ -200,7 +201,7 @@ class UsersRepo:
 # groups + membership
 # --------------------------------------------------------------------------
 
-_GROUP_UPDATABLE = {"ldap_dn", "scopes_json"}
+_GROUP_UPDATABLE = {"ldap_dn", "scopes_json", "write_scopes_json"}
 
 
 class GroupsRepo:
@@ -214,6 +215,7 @@ class GroupsRepo:
         source: str = "local",
         ldap_dn: str | None = None,
         scopes: list[str] | None = None,
+        write_scopes: list[str] | None = None,
     ) -> dict:
         name = name.strip()
         if not name:
@@ -223,14 +225,16 @@ class GroupsRepo:
         with self.db.transaction() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO groups (name, source, ldap_dn, scopes_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO groups (name, source, ldap_dn, scopes_json,
+                                    write_scopes_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
                     source,
                     ldap_dn,
                     json.dumps(scopes) if scopes is not None else None,
+                    json.dumps(write_scopes) if write_scopes is not None else None,
                     _now(),
                 ),
             )
@@ -279,6 +283,15 @@ class GroupsRepo:
         if group is None or not group["scopes_json"]:
             return []
         return list(json.loads(group["scopes_json"]))
+
+    def set_write_scopes(self, group_id: int, scopes: list[str]) -> None:
+        self.update(group_id, write_scopes_json=json.dumps(scopes))
+
+    def write_scopes(self, group_id: int) -> list[str]:
+        group = self.get(group_id)
+        if group is None or not group.get("write_scopes_json"):
+            return []
+        return list(json.loads(group["write_scopes_json"]))
 
     def delete(self, group_id: int) -> bool:
         with self.db.transaction() as conn:
@@ -602,4 +615,311 @@ class SessionsRepo:
             cur = conn.execute(
                 "DELETE FROM sessions WHERE expires_at <= ?", (now or _now(),)
             )
+            return cur.rowcount
+
+
+# --------------------------------------------------------------------------
+# MCP gateway registry, permissions, and central call audit (D1/D2)
+# --------------------------------------------------------------------------
+
+
+class McpServersRepo:
+    """CRUD for external MCP registrations.
+
+    Credential values are never stored: ``auth_env`` and
+    ``headers_env_json`` contain environment-variable *names*.  API
+    serializers intentionally omit even those names for non-admin callers.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(
+        self,
+        name: str,
+        *,
+        url: str,
+        owner_user_id: int | None = None,
+        description: str | None = None,
+        transport: str = "streamable-http",
+        auth_env: str | None = None,
+        headers_env: dict[str, str] | None = None,
+        visibility: str = "group",
+        enabled: bool = True,
+    ) -> dict:
+        now = _now()
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO mcp_servers
+                    (name, url, transport, auth_env, headers_env_json,
+                     owner_user_id, visibility, enabled, description,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    url,
+                    transport,
+                    auth_env,
+                    json.dumps(headers_env or {}),
+                    owner_user_id,
+                    visibility,
+                    int(enabled),
+                    description,
+                    now,
+                    now,
+                ),
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM mcp_servers WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+            )
+
+    def get(self, server_id: int) -> dict | None:
+        with self.db.connection() as conn:
+            return _row(
+                conn.execute(
+                    "SELECT * FROM mcp_servers WHERE id = ?", (server_id,)
+                ).fetchone()
+            )
+
+    def get_by_name(self, name: str) -> dict | None:
+        with self.db.connection() as conn:
+            return _row(
+                conn.execute(
+                    "SELECT * FROM mcp_servers WHERE name = ?", (name,)
+                ).fetchone()
+            )
+
+    def list(self, *, owner_user_id: int | None | object = ...) -> list[dict]:
+        with self.db.connection() as conn:
+            if owner_user_id is ...:
+                rows = conn.execute(
+                    "SELECT * FROM mcp_servers ORDER BY name"
+                ).fetchall()
+            elif owner_user_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM mcp_servers WHERE owner_user_id IS NULL ORDER BY name"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM mcp_servers WHERE owner_user_id = ? ORDER BY name",
+                    (owner_user_id,),
+                ).fetchall()
+            return _rows(rows)
+
+    def visible_to(self, user_id: int, *, is_admin: bool = False) -> list[dict]:
+        with self.db.connection() as conn:
+            if is_admin:
+                rows = conn.execute(
+                    "SELECT * FROM mcp_servers ORDER BY name"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM mcp_servers
+                    WHERE enabled = 1 AND (owner_user_id IS NULL OR owner_user_id = ?)
+                    ORDER BY name
+                    """,
+                    (user_id,),
+                ).fetchall()
+            return _rows(rows)
+
+    def update(self, server_id: int, **fields: Any) -> dict | None:
+        allowed = {
+            "url", "description", "transport", "auth_env", "headers_env_json",
+            "visibility", "enabled", "tools_json", "last_error",
+            "last_checked_at", "owner_user_id",
+        }
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"cannot update field(s): {', '.join(sorted(bad))}")
+        if not fields:
+            return self.get(server_id)
+        fields["updated_at"] = _now()
+        sets = ", ".join(f"{key} = ?" for key in fields)
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
+        with self.db.transaction() as conn:
+            conn.execute(
+                f"UPDATE mcp_servers SET {sets} WHERE id = ?",
+                (*values, server_id),
+            )
+            return _row(
+                conn.execute(
+                    "SELECT * FROM mcp_servers WHERE id = ?", (server_id,)
+                ).fetchone()
+            )
+
+    def set_inventory(
+        self, server_id: int, tools: list[dict], *, error: str | None = None
+    ) -> dict | None:
+        return self.update(
+            server_id,
+            tools_json=json.dumps(tools, separators=(",", ":")),
+            last_error=error,
+            last_checked_at=_now(),
+            enabled=error is None,
+        )
+
+    def delete(self, server_id: int) -> bool:
+        with self.db.transaction() as conn:
+            cur = conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
+            return cur.rowcount > 0
+
+
+class ToolPermissionsRepo:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def set(
+        self,
+        *,
+        subject_type: str,
+        subject_id: int,
+        tool_pattern: str,
+        effect: str,
+        server_id: int | None = None,
+        created_by: int | None = None,
+    ) -> dict:
+        if subject_type not in ("user", "group"):
+            raise ValueError("subject_type must be user or group")
+        if effect not in ("allow", "deny"):
+            raise ValueError("effect must be allow or deny")
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                DELETE FROM tool_permissions
+                WHERE subject_type = ? AND subject_id = ?
+                  AND server_id IS ? AND tool_pattern = ?
+                """,
+                (subject_type, subject_id, server_id, tool_pattern),
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO tool_permissions
+                    (subject_type, subject_id, server_id, tool_pattern,
+                     effect, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    subject_type,
+                    subject_id,
+                    server_id,
+                    tool_pattern,
+                    effect,
+                    created_by,
+                    _now(),
+                ),
+            )
+            return dict(
+                conn.execute(
+                    "SELECT * FROM tool_permissions WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+            )
+
+    def list(self) -> list[dict]:
+        with self.db.connection() as conn:
+            return _rows(
+                conn.execute(
+                    "SELECT * FROM tool_permissions ORDER BY subject_type, subject_id, tool_pattern"
+                ).fetchall()
+            )
+
+    def delete(self, permission_id: int) -> bool:
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM tool_permissions WHERE id = ?", (permission_id,)
+            )
+            return cur.rowcount > 0
+
+    def matching(self, user_id: int, group_ids: list[int], tool_id: str) -> list[dict]:
+        rules = self.list()
+        return [
+            rule
+            for rule in rules
+            if (
+                (rule["subject_type"] == "user" and rule["subject_id"] == user_id)
+                or (
+                    rule["subject_type"] == "group"
+                    and rule["subject_id"] in group_ids
+                )
+            )
+            and fnmatch.fnmatchcase(tool_id, rule["tool_pattern"])
+        ]
+
+
+class ToolAuditRepo:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def record(
+        self,
+        *,
+        subject: str,
+        server: str,
+        tool: str,
+        decision: str,
+        user_id: int | None = None,
+        api_token_id: int | None = None,
+        vault: str | None = None,
+        error_kind: str | None = None,
+        duration_ms: int | None = None,
+        args_digest: str | None = None,
+        args_summary: str | None = None,
+    ) -> int:
+        if decision not in ("allowed", "denied", "error"):
+            raise ValueError("invalid audit decision")
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO tool_call_audit
+                    (ts, subject, user_id, api_token_id, server, tool, decision,
+                     error_kind, duration_ms, args_digest, vault, args_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now(), subject, user_id, api_token_id, server, tool,
+                    decision, error_kind, duration_ms, args_digest, vault,
+                    (args_summary or "")[:512] or None,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list(
+        self,
+        *,
+        user_id: int | None = None,
+        server: str | None = None,
+        tool: str | None = None,
+        decision: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("user_id", user_id),
+            ("server", server),
+            ("tool", tool),
+            ("decision", decision),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(max(1, min(int(limit), 1000)))
+        with self.db.connection() as conn:
+            return _rows(
+                conn.execute(
+                    "SELECT * FROM tool_call_audit"
+                    + where
+                    + " ORDER BY ts DESC, id DESC LIMIT ?",
+                    values,
+                ).fetchall()
+            )
+
+    def prune(self, *, before: int) -> int:
+        with self.db.transaction() as conn:
+            cur = conn.execute("DELETE FROM tool_call_audit WHERE ts < ?", (before,))
             return cur.rowcount

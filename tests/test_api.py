@@ -174,6 +174,34 @@ def test_me_anonymous_is_401(client: TestClient):
     assert_envelope(client.get(f"{API_PREFIX}/auth/me"), 401, "unauthenticated")
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/ldap/status"),
+        ("GET", "/admin/tokens"),
+        ("GET", "/vaults"),
+        ("GET", "/vaults/main/tree"),
+        ("GET", "/vaults/main/search?q=x"),
+        ("GET", "/vaults/main/notes/x.md"),
+        ("GET", "/vaults/main/assets/x.png"),
+        ("GET", "/vaults/main/tags"),
+        ("GET", "/vaults/main/links/x.md"),
+        ("POST", "/admin/vaults/alice/repair"),
+        ("GET", "/audit/commits"),
+        ("GET", "/audit/tools"),
+        ("GET", "/mcp/tools"),
+        ("GET", "/mcp/servers"),
+        ("POST", "/mcp/servers"),
+        ("GET", "/mcp/servers/1"),
+        ("POST", "/mcp/servers/1/refresh"),
+        ("GET", "/admin/permissions"),
+        ("GET", "/admin/janitor"),
+    ],
+)
+def test_every_v2_route_authenticates_before_work(client: TestClient, method: str, path: str):
+    assert_envelope(client.request(method, f"{API_PREFIX}{path}"), 401, "unauthenticated")
+
+
 # ---------------------------------------------------------------------------
 # CSRF + Origin on cookie auth; bearer is exempt
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# Cortex /api/v1 — hand-written OpenAPI contract (A6, #40).
+# Cortex /api/v1 — hand-written OpenAPI contract (A6/B3/D4).
 #
 # Authoritative description of the JSON REST surface the SPA (C1+) and any
 # scripting client build against. Kept accurate to src/cortex/api.py by hand;
@@ -8,10 +8,8 @@ info:
   title: Cortex API
   version: "1.0"
   description: |
-    JSON REST API for Cortex identity and self-service management (v2 A6).
-    This phase covers authentication, admin user/group management, per-user
-    API tokens, and the LDAP sync trigger. Vault-content endpoints (B3) and
-    MCP-gateway endpoints (D) are added in later phases.
+    JSON REST API for Cortex identity, multi-vault content/lifecycle,
+    self-service tokens, governed MCP registry/permissions, and audit.
 
     **Authentication.** Two schemes, resolved per request:
     - `cookieAuth` — the HttpOnly session cookie set by `POST /auth/login`.
@@ -53,6 +51,14 @@ tags:
     description: Self-service API tokens.
   - name: ldap
     description: Admin-only directory operations.
+  - name: vaults
+    description: Identity-scoped vault discovery and read-oriented content.
+  - name: audit
+    description: Git mutation history and value-free tool-call telemetry.
+  - name: gateway
+    description: Governed upstream MCP registry and visible tool inventory.
+  - name: policy
+    description: Admin-only deny-wins tool permission rules.
 
 paths:
   /auth/login:
@@ -532,6 +538,261 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/DirectoryUnavailable" }
 
+  /ldap/status:
+    get:
+      tags: [ldap]
+      operationId: ldapStatus
+      summary: Show directory configuration posture (admin; no credentials).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/tokens:
+    get:
+      tags: [tokens]
+      operationId: adminListTokens
+      summary: List every user's token metadata (admin; never raw tokens/hashes).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /vaults:
+    get:
+      tags: [vaults]
+      operationId: listVisibleVaults
+      summary: List only vaults granted to the caller, including health/freshness.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  /vaults/{vault}/tree:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+    get:
+      tags: [vaults]
+      operationId: vaultTree
+      summary: Return a scope-filtered folder/note tree.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/search:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - name: q
+        in: query
+        required: true
+        schema: { type: string }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      - name: folder
+        in: query
+        schema: { type: string }
+      - name: tag
+        in: query
+        schema: { type: string }
+    get:
+      tags: [vaults]
+      operationId: searchVault
+      summary: Full-text search within the caller's visible note scopes.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/notes/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/NotePath"
+    get:
+      tags: [vaults]
+      operationId: readVaultNote
+      summary: Read one scope-checked Markdown note with frontmatter and ETag.
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "304": { description: The ETag still matches. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/assets/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/AssetPath"
+    get:
+      tags: [vaults]
+      operationId: readVaultAsset
+      summary: Fetch a scope-checked attachment with safe content headers.
+      responses:
+        "200": { description: Attachment bytes. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/tags:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+    get:
+      tags: [vaults]
+      operationId: vaultTags
+      summary: Aggregate frontmatter and inline tags over visible notes.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /vaults/{vault}/links/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/NotePath"
+    get:
+      tags: [vaults]
+      operationId: vaultLinks
+      summary: Resolve visible outbound links and backlinks for one note.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/vaults/{vault}/{action}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - name: action
+        in: path
+        required: true
+        schema: { type: string, enum: [provision, repair, archive] }
+    post:
+      tags: [vaults]
+      operationId: administerVault
+      summary: Provision, repair, or non-destructively archive a vault (admin).
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /audit/commits:
+    get:
+      tags: [audit]
+      operationId: listCommitAudit
+      summary: Aggregate visible per-vault git commits.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /audit/tools:
+    get:
+      tags: [audit]
+      operationId: listToolAudit
+      summary: List caller-owned, or admin-visible, tool-call telemetry.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /mcp/tools:
+    get:
+      tags: [gateway]
+      operationId: listVisibleMcpTools
+      summary: List the exact tool surface permitted for the caller.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /mcp/servers:
+    get:
+      tags: [gateway]
+      operationId: listMcpServers
+      summary: List global and caller-owned enabled upstreams (all for admin).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    post:
+      tags: [gateway]
+      operationId: createMcpServer
+      summary: Register and test a Streamable HTTP upstream.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/McpServerInput" }
+      responses:
+        "201": { $ref: "#/components/responses/FreeformOk" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /mcp/servers/{server_id}:
+    parameters:
+      - $ref: "#/components/parameters/ServerId"
+    get:
+      tags: [gateway]
+      operationId: getMcpServer
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [gateway]
+      operationId: updateMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    delete:
+      tags: [gateway]
+      operationId: deleteMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Server and dependent rules removed. }
+
+  /mcp/servers/{server_id}/{action}:
+    parameters:
+      - $ref: "#/components/parameters/ServerId"
+      - name: action
+        in: path
+        required: true
+        schema: { type: string, enum: [test, refresh] }
+    post:
+      tags: [gateway]
+      operationId: refreshMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /admin/permissions:
+    get:
+      tags: [policy]
+      operationId: listToolPermissions
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    post:
+      tags: [policy]
+      operationId: setToolPermission
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "201": { $ref: "#/components/responses/FreeformOk" }
+
+  /admin/permissions/{permission_id}:
+    parameters:
+      - name: permission_id
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [policy]
+      operationId: deleteToolPermission
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Rule removed. }
+
+  /admin/janitor:
+    get:
+      tags: [audit]
+      operationId: janitorStatus
+      summary: Show report-first janitor configuration and recent reports (admin).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
 components:
   securitySchemes:
     cookieAuth:
@@ -556,8 +817,36 @@ components:
         Required on state-changing requests authenticated by session cookie
         (the csrf_token from the login response). Ignored — and unnecessary —
         for bearer-authenticated requests.
+    VaultId:
+      name: vault
+      in: path
+      required: true
+      schema: { type: string }
+      description: "main or a granted username vault id."
+    NotePath:
+      name: path
+      in: path
+      required: true
+      schema: { type: string }
+      description: Vault-relative Markdown note path; may contain `/`.
+    AssetPath:
+      name: path
+      in: path
+      required: true
+      schema: { type: string }
+      description: Vault-relative attachment path; may contain `/`.
+    ServerId:
+      name: server_id
+      in: path
+      required: true
+      schema: { type: integer }
 
   responses:
+    FreeformOk:
+      description: Successful JSON response; see the operation summary and server implementation for the endpoint-specific shape.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
     Unauthenticated:
       description: No valid credential (code `unauthenticated`).
       content:
@@ -631,6 +920,10 @@ components:
           type: array
           items: { type: string }
           description: Shared-vault path-scope grants (design §6.4).
+        write_scopes:
+          type: array
+          items: { type: string }
+          description: Independent shared-vault mutation grants.
         members:
           type: array
           items: { type: string }
@@ -650,6 +943,22 @@ components:
         expires_at: { type: [integer, "null"], description: Unix seconds. }
         last_used_at: { type: [integer, "null"], description: Unix seconds. }
         revoked_at: { type: [integer, "null"], description: Unix seconds. }
+
+    McpServerInput:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
+        url: { type: string, format: uri }
+        description: { type: string }
+        auth_env:
+          type: string
+          description: Environment-variable name, never a credential value.
+        headers_env:
+          type: object
+          additionalProperties: { type: string }
+          description: HTTP header name to environment-variable name.
+        global: { type: boolean, default: true }
 
     SyncReport:
       type: object

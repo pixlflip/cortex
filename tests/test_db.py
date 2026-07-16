@@ -46,6 +46,7 @@ EXPECTED_TABLES = {
     "mcp_servers",
     "tool_permissions",
     "tool_call_audit",
+    "janitor_reports",
 }
 
 
@@ -581,7 +582,11 @@ def test_cli_db_init_status_migrate_import(project, capsys):
 
     assert main(["-c", str(cfg_path), "db", "init"]) == 0
     out = capsys.readouterr().out
-    assert "created database" in out and "0 -> 1" in out and "imported legacy" in out
+    assert (
+        "created database" in out
+        and f"0 -> {latest_version()}" in out
+        and "imported legacy" in out
+    )
     assert (base / "data" / "cortex.sqlite").exists()
 
     assert main(["-c", str(cfg_path), "db", "init"]) == 0  # idempotent

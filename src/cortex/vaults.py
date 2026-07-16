@@ -120,6 +120,15 @@ class ProvisionResult:
     commit: str | None
 
 
+@dataclass
+class RepairResult:
+    vault_id: str
+    root: Path
+    initialized_git: bool
+    baseline_commit: str | None
+    indexed_notes: int
+
+
 class VaultManager:
     """Owns the registry of vaults (main + per-user) and their lifecycle.
 
@@ -305,6 +314,32 @@ class VaultManager:
             initialized_git=initialized_git,
             seeded=seeded,
             commit=commit,
+        )
+
+    def repair(self, vault_id: str) -> RepairResult:
+        """Repair the rebuildable/derived parts of any live vault.
+
+        A missing git repository is initialized and baselined; an existing
+        repository's pending human edits are deliberately left untouched.
+        The search index is rebuilt from the current Markdown source of truth.
+        """
+        bundle = self.get(vault_id)
+        initialized = False
+        commit = None
+        if self._git_config.enabled:
+            initialized = bundle.git.ensure_repo()
+            if initialized:
+                commit = bundle.git.commit(
+                    actor="cortex-repair",
+                    reason=f"restore audit baseline for {bundle.vault_id}",
+                )
+        bundle.index.rebuild()
+        return RepairResult(
+            vault_id=bundle.vault_id,
+            root=bundle.root,
+            initialized_git=initialized,
+            baseline_commit=commit,
+            indexed_notes=bundle.index.stats()["note_count"],
         )
 
     def _seed(self, root: Path) -> None:

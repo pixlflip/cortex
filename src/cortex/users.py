@@ -42,7 +42,10 @@ from .db.repos import (
     ApiTokensRepo,
     CreatedApiToken,
     GroupsRepo,
+    McpServersRepo,
     SessionsRepo,
+    ToolAuditRepo,
+    ToolPermissionsRepo,
     UsersRepo,
 )
 from .pwhash import sha256_hex
@@ -113,6 +116,9 @@ class IdentityService:
         self.groups = GroupsRepo(db)
         self.tokens = ApiTokensRepo(db)
         self.sessions = SessionsRepo(db)
+        self.mcp_servers = McpServersRepo(db)
+        self.tool_permissions = ToolPermissionsRepo(db)
+        self.tool_audit = ToolAuditRepo(db)
         # Optional VaultManager (cortex.vaults). When set, creating a user
         # provisions their per-user vault (B1). Left None in pure-v1 / DB-only
         # flows so nothing touches the filesystem. Wired via
@@ -259,6 +265,7 @@ class IdentityService:
         name: str,
         *,
         scopes: list[str] | None = None,
+        write_scopes: list[str] | None = None,
         actor: dict | None = OPERATOR,
     ) -> dict:
         self._require_admin(actor)
@@ -266,7 +273,12 @@ class IdentityService:
         if not name:
             raise IdentityError("group name is required")
         try:
-            return self.groups.create(name, source="local", scopes=scopes)
+            return self.groups.create(
+                name,
+                source="local",
+                scopes=scopes,
+                write_scopes=write_scopes,
+            )
         except sqlite3.IntegrityError as exc:
             raise IdentityError(f"group already exists: {name}") from exc
 
@@ -287,12 +299,19 @@ class IdentityService:
         self.groups.delete(group["id"])
 
     def set_group_scopes(
-        self, name: str, scopes: list[str], *, actor: dict | None = OPERATOR
+        self,
+        name: str,
+        scopes: list[str],
+        *,
+        write_scopes: list[str] | None = None,
+        actor: dict | None = OPERATOR,
     ) -> dict:
         """Replace a group's shared-vault scope grants (design §6.4)."""
         self._require_admin(actor)
         group = self.get_group(name)
         self.groups.set_scopes(group["id"], list(scopes))
+        if write_scopes is not None:
+            self.groups.set_write_scopes(group["id"], list(write_scopes))
         return self.get_group(name)
 
     def add_to_group(
@@ -342,8 +361,24 @@ class IdentityService:
             return None
         scopes = self.scopes_for_user(user)
         if token_scopes is not None:
-            scopes = [s for s in token_scopes if s in scopes]
-        return Principal(name=username, scopes=scopes)
+            # Conservative glob containment for the shared vault. A narrower
+            # token pattern below an existing ``folder/**`` grant is valid;
+            # unrelated patterns are dropped. The raw token constraints are
+            # also retained so B2 can apply them to the user's own vault.
+            def within(candidate: str, grant: str) -> bool:
+                if grant == "**" or candidate == grant:
+                    return True
+                if grant.endswith("/**"):
+                    prefix = grant[:-3].rstrip("/")
+                    return candidate == prefix or candidate.startswith(prefix + "/")
+                return False
+
+            scopes = [
+                candidate
+                for candidate in token_scopes
+                if any(within(candidate, grant) for grant in scopes)
+            ]
+        return Principal(name=username, scopes=scopes, token_scopes=token_scopes)
 
     # -- API tokens -------------------------------------------------------------
 

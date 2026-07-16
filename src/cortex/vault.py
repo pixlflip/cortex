@@ -26,6 +26,48 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 NOTE_SUFFIXES = {".md", ".markdown"}
 
 
+def canonical_note_path(path: str) -> str | None:
+    """Canonical, hidden-file-safe note path used before authorization.
+
+    The scope check and filesystem operation must consume this exact value;
+    accepting a raw ``..`` path before normalization is the boundary-crossing
+    vulnerability fixed in #5.
+    """
+    if not path or "\x00" in path or "\\" in path:
+        return None
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return None
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == ".." or segment.startswith("."):
+            return None
+        parts.append(segment)
+    if not parts:
+        return None
+    suffix = Path(parts[-1]).suffix.lower()
+    if suffix not in NOTE_SUFFIXES:
+        return None
+    return "/".join(parts)
+
+
+def canonical_asset_path(path: str) -> str | None:
+    """Canonicalize an attachment path while excluding hidden components."""
+    if not path or "\x00" in path or "\\" in path:
+        return None
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return None
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == ".." or segment.startswith("."):
+            return None
+        parts.append(segment)
+    return "/".join(parts) if parts else None
+
+
 class VaultError(Exception):
     """Raised for invalid paths or missing notes."""
 

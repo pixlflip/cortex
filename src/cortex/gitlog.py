@@ -156,6 +156,32 @@ class GitAudit:
             return None  # repo exists but has zero commits yet
         return commits[0].iso_date if commits else None
 
+    def diff_summary(self, sha: str) -> dict:
+        """Bounded, content-free file/line summary for an audit commit."""
+        out = _run(["show", "--numstat", "--format=", sha, "--"], self.root)
+        files: list[dict] = []
+        insertions = 0
+        deletions = 0
+        for line in out.splitlines()[:200]:
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            added, removed, path = parts
+            added_n = int(added) if added.isdigit() else 0
+            removed_n = int(removed) if removed.isdigit() else 0
+            insertions += added_n
+            deletions += removed_n
+            if len(files) < 50:
+                files.append(
+                    {"path": path, "insertions": added_n, "deletions": removed_n}
+                )
+        return {
+            "files": files,
+            "file_count": len(out.splitlines()),
+            "insertions": insertions,
+            "deletions": deletions,
+        }
+
     # -- remote sync (best-effort; caller decides whether failure is fatal) --
 
     def pull_rebase(self, remote: str = "origin", branch: str | None = None) -> None:

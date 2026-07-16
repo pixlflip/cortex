@@ -193,6 +193,48 @@ def _m0001_initial_schema(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
+def _m0002_gateway_and_shared_writes(conn: sqlite3.Connection) -> None:
+    """Finish the columns consumed by B2/B4 and the MCP gateway.
+
+    Migration 1 deliberately created the D-workstream tables early.  This
+    forward-only refinement adds the operational metadata discovered while
+    implementing the registry/runtime, without making fresh and upgraded
+    databases diverge.
+    """
+    for stmt in (
+        "ALTER TABLE groups ADD COLUMN write_scopes_json TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN description TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN headers_env_json TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN tools_json TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN last_error TEXT",
+        "ALTER TABLE mcp_servers ADD COLUMN last_checked_at INTEGER",
+        "ALTER TABLE mcp_servers ADD COLUMN updated_at INTEGER",
+        "ALTER TABLE tool_call_audit ADD COLUMN vault TEXT",
+        "ALTER TABLE tool_call_audit ADD COLUMN args_summary TEXT",
+    ):
+        conn.execute(stmt)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_permissions_unique "
+        "ON tool_permissions(subject_type, subject_id, server_id, tool_pattern)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mcp_servers_owner "
+        "ON mcp_servers(owner_user_id, enabled)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS janitor_reports (
+            id         INTEGER PRIMARY KEY,
+            vault      TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            dry_run    INTEGER NOT NULL DEFAULT 1,
+            summary    TEXT NOT NULL,
+            details_json TEXT
+        )
+        """
+    )
+
+
 def _split_statements(script: str) -> list[str]:
     """Split a DDL script into single statements for ``execute()``.
 
@@ -220,6 +262,7 @@ def _split_statements(script: str) -> list[str]:
 #: Versions must be contiguous starting at 1.
 MIGRATIONS: list[Migration] = [
     Migration(1, "initial_schema", _m0001_initial_schema),
+    Migration(2, "gateway_and_shared_writes", _m0002_gateway_and_shared_writes),
 ]
 
 

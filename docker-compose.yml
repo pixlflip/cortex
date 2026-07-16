@@ -22,11 +22,18 @@ services:
       # CORTEX_LLM_API_KEY: ${CORTEX_LLM_API_KEY}
     volumes:
       - ./vault:/data/vault
+      - ./data:/data/data
       - ./cortex.yaml:/data/cortex.yaml:ro
     # stdin_open/tty let stdio MCP clients attach (docker compose run -it).
     stdin_open: true
     tty: true
     # For remote MCP clients (server.transport: http), expose the port and put
     # a TLS-terminating reverse proxy in front. See docs/http-exposure.md.
-    # ports:
-    #   - "8765:8765"
+    ports:
+      - "8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

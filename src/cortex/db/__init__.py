@@ -30,7 +30,10 @@ from .repos import (
     CreatedApiToken,
     CreatedSession,
     GroupsRepo,
+    McpServersRepo,
     SessionsRepo,
+    ToolAuditRepo,
+    ToolPermissionsRepo,
     UsersRepo,
 )
 from .admin_import import import_admin_state
@@ -47,6 +50,9 @@ __all__ = [
     "GroupsRepo",
     "ApiTokensRepo",
     "SessionsRepo",
+    "McpServersRepo",
+    "ToolPermissionsRepo",
+    "ToolAuditRepo",
     "CreatedApiToken",
     "CreatedSession",
     "import_admin_state",

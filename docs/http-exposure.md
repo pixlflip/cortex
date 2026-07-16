@@ -35,7 +35,7 @@ Each request must send `Authorization: Bearer <token>`. The token maps to its
 principal; the principal's scopes are enforced on every tool call. An unknown or
 missing token gets `401`.
 
-## 2. Admin UI
+## 2. Web app and admin panel
 
 Run `cortex init` once before exposing HTTP. It initializes the git audit
 baseline and creates the admin UI state file with a generated password:
@@ -46,10 +46,11 @@ cortex init
 # admin password: <shown once>
 ```
 
-When `admin.enabled: true`, HTTP deployments expose `/admin`. Sign in there to
-create roles (scope lists like `Projects/Alpha/**`) and AI clients. Each AI
-client gets its own bearer token and resolves to its own principal, so clients
-can be individually scoped without editing `cortex.yaml` for every connector.
+HTTP deployments with an initialized SQLite database expose the same-origin SPA
+at `/`. Sign in with the generated local admin to manage users, groups and
+shared scopes, private vaults, LDAP sync, user tokens, upstream MCP servers,
+deny-wins tool rules, and audit telemetry. Each person creates a separate token
+per AI client; token path scopes may narrow that client's vault access.
 
 ## 3. Put TLS in front (reverse proxy)
 
@@ -110,7 +111,7 @@ at `https://cortex.example.com/mcp`, let it auto-discover and register, and when
 it sends you to the Cortex consent page, paste the principal token for the scope
 you want that connector to have.
 
-> Token storage is in-memory: a server restart invalidates issued OAuth tokens
+> OAuth authorization state is in-memory: a server restart invalidates issued OAuth tokens
 > and registered clients, so connectors re-authorize. Persisting them is a
 > planned enhancement. Principal tokens should be high-entropy
 > (`openssl rand -hex 32`) — at the consent step they are the login credential.
@@ -129,3 +130,6 @@ curl -s -X POST https://cortex.example.com/mcp \
   -H 'Accept: application/json, text/event-stream' -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
+
+Read [`mcp-gateway.md`](mcp-gateway.md) before registering upstream servers,
+especially the SSRF and untrusted-result boundaries.

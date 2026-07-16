@@ -312,6 +312,7 @@ def _bootstrap_identity(cfg: CortexConfig) -> int:
     (A4); the legacy admin.json is import-only from here on."""
     from .db import Database, import_admin_state
     from .users import IdentityService, bootstrap_admin
+    from .vaults import attach_vault_manager
 
     db = Database(cfg.database.path)
     if cfg.admin.enabled and AdminStore(cfg.admin.path).exists():
@@ -319,7 +320,15 @@ def _bootstrap_identity(cfg: CortexConfig) -> int:
         if report.changed:
             print(f"imported legacy admin state from {cfg.admin.path}")
     identity = IdentityService(db, cfg)
-    password = bootstrap_admin(identity)
+    manager = attach_vault_manager(identity, cfg)
+    try:
+        password = bootstrap_admin(identity)
+        # Imported/existing users predate the attached manager; repair their
+        # private vaults as part of the same idempotent first-run command.
+        for user in identity.list_users():
+            manager.provision(user["username"])
+    finally:
+        manager.close()
     if password:
         print(f"admin user created in {cfg.database.path}")
         print("admin username: admin")
@@ -346,6 +355,49 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         print("git audit is disabled in config; skipping vault repo init.")
     return _bootstrap_identity(cfg)
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Idempotent v1 -> v2 adoption command (E1).
+
+    Applies SQLite migrations, imports the legacy admin store exactly once,
+    keeps ``vault.path`` as the main/shared vault, and repairs a private vault
+    for every existing user.  It is safe to rerun after an interrupted
+    upgrade.
+    """
+    cfg = _load(args)
+    from .db import Database, import_admin_state
+    from .users import IdentityService, bootstrap_admin
+    from .vaults import attach_vault_manager
+
+    db = Database(cfg.database.path)
+    report = import_admin_state(db, cfg.admin.path)
+    identity = IdentityService(db, cfg)
+    bootstrap_password = bootstrap_admin(identity)
+    manager = attach_vault_manager(identity, cfg)
+    provisioned: list[str] = []
+    repaired: list[str] = []
+    try:
+        for user in identity.list_users():
+            outcome = manager.provision(user["username"])
+            if outcome.created_dir:
+                provisioned.append(user["username"])
+            else:
+                repaired.append(user["username"])
+    finally:
+        manager.close()
+    print(f"database: {cfg.database.path} (schema {db.schema_version()})")
+    print(f"main vault adopted: {cfg.vault.path}")
+    print(
+        "legacy admin import: "
+        + ("applied" if report.changed else "already complete / nothing to import")
+    )
+    print(f"user vaults provisioned: {len(provisioned)}; checked: {len(repaired)}")
+    if bootstrap_password:
+        print("initial admin created: admin")
+        print(f"admin password: {bootstrap_password}")
+        print("save this password now; Cortex stores only its hash.")
+    return 0
 
 
 def cmd_db(args: argparse.Namespace) -> int:
@@ -401,8 +453,16 @@ def cmd_db(args: argparse.Namespace) -> int:
             # First-run admin bootstrap (A4): the DB is the source of truth
             # for users, so `db init` guarantees an admin exists.
             from .users import IdentityService, bootstrap_admin
+            from .vaults import attach_vault_manager
 
-            password = bootstrap_admin(IdentityService(db, cfg))
+            identity = IdentityService(db, cfg)
+            manager = attach_vault_manager(identity, cfg)
+            try:
+                password = bootstrap_admin(identity)
+                for user in identity.list_users():
+                    manager.provision(user["username"])
+            finally:
+                manager.close()
             if password:
                 print("admin username: admin")
                 print(f"admin password: {password}")
@@ -605,6 +665,15 @@ def cmd_vault(args: argparse.Namespace) -> int:
                     f"{result.root} (no changes)"
                 )
             return 0
+        if action == "repair":
+            result = manager.repair(args.vault)
+            print(f"repaired vault '{result.vault_id}' at {result.root}")
+            if result.initialized_git:
+                print("  restored git audit repository")
+            if result.baseline_commit:
+                print(f"  baseline commit: {result.baseline_commit[:10]}")
+            print(f"  rebuilt index: {result.indexed_notes} note(s)")
+            return 0
         if action == "archive":
             dest = manager.archive(args.username)
             print(f"archived vault '{args.username}' to {dest}")
@@ -735,6 +804,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check", help="validate config and report setup").set_defaults(func=cmd_check)
     sub.add_parser("init", help="init git repo + bootstrap snapshot").set_defaults(func=cmd_init)
     sub.add_parser("serve", help="run the MCP server").set_defaults(func=cmd_serve)
+    sub.add_parser(
+        "migrate",
+        help="idempotently upgrade/adopt a v1 install into the v2 data layout",
+    ).set_defaults(func=cmd_migrate)
 
     pl = sub.add_parser("log", help="show recent audit commits")
     pl.add_argument("-n", "--limit", type=int, default=20)
@@ -815,6 +888,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pv_prov.add_argument("username")
     pv_prov.set_defaults(func=cmd_vault)
+    pv_repair = pv_sub.add_parser(
+        "repair", help="repair git/index state for main or a per-user vault"
+    )
+    pv_repair.add_argument("vault", help="vault id (main or username)")
+    pv_repair.set_defaults(func=cmd_vault)
     pv_arch = pv_sub.add_parser(
         "archive",
         help="move a user's vault aside (archive_dir/<user>-<ts>), keeping git history",
