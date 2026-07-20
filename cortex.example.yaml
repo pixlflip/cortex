@@ -25,6 +25,11 @@ vaults:
   auto_provision: true
   sync:
     adapter: none
+  # Optional per-user exceptions inherit nothing from the default above:
+  # sync_overrides:
+  #   alice:
+  #     adapter: s3
+  #     options: { bucket: alice-notes, prefix: cortex/ }
 
 sync:
   adapter: none                # none (default) | git | nextcloud | s3
@@ -200,7 +205,7 @@ writes:
 
 janitor:
   enabled: false               # dark by default — keep it off until spec'd
-  dry_run: true                # report-only before any write mode
+  dry_run: true                # current worker is report-only
   interval_seconds: 3600
-  allowed_paths: []            # paths the janitor may touch (when enabled)
+  allowed_paths: []            # paths the janitor may inspect (when enabled)
   forbidden_paths: []          # always-off paths (in addition to hard categories)

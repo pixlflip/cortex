@@ -1264,9 +1264,29 @@ class ApiV1:
                     for key, value in headers.items()
                 }
             )
+        connection_changed = bool(
+            {"url", "auth_env", "headers_env_json"}.intersection(fields)
+        )
         row = self.identity.mcp_servers.update(row["id"], **fields)
-        self.gateway.sync_registration(row)
-        return JSONResponse({"server": self._server_summary(row, include_env_refs=ident.is_admin)})
+        validation_error = None
+        if connection_changed:
+            try:
+                await self.gateway.discover(row)
+            except GatewayError as exc:
+                # Discovery persists the failure and disables the registration,
+                # so a bad update cannot leave stale tools callable.
+                validation_error = str(exc)
+            row = self.identity.mcp_servers.get(row["id"])
+        else:
+            self.gateway.sync_registration(row)
+        return JSONResponse(
+            {
+                "server": self._server_summary(
+                    row, include_env_refs=ident.is_admin
+                ),
+                "validation_error": validation_error,
+            }
+        )
 
     async def mcp_server_action(self, request: Request) -> Response:
         ident = self._require_identity(request)
@@ -1406,7 +1426,11 @@ class ApiV1:
         return JSONResponse(
             {
                 "enabled": self.config.janitor.enabled,
-                "dry_run": self.config.janitor.dry_run,
+                # The shipped janitor is intentionally report-only.  Do not
+                # imply write mode merely because an old/future-facing config
+                # sets dry_run false.
+                "dry_run": True,
+                "configured_dry_run": self.config.janitor.dry_run,
                 "interval_seconds": self.config.janitor.interval_seconds,
                 "allowed_paths": self.config.janitor.allowed_paths,
                 "forbidden_paths": self.config.janitor.forbidden_paths,

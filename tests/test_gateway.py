@@ -13,7 +13,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp import FastMCP
 import uvicorn
 
-from cortex.config import CortexConfig, GatewayConfig
+from cortex.config import CortexConfig, GatewayConfig, Principal
 from cortex.db import Database
 from cortex.gateway import (
     GatewayError,
@@ -81,6 +81,51 @@ def test_server_scoped_permission_does_not_bleed_to_another_namespace(identity):
     principal = identity.principal_for_username("alice")
     assert resolver.allowed(principal, "calendar.list") is True
     assert resolver.allowed(principal, "mail.list") is False
+
+
+def test_personal_server_is_callable_only_by_its_owner(identity):
+    alice = identity.get_user("alice")
+    identity.create_user("bob", password="pw", is_admin=True)
+    identity.mcp_servers.create(
+        "personal", url="https://personal.example.com/mcp",
+        owner_user_id=alice["id"], visibility="personal",
+    )
+    resolver = PermissionResolver(CortexConfig(), identity)
+
+    assert resolver.allowed(
+        identity.principal_for_username("alice"), "personal.list"
+    ) is True
+    # Even an administrator cannot invoke another user's personal upstream.
+    assert resolver.allowed(
+        identity.principal_for_username("bob"), "personal.list"
+    ) is False
+    # Static/config principals retain broad v1 access only to Cortex and
+    # globally registered upstreams, never to a user's personal credentials.
+    assert resolver.allowed(Principal(name="automation"), "personal.list") is False
+    identity.tool_permissions.set(
+        subject_type="user",
+        subject_id=alice["id"],
+        tool_pattern="personal.*",
+        effect="deny",
+    )
+    assert resolver.allowed(
+        identity.principal_for_username("alice"), "personal.list"
+    ) is False
+
+
+def test_explicit_deny_applies_to_admin(identity):
+    admin = identity.get_user("admin")
+    identity.tool_permissions.set(
+        subject_type="user",
+        subject_id=admin["id"],
+        tool_pattern="cortex.search",
+        effect="deny",
+    )
+    resolver = PermissionResolver(CortexConfig(), identity)
+
+    assert resolver.allowed(
+        identity.principal_for_username("admin"), "cortex.search"
+    ) is False
 
 
 def test_ssrf_guard_blocks_local_and_credentials(monkeypatch):
@@ -242,8 +287,34 @@ async def test_fake_streamable_http_upstream_discovery_and_call(identity):
     try:
         inventory = await runtime.discover(row)
         assert [tool["name"] for tool in inventory] == ["echo"]
-        result = await runtime.call(row, "echo", {"message": "hello"})
+        group = identity.get_group("staff")
+        identity.tool_permissions.set(
+            subject_type="group",
+            subject_id=group["id"],
+            server_id=row["id"],
+            tool_pattern="fake.echo",
+            effect="allow",
+        )
+        alice = identity.principal_for_username("alice")
+        governor = ToolGovernor(config, identity, lambda: alice)
+
+        async def proxy(_name, arguments):
+            return await runtime.call(row, "echo", arguments)
+
+        result = await governor.call(proxy, "fake.echo", {"message": "hello"})
         assert result["content"][0]["text"] == "upstream:hello"
+        audit = identity.tool_audit.list()[0]
+        assert audit["decision"] == "allowed"
+        assert audit["server"] == "fake"
+        assert "hello" not in json.dumps(audit)
+
+        identity.create_user("bob", password="pw")
+        denied = ToolGovernor(
+            config, identity, lambda: identity.principal_for_username("bob")
+        )
+        with pytest.raises(ToolError):
+            await denied.call(proxy, "fake.echo", {"message": "not-forwarded"})
+        assert identity.tool_audit.list()[0]["decision"] == "denied"
     finally:
         await runtime.aclose()
         server.should_exit = True

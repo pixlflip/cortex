@@ -263,10 +263,14 @@ class VaultManager:
 
     def sync_config_for(self, vault_id: str) -> SyncConfig:
         """The sync adapter a vault uses: the main vault keeps the top-level
-        ``sync:`` block; a user vault inherits ``vaults.sync`` (per-vault
-        overrides are a future refinement — B4)."""
+        ``sync:`` block; a user vault uses its named
+        ``vaults.sync_overrides`` entry when present and otherwise inherits
+        ``vaults.sync``."""
         if vault_id == MAIN_VAULT_ID:
             return self.config.sync
+        safe = sanitize_vault_id(vault_id)
+        if safe in self.vaults_cfg.sync_overrides:
+            return self.vaults_cfg.sync_overrides[safe]
         return self.vaults_cfg.sync
 
     # -- provisioning ---------------------------------------------------------

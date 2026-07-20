@@ -373,6 +373,29 @@ def test_v1_config_has_default_vaults_section(tmp_path: Path):
     assert cfg.vaults.sync.adapter == "none"
 
 
+def test_per_vault_sync_override_and_default(tmp_path: Path):
+    cfg_path = tmp_path / "cortex.yaml"
+    (tmp_path / "main").mkdir()
+    cfg_path.write_text(
+        "vault:\n"
+        "  path: main\n"
+        "vaults:\n"
+        "  sync:\n"
+        "    adapter: git\n"
+        "    options: {remote: origin}\n"
+        "  sync_overrides:\n"
+        "    alice:\n"
+        "      adapter: s3\n"
+        "      options: {bucket: alice-notes}\n",
+        encoding="utf-8",
+    )
+    manager = VaultManager(load_config(cfg_path))
+    assert manager.sync_config_for("alice").adapter == "s3"
+    assert manager.sync_config_for("alice").options == {"bucket": "alice-notes"}
+    assert manager.sync_config_for("bob").adapter == "git"
+    assert manager.sync_config_for("bob").options == {"remote": "origin"}
+
+
 def test_manager_construction_creates_nothing(main_vault: Path, tmp_path: Path):
     """Constructing a manager must not scaffold the vaults root — a pure-v1
     deployment that never provisions never grows a data/vaults tree."""
