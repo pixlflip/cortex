@@ -1,0 +1,1025 @@
+# Cortex /api/v1 — hand-written OpenAPI contract (A6/B3/D4).
+#
+# Authoritative description of the JSON REST surface the SPA (C1+) and any
+# scripting client build against. Kept accurate to src/cortex/api.py by hand;
+# later API issues (B3 vault-content, D gateway) extend this file.
+openapi: 3.1.0
+info:
+  title: Cortex API
+  version: "1.0"
+  description: |
+    JSON REST API for Cortex identity, multi-vault content/lifecycle,
+    self-service tokens, governed MCP registry/permissions, and audit.
+
+    **Authentication.** Two schemes, resolved per request:
+    - `cookieAuth` — the HttpOnly session cookie set by `POST /auth/login`.
+      Every state-changing request (POST/PUT/PATCH/DELETE) authenticated by
+      cookie must also echo the CSRF token from the login response in the
+      `X-Cortex-CSRF` header (session-bound double-submit), and must not
+      carry a cross-site `Origin` header.
+    - `bearerAuth` — a per-user API token (minted via `POST /tokens` or the
+      CLI). Bearer requests are CSRF-exempt by construction. Only *user*
+      tokens authenticate here; MCP config-principal and legacy client
+      tokens are rejected with the same uniform 401 as an invalid token.
+
+    **Authorization.** Admin-tagged routes return 403 for an authenticated
+    non-admin and 401 for anonymous callers, before any resource lookup.
+    Resources a caller is not permitted to know about are reported with the
+    same 404 as missing ones — existence is never leaked across authz
+    boundaries.
+
+    **Token rule.** A user lists, mints, and revokes only their own API
+    tokens; an admin may revoke any user's token by id.
+
+    **Errors.** Every non-2xx response body is the uniform envelope
+    `{"error": {"code": "...", "message": "..."}}`.
+servers:
+  - url: /api/v1
+    description: Same-origin — the SPA is served by Cortex itself.
+
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+tags:
+  - name: auth
+  - name: users
+    description: Admin-only user management.
+  - name: groups
+    description: Admin-only group management and membership.
+  - name: tokens
+    description: Self-service API tokens.
+  - name: ldap
+    description: Admin-only directory operations.
+  - name: vaults
+    description: Identity-scoped vault discovery and read-oriented content.
+  - name: audit
+    description: Git mutation history and value-free tool-call telemetry.
+  - name: gateway
+    description: Governed upstream MCP registry and visible tool inventory.
+  - name: policy
+    description: Admin-only deny-wins tool permission rules.
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in with username and password; sets the session cookie.
+      description: |
+        Local and LDAP users take one path (LDAP-configured deployments
+        route through the directory service). Failure is one uniform 401 —
+        unknown user, wrong password, disabled account, and LDAP-vs-local
+        are indistinguishable. Repeated failures for a username are rate
+        limited (429). No prior authentication or CSRF token is required.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: >
+            Logged in. The `Set-Cookie` header carries the HttpOnly
+            `cortex_session` cookie; the body carries the CSRF token to echo
+            in `X-Cortex-CSRF` on every state-changing request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, csrf_token]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  csrf_token: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401":
+          description: Invalid credentials (uniform; code `invalid_credentials`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Too many failed logins (code `rate_limited`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/DirectoryUnavailable" }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Destroy the current session and clear the cookie.
+      description: >
+        Session-cookie auth only (a bearer token has no session; using one
+        here returns 400). CSRF applies as on any mutation.
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Session destroyed. }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      operationId: me
+      summary: The authenticated caller.
+      responses:
+        "200":
+          description: Current user and how they authenticated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, auth]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  auth:
+                    type: string
+                    enum: [session, bearer]
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  /users:
+    get:
+      tags: [users]
+      operationId: listUsers
+      summary: List all users (admin).
+      responses:
+        "200":
+          description: All users.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [users]
+      operationId: createUser
+      summary: Create a local user (admin).
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+                password: { type: string }
+                display_name: { type: string }
+                email: { type: string }
+                is_admin: { type: boolean, default: false }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /users/{username}:
+    parameters:
+      - name: username
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: Fetch one user (admin).
+      responses:
+        "200":
+          description: The user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [users]
+      operationId: updateUser
+      summary: Update a user (admin) — enable/disable, admin flag, profile, password reset.
+      description: >
+        `disabled: true` also destroys the user's live sessions immediately.
+        `password` resets a local user's password (400 for LDAP users, who
+        carry no password material). Unknown fields are rejected with 400.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                email: { type: string }
+                is_admin: { type: boolean }
+                disabled: { type: boolean }
+                password: { type: string }
+      responses:
+        "200":
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [users]
+      operationId: deleteUser
+      summary: Delete a user (admin). Sessions and tokens cascade; vault directories are never touched.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups:
+    get:
+      tags: [groups]
+      operationId: listGroups
+      summary: List all groups with members (admin).
+      responses:
+        "200":
+          description: All groups.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: "#/components/schemas/Group" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [groups]
+      operationId: createGroup
+      summary: Create a local group (admin), optionally with shared-vault scope grants.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                scopes:
+                  type: array
+                  items: { type: string }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group]
+                properties:
+                  group: { $ref: "#/components/schemas/Group" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /groups/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [groups]
+      operationId: updateGroup
+      summary: Replace a group's shared-vault scope grants (admin).
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scopes]
+              properties:
+                scopes:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Updated group.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group]
+                properties:
+                  group: { $ref: "#/components/schemas/Group" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [groups]
+      operationId: deleteGroup
+      summary: Delete a group (admin). Members lose the group's scope grants.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{name}/members:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [groups]
+      operationId: addGroupMember
+      summary: "Add a user to a group (admin). Idempotent (`added: false` when already a member)."
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+      responses:
+        "200":
+          description: Membership state after the call.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [group, added]
+                properties:
+                  group: { $ref: "#/components/schemas/Group" }
+                  added: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /groups/{name}/members/{username}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+      - name: username
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [groups]
+      operationId: removeGroupMember
+      summary: Remove a user from a group (admin). Idempotent.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Removed (or was not a member). }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /tokens:
+    get:
+      tags: [tokens]
+      operationId: listTokens
+      summary: List the caller's own API tokens (never the secrets).
+      responses:
+        "200":
+          description: The caller's tokens, including revoked/expired ones.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tokens]
+                properties:
+                  tokens:
+                    type: array
+                    items: { $ref: "#/components/schemas/ApiToken" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+    post:
+      tags: [tokens]
+      operationId: mintToken
+      summary: Mint a new API token for the caller.
+      description: >
+        The raw token appears in this response exactly once and is stored
+        only as a salted hash. `scopes` may only narrow (never widen) the
+        caller's grants; `expires_in` is seconds from now.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: "Label, e.g. claude-desktop." }
+                scopes:
+                  type: array
+                  items: { type: string }
+                expires_in:
+                  type: integer
+                  description: Lifetime in seconds; omitted = no expiry.
+      responses:
+        "201":
+          description: Minted. `token` is shown here and never again.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name, token, token_prefix]
+                properties:
+                  id: { type: integer }
+                  name: { type: string }
+                  token: { type: string }
+                  token_prefix: { type: string }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /tokens/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [tokens]
+      operationId: revokeToken
+      summary: Revoke a token by id — the caller's own, or any user's when the caller is an admin.
+      description: >
+        Another user's token is reported with the same 404 as a nonexistent
+        id — existence is not leaked. Revocation is idempotent.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Revoked (idempotent). }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /ldap/sync:
+    post:
+      tags: [ldap]
+      operationId: ldapSync
+      summary: Run (or preview) a directory sync (admin).
+      description: >
+        Thin trigger over the A5 DirectoryService sync — pull directory
+        users, reconcile mapped groups, disable vanished LDAP rows. 400 with
+        code `ldap_not_configured` when no `ldap:` block is configured.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+        - name: dry_run
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Report what would change without writing.
+      responses:
+        "200":
+          description: Sync report.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SyncReport" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/DirectoryUnavailable" }
+
+  /ldap/status:
+    get:
+      tags: [ldap]
+      operationId: ldapStatus
+      summary: Show directory configuration posture (admin; no credentials).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [ldap]
+      operationId: updateLdapPolicy
+      summary: Update public-safe JIT and group-mapping policy (admin).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                jit_provisioning: { type: boolean }
+                group_mappings:
+                  type: object
+                  additionalProperties: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/tokens:
+    get:
+      tags: [tokens]
+      operationId: adminListTokens
+      summary: List every user's token metadata (admin; never raw tokens/hashes).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /vaults:
+    get:
+      tags: [vaults]
+      operationId: listVisibleVaults
+      summary: List only vaults granted to the caller, including health/freshness.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+
+  /vaults/{vault}/tree:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+    get:
+      tags: [vaults]
+      operationId: vaultTree
+      summary: Return a scope-filtered folder/note tree.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/search:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - name: q
+        in: query
+        required: true
+        schema: { type: string }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      - name: folder
+        in: query
+        schema: { type: string }
+      - name: tag
+        in: query
+        schema: { type: string }
+    get:
+      tags: [vaults]
+      operationId: searchVault
+      summary: Full-text search within the caller's visible note scopes.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/notes/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/NotePath"
+    get:
+      tags: [vaults]
+      operationId: readVaultNote
+      summary: Read one scope-checked Markdown note with frontmatter and ETag.
+      parameters:
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "304": { description: The ETag still matches. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/assets/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/AssetPath"
+    get:
+      tags: [vaults]
+      operationId: readVaultAsset
+      summary: Fetch a scope-checked attachment with safe content headers.
+      responses:
+        "200": { description: Attachment bytes. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /vaults/{vault}/tags:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+    get:
+      tags: [vaults]
+      operationId: vaultTags
+      summary: Aggregate frontmatter and inline tags over visible notes.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /vaults/{vault}/links/{path}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - $ref: "#/components/parameters/NotePath"
+    get:
+      tags: [vaults]
+      operationId: vaultLinks
+      summary: Resolve visible outbound links and backlinks for one note.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/vaults/{vault}/{action}:
+    parameters:
+      - $ref: "#/components/parameters/VaultId"
+      - name: action
+        in: path
+        required: true
+        schema: { type: string, enum: [provision, repair, archive] }
+    post:
+      tags: [vaults]
+      operationId: administerVault
+      summary: Provision, repair, or non-destructively archive a vault (admin).
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /audit/commits:
+    get:
+      tags: [audit]
+      operationId: listCommitAudit
+      summary: Aggregate visible per-vault git commits.
+      parameters:
+        - { name: vault, in: query, schema: { type: string } }
+        - { name: actor, in: query, schema: { type: string } }
+        - { name: user, in: query, schema: { type: string } }
+        - { name: path, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string }, description: ISO-8601 or Unix seconds. }
+        - { name: to, in: query, schema: { type: string }, description: ISO-8601 or Unix seconds. }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500 } }
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /audit/tools:
+    get:
+      tags: [audit]
+      operationId: listToolAudit
+      summary: List caller-owned, or admin-visible, tool-call telemetry.
+      parameters:
+        - { name: user, in: query, schema: { type: string } }
+        - { name: server, in: query, schema: { type: string } }
+        - { name: tool, in: query, schema: { type: string } }
+        - { name: outcome, in: query, schema: { type: string, enum: [allowed, denied, error] } }
+        - { name: from, in: query, schema: { type: string }, description: ISO-8601 or Unix seconds. }
+        - { name: to, in: query, schema: { type: string }, description: ISO-8601 or Unix seconds. }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000 } }
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /mcp/tools:
+    get:
+      tags: [gateway]
+      operationId: listVisibleMcpTools
+      summary: List the exact tool surface permitted for the caller.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /mcp/servers:
+    get:
+      tags: [gateway]
+      operationId: listMcpServers
+      summary: List global and caller-owned enabled upstreams (all for admin).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    post:
+      tags: [gateway]
+      operationId: createMcpServer
+      summary: Register and test a Streamable HTTP upstream.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/McpServerInput" }
+      responses:
+        "201": { $ref: "#/components/responses/FreeformOk" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /mcp/servers/{server_id}:
+    parameters:
+      - $ref: "#/components/parameters/ServerId"
+    get:
+      tags: [gateway]
+      operationId: getMcpServer
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [gateway]
+      operationId: updateMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    delete:
+      tags: [gateway]
+      operationId: deleteMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Server and dependent rules removed. }
+
+  /mcp/servers/{server_id}/{action}:
+    parameters:
+      - $ref: "#/components/parameters/ServerId"
+      - name: action
+        in: path
+        required: true
+        schema: { type: string, enum: [test, refresh] }
+    post:
+      tags: [gateway]
+      operationId: refreshMcpServer
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+  /admin/permissions:
+    get:
+      tags: [policy]
+      operationId: listToolPermissions
+      parameters:
+        - name: user
+          in: query
+          schema: { type: string }
+          description: Include the effective enabled-tool preview for this username.
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+    post:
+      tags: [policy]
+      operationId: setToolPermission
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "201": { $ref: "#/components/responses/FreeformOk" }
+
+  /admin/permissions/{permission_id}:
+    parameters:
+      - name: permission_id
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      tags: [policy]
+      operationId: deleteToolPermission
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Rule removed. }
+
+  /admin/janitor:
+    get:
+      tags: [audit]
+      operationId: janitorStatus
+      summary: Show report-first janitor configuration and recent reports (admin).
+      responses:
+        "200": { $ref: "#/components/responses/FreeformOk" }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: cortex_session
+      description: >
+        HttpOnly session cookie set by /auth/login (SameSite=Lax; Secure
+        under HTTPS). State-changing requests must also send X-Cortex-CSRF.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Per-user API token (ctx_...). CSRF-exempt.
+
+  parameters:
+    CsrfHeader:
+      name: X-Cortex-CSRF
+      in: header
+      required: false
+      schema: { type: string }
+      description: >
+        Required on state-changing requests authenticated by session cookie
+        (the csrf_token from the login response). Ignored — and unnecessary —
+        for bearer-authenticated requests.
+    VaultId:
+      name: vault
+      in: path
+      required: true
+      schema: { type: string }
+      description: "main or a granted username vault id."
+    NotePath:
+      name: path
+      in: path
+      required: true
+      schema: { type: string }
+      description: Vault-relative Markdown note path; may contain `/`.
+    AssetPath:
+      name: path
+      in: path
+      required: true
+      schema: { type: string }
+      description: Vault-relative attachment path; may contain `/`.
+    ServerId:
+      name: server_id
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    FreeformOk:
+      description: Successful JSON response; see the operation summary and server implementation for the endpoint-specific shape.
+      content:
+        application/json:
+          schema: { type: object, additionalProperties: true }
+    Unauthenticated:
+      description: No valid credential (code `unauthenticated`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: >
+        Authenticated but not permitted (code `forbidden`), or a failed CSRF
+        / Origin check on a cookie-authenticated mutation (codes
+        `csrf_failed` / `origin_forbidden`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: >
+        No such resource — or one the caller is not permitted to know about
+        (code `not_found`; existence is never leaked).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Malformed body or invalid field (code `invalid_request`, or a specific code such as `ldap_not_configured`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    DirectoryUnavailable:
+      description: The LDAP directory is unreachable (code `directory_unavailable`). Local logins are unaffected.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    User:
+      type: object
+      required: [username, auth_source, is_admin, disabled, groups]
+      properties:
+        username: { type: string }
+        display_name: { type: [string, "null"] }
+        email: { type: [string, "null"] }
+        auth_source:
+          type: string
+          enum: [local, ldap]
+        is_admin: { type: boolean }
+        disabled: { type: boolean }
+        created_at: { type: [integer, "null"], description: Unix seconds. }
+        last_login_at: { type: [integer, "null"], description: Unix seconds. }
+        groups:
+          type: array
+          items: { type: string }
+
+    Group:
+      type: object
+      required: [name, source, scopes, members]
+      properties:
+        name: { type: string }
+        source:
+          type: string
+          enum: [local, ldap]
+        scopes:
+          type: array
+          items: { type: string }
+          description: Shared-vault path-scope grants (design §6.4).
+        write_scopes:
+          type: array
+          items: { type: string }
+          description: Independent shared-vault mutation grants.
+        members:
+          type: array
+          items: { type: string }
+        created_at: { type: [integer, "null"], description: Unix seconds. }
+
+    ApiToken:
+      type: object
+      required: [id, name, token_prefix]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        token_prefix: { type: string }
+        scopes:
+          type: [array, "null"]
+          items: { type: string }
+        created_at: { type: [integer, "null"], description: Unix seconds. }
+        expires_at: { type: [integer, "null"], description: Unix seconds. }
+        last_used_at: { type: [integer, "null"], description: Unix seconds. }
+        revoked_at: { type: [integer, "null"], description: Unix seconds. }
+
+    McpServerInput:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
+        url: { type: string, format: uri }
+        description: { type: string }
+        auth_env:
+          type: string
+          description: Environment-variable name, never a credential value.
+        headers_env:
+          type: object
+          additionalProperties: { type: string }
+          description: HTTP header name to environment-variable name.
+        global: { type: boolean, default: true }
+
+    SyncReport:
+      type: object
+      required: [dry_run, changed, added, updated, disabled, group_changes, skipped]
+      properties:
+        dry_run: { type: boolean }
+        changed: { type: boolean }
+        added:
+          type: array
+          items: { type: string }
+        updated:
+          type: array
+          items: { type: string }
+        disabled:
+          type: array
+          items: { type: string }
+        group_changes:
+          type: array
+          items: { type: string }
+        skipped:
+          type: array
+          items: { type: string }

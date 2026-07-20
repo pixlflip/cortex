@@ -52,7 +52,7 @@ runuser -u cortex -- bash -lc '
   cd /srv/cortex/app && . .venv/bin/activate
   export CORTEX_CONFIG=/srv/cortex/cortex.yaml
   cortex check
-  cortex init       # creates the git audit baseline in your vault
+  cortex init       # database, first admin, private vault, git baselines
 '
 ```
 
@@ -70,9 +70,9 @@ systemctl status cortex
 ```
 
 The unit runs `cortex serve`. Over **stdio** this is for local MCP clients that
-spawn the process; for a long-running background service you'll typically use
-the **http** transport (a later build step) so clients connect over the network.
-Until HTTP lands, use the unit for `cortex check`/health and run stdio on demand.
+spawn the process; for a long-running background service use **http** transport.
+The same server exposes the SPA at `/`, JSON API at `/api/v1`, MCP at the
+configured path, and readiness at `/healthz`.
 
 ## Periodic sync & audit
 
@@ -126,6 +126,11 @@ The shipped unit already references `/srv/cortex/cortex.env` if present.
 ```bash
 runuser -u cortex -- bash -lc '
   cd /srv/cortex/app && git pull && . .venv/bin/activate && pip install .
+  export CORTEX_CONFIG=/srv/cortex/cortex.yaml
+  cortex migrate
 '
 systemctl restart cortex
 ```
+
+See [`upgrading-v2.md`](upgrading-v2.md) for backup, migration, verification,
+and rollback details.

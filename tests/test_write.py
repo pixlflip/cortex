@@ -365,7 +365,9 @@ def test_move_note_does_not_accept_directory_source(vault: Path):
 def test_move_note_rejects_directory_destination(vault: Path):
     srv = _server(vault)
     p = srv.config.principal("p")
-    with pytest.raises(ValueError, match="directory"):
+    # Directory targets are outside the note-address space and use the same
+    # non-leaking response as an out-of-scope path.
+    with pytest.raises(ValueError, match="not found or not in scope"):
         srv._do_move_note(p, "Public/open.md", "Private", "dest is a directory")
     assert srv.vault.exists("Public/open.md")
 

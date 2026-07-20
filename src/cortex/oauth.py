@@ -161,11 +161,11 @@ class CortexOAuthProvider:
             return at
         # Fall back to a static principal token (9a / programmatic clients).
         try:
-            principal = self._auth.for_token(token)
+            principal, subject = self._auth.resolve_token(token)
         except AuthError:
             return None
         return AccessToken(
-            token=token, client_id=principal.name, scopes=[], subject=principal.name
+            token=token, client_id=principal.name, scopes=[], subject=subject
         )
 
     async def revoke_token(self, token) -> None:
@@ -193,7 +193,9 @@ class CortexOAuthProvider:
         that principal. Returns the client redirect URL (with code + state).
         Raises AuthError on a bad token, KeyError on an unknown transaction."""
         client, params = self._pending[txn]
-        principal = self._auth.for_token(token)  # raises AuthError if invalid
+        # raises AuthError if invalid; subject is namespaced (client:<name>)
+        # for admin-store clients so later resolution uses the right store (#9)
+        principal, subject = self._auth.resolve_token(token)
         self._pending.pop(txn, None)
         code = secrets.token_urlsafe(32)
         self._codes[code] = AuthorizationCode(
@@ -205,7 +207,7 @@ class CortexOAuthProvider:
             redirect_uri=params.redirect_uri,
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=params.resource,
-            subject=principal.name,
+            subject=subject,
         )
         return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
 

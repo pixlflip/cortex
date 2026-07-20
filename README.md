@@ -10,13 +10,17 @@ through a secure [Model Context Protocol](https://modelcontextprotocol.io)
 
 - **Obsidian-native** — the source of truth is a normal Obsidian vault: Markdown
   notes, YAML frontmatter, folders, links, and your editor of choice.
-- **Scoped** — each caller (principal) sees only the slice you grant; a path
-  out of scope is *invisible*, not just unreadable.
+- **Multi-user** — local or LDAP users get private vaults; groups grant
+  independent read/write slices of a shared vault; admins get a macro view.
+- **Scoped** — each token sees only its allowed vaults, note paths, and MCP
+  tools. Out-of-scope resources are *invisible*, not just unreadable.
 - **Audited** — every change is a git commit tagged with *actor* and *reason*.
   Git is the single audit trail and rollback mechanism.
 - **Deterministic by default** — search, reads, and context packs spend zero
   model tokens. Only the one `semantic_search` tool calls an LLM.
-- **Self-improving (later)** — an optional, bounded "janitor" AI tidies and
+- **One governed MCP** — connect an AI only to Cortex; it receives Cortex and
+  upstream MCP tools filtered by the token owner's deny-wins policy.
+- **Self-improving (bounded)** — an optional, report-first janitor tidies and
   watches the vault on a heartbeat, never able to edit its own limits.
 
 Anyone can spin one up — locally, in Docker, or on a homelab — and keep their
@@ -36,7 +40,8 @@ git clone https://github.com/pixlflip/cortex.git && cd cortex
 cp cortex.example.yaml cortex.yaml          # edit to taste
 # put your Obsidian vault in ./vault (or point vault.path at one)
 docker compose run --rm cortex check        # validate setup
-docker compose run --rm cortex init         # create the git audit baseline
+docker compose run --rm cortex init         # DB + admin + git baselines
+docker compose up -d                        # SPA + API + MCP on :8765
 ```
 
 Run `cortex sync` any time (or on a schedule — see
@@ -53,16 +58,40 @@ pip install .
 cp cortex.example.yaml cortex.yaml          # edit to taste
 cortex check
 cortex init
-cortex serve                                # MCP server over stdio
+cortex serve                                # stdio or HTTP, per cortex.yaml
 ```
 
 Full host/service setup (service user, systemd) is in
 [`docs/bare-metal.md`](docs/bare-metal.md).
 
-### Connect an MCP client
+Open the same-origin web app at the server root (for example
+`http://127.0.0.1:8765/`). The first-run admin password is printed by
+`cortex init`. The panel manages people, groups, vault health, tokens, LDAP,
+upstream MCP servers, tool permissions, and both audit streams.
 
-For a stdio client (e.g. Claude Desktop), register Cortex as a server that runs
-`cortex serve` with `CORTEX_CONFIG` pointing at your `cortex.yaml`. It exposes:
+### Connect an AI once
+
+Create a per-user token in the web app, then give the AI Cortex as its only
+MCP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "url": "https://cortex.example.com/mcp",
+      "headers": { "Authorization": "Bearer ctx_…" }
+    }
+  }
+}
+```
+
+Tool discovery is identity-specific. Built-in tools and namespaced upstream
+tools (`calendar.list_events`, for example) are omitted unless allowed, and
+authorization is checked again at call time. See
+[`docs/mcp-gateway.md`](docs/mcp-gateway.md).
+
+For local stdio clients, register Cortex as a server that runs `cortex serve`
+with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
 
 | Tool | What it does |
 |---|---|
@@ -76,6 +105,20 @@ For a stdio client (e.g. Claude Desktop), register Cortex as a server that runs
 | `context_pack` | Compact, budgeted bundle for a query |
 | `semantic_search` | Fuzzy "comb & synthesize" — the only tool that uses an LLM |
 
+With `writes.enabled: true` in `cortex.yaml` (default **false** — otherwise
+these tools are not registered at all), the mutating tools appear. Each one
+requires a `reason`, is write-scope-checked, and lands as exactly one git
+commit (always `git revert`-able):
+
+| Tool (gated by `writes.enabled`) | What it does |
+|---|---|
+| `write_note` | Create a note (or replace one, only with `overwrite=True`) |
+| `patch_note` | Replace a single unique string in an existing note |
+| `append_note` | Append text to an existing note |
+| `update_frontmatter` | Merge a patch into a note's YAML frontmatter |
+| `delete_note` | Delete one note file (committed, so still recoverable) |
+| `move_note` | Move/rename a note when both paths are writable |
+
 ---
 
 ## Configuration
@@ -87,43 +130,44 @@ runs locally with no API key and the LLM disabled (deterministic tools only).
 Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 
 - `vault.path` — your Obsidian vault folder.
+- `vaults` — private-vault root, index directory, templates, archives, sync.
 - `principals` — static identities, their `scopes` (path globs), and `token_env`.
-- `admin` — optional web UI state path. `cortex init` generates the admin
-  password; the UI creates roles and per-client tokens for scoped AI clients.
+- `database.path` — SQLite identity, session, gateway, and telemetry state.
+- `gateway` — upstream registration policy, SSRF controls, timeouts, and audit
+  retention. Secrets are environment references only.
 - `sync.adapter` — `none` (default, local-only) · `git` · `nextcloud` · `s3`.
 - `llm.provider` — `none` (default) · `openrouter` · `openai` · `anthropic` ·
   `ollama`. OpenRouter (one key, many models; defaulting to the latest Claude
   Sonnet) is the recommended way to enable `semantic_search`.
 - `janitor` — off by default; report-only before any write mode.
 
+Run one bounded report pass across the main and every user vault with
+`cortex janitor --force` (or omit `--force` when `janitor.enabled` is true).
+Reports are stored in SQLite for the admin vault panel; the current worker
+never modifies vault content.
+
 ---
 
-## Status
+## What v2 includes
 
-This repo is built in dependency order (see the build sequence in
-[`ARCHITECTURE.md`](ARCHITECTURE.md)). **Working today:**
+- Local accounts, LDAP/Active Directory login and sync, groups, sessions,
+  CSRF-protected same-origin API, and individually revocable user tokens.
+- One git-audited private vault per user, the existing main/shared vault,
+  group scope grants, admin macro view, lifecycle repair/archive operations,
+  and token-level path narrowing.
+- A responsive React admin panel and read-oriented Obsidian-compatible vault
+  viewer with full-text search, tags, backlinks, embeds, properties, ETags,
+  and safe Markdown rendering.
+- Governed upstream MCP aggregation with per-user/group glob permissions,
+  deny-wins behavior, discovery/call parity, SSRF defenses, bounded calls,
+  circuit breaking, hot tool refresh, and argument-shape-only telemetry.
+- Reproducible Docker/Compose and Python-wheel packaging, a v1→v2 migration
+  command, health checks, CI, and documented backup/upgrade procedures.
 
-- ✅ Config system (public-safe, env-injected secrets)
-- ✅ Obsidian vault store (list / read / frontmatter / section / search) with
-  path-traversal safety
-- ✅ Git audit layer (commit-on-mutation with actor + reason)
-- ✅ Scoping + auth (token → principal → scopes; directory-bounded globs)
-- ✅ MCP server **v1, read-only** over stdio — all tools above
-- ✅ LLM provider layer (OpenRouter default → latest Claude Sonnet; also
-  OpenAI / Anthropic / Ollama / none)
-- ✅ Live `semantic_search` — scoped retrieve-then-synthesize (the model only
-  sees notes the principal may read)
-- ✅ Remote **Streamable HTTP** transport with bearer-token → principal auth,
-  per-request scoping, and Host/Origin protection (TLS via reverse proxy).
-- ✅ Admin web UI for HTTP deployments — `cortex init` generates an admin
-  password, then the UI can create roles and per-client tokens for scoped AI
-  clients.
-- ✅ **OAuth 2.1** authorization server (dynamic client registration + PKCE +
-  consent) so the one-click **Claude.ai / ChatGPT / Grok** connector UIs can
-  authorize. See [`docs/http-exposure.md`](docs/http-exposure.md).
-- ✅ Docker image + Compose, and a bare-metal/systemd path
-
-**Next on the roadmap:** sync adapters (opt-in) → the bounded janitor.
+Start with [`docs/multi-user.md`](docs/multi-user.md),
+[`docs/mcp-gateway.md`](docs/mcp-gateway.md), and
+[`docs/upgrading-v2.md`](docs/upgrading-v2.md). The focused security review is
+[`docs/security-review-v2.md`](docs/security-review-v2.md).
 
 ---
 
@@ -132,6 +176,7 @@ This repo is built in dependency order (see the build sequence in
 ```bash
 pip install -e ".[dev]"
 pytest
+cd web && npm ci && npm run lint && npm run build
 ```
 
 ## License

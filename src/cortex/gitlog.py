@@ -4,9 +4,10 @@ Every mutation to the vault is followed immediately by a commit whose message
 encodes *actor* and *reason*. Git is the only version store; there is no
 separate history database. Rollback is ordinary git (``revert`` / ``checkout``).
 
-In v1 the server is read-only, so the only writers are the bootstrap (initial
-snapshot) and — once enabled — the Janitor. This module gives them a consistent,
-attributable commit convention and the read side (log/diff) that tooling needs.
+Cortex can expose explicitly enabled write tools, and maintenance/sync paths
+also create snapshots. This module gives every writer a consistent,
+attributable commit convention and provides the log/diff side used by audit
+tooling.
 """
 
 from __future__ import annotations
@@ -98,7 +99,20 @@ class GitAudit:
         if not self.config.enabled:
             return None
         if paths:
-            _run(["add", "--", *paths], self.root)
+            # A move can begin with an untracked source (for example a human
+            # created it immediately before the operation). After the rename
+            # that source path neither exists nor is tracked, and passing it
+            # directly makes `git add` abort before staging the destination.
+            # Keep existing paths plus tracked deletions, skip only truly
+            # unknown/missing pathspecs, and use -A so deletions are recorded.
+            stageable = [
+                path
+                for path in paths
+                if (self.root / path).exists()
+                or bool(_run(["ls-files", "--", path], self.root).strip())
+            ]
+            if stageable:
+                _run(["add", "-A", "--", *stageable], self.root)
         else:
             _run(["add", "-A"], self.root)
 
@@ -155,6 +169,32 @@ class GitAudit:
         except GitError:
             return None  # repo exists but has zero commits yet
         return commits[0].iso_date if commits else None
+
+    def diff_summary(self, sha: str) -> dict:
+        """Bounded, content-free file/line summary for an audit commit."""
+        out = _run(["show", "--numstat", "--format=", sha, "--"], self.root)
+        files: list[dict] = []
+        insertions = 0
+        deletions = 0
+        for line in out.splitlines()[:200]:
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            added, removed, path = parts
+            added_n = int(added) if added.isdigit() else 0
+            removed_n = int(removed) if removed.isdigit() else 0
+            insertions += added_n
+            deletions += removed_n
+            if len(files) < 50:
+                files.append(
+                    {"path": path, "insertions": added_n, "deletions": removed_n}
+                )
+        return {
+            "files": files,
+            "file_count": len(out.splitlines()),
+            "insertions": insertions,
+            "deletions": deletions,
+        }
 
     # -- remote sync (best-effort; caller decides whether failure is fatal) --
 
