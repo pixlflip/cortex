@@ -71,6 +71,7 @@ from .gateway import (
 )
 from .ldap import DirectoryService, LdapError
 from .scopes import filter_paths, path_allowed
+from .serialization import normalize_json
 from .sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from .users import AuthzError, IdentityError, IdentityService
 from .vault import VaultError, canonical_asset_path, canonical_note_path
@@ -927,7 +928,7 @@ class ApiV1:
                 "path": path,
                 "markdown": note.body,
                 "raw": note.raw,
-                "frontmatter": note.frontmatter,
+                "frontmatter": normalize_json(note.frontmatter),
                 "etag": etag,
                 "modified_at": int(file_path.stat().st_mtime),
             },

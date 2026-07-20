@@ -119,6 +119,46 @@ def test_vault_api_never_leaks_another_users_vault(multivault):
     assert hidden.status_code == 404
 
 
+def test_vault_note_normalizes_date_frontmatter_without_changing_content(multivault):
+    cfg, identity, manager = multivault
+    raw = (
+        "---\n"
+        "date: 2026-04-07\n"
+        "nested:\n"
+        "  dates: [2026-04-08, 2026-04-09]\n"
+        "title: Dated note\n"
+        "published: true\n"
+        "rating: 5\n"
+        "optional: null\n"
+        "---\n"
+        "# Original body\n\nBody text stays exactly as written.\n"
+    )
+    note_path = manager.root_for("alice") / "Projects" / "dated.md"
+    note_path.write_text(raw, encoding="utf-8")
+    expected_raw = manager.get("alice").store.read_note("Projects/dated.md").raw
+    api = ApiV1(cfg, identity, SessionAuth(identity, secure_cookies=False))
+    client = TestClient(Starlette(routes=api.routes()))
+    assert client.post(
+        f"{API_PREFIX}/auth/login",
+        json={"username": "alice", "password": "alice-pw"},
+    ).status_code == 200
+
+    response = client.get(f"{API_PREFIX}/vaults/alice/notes/Projects/dated.md")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["frontmatter"] == {
+        "date": "2026-04-07",
+        "nested": {"dates": ["2026-04-08", "2026-04-09"]},
+        "title": "Dated note",
+        "published": True,
+        "rating": 5,
+        "optional": None,
+    }
+    assert payload["markdown"] == "# Original body\n\nBody text stays exactly as written.\n"
+    assert payload["raw"] == expected_raw
+
+
 def test_move_note_stays_in_selected_vault_and_uses_user_actor(multivault):
     cfg, identity, manager = multivault
     principal = identity.principal_for_username("alice")

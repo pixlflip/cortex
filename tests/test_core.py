@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 import os
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from cortex.config import ConfigError, load_config
 from cortex.gitlog import GitAudit
 from cortex.scopes import filter_paths, path_allowed
+from cortex.serialization import normalize_json
 from cortex.vault import VaultError, VaultStore, split_frontmatter
 
 
@@ -32,6 +34,34 @@ def vault(tmp_path: Path) -> Path:
 
 
 # -- frontmatter -----------------------------------------------------------
+
+
+def test_normalize_json_recurses_without_mutating_values():
+    original = {
+        "date": date(2026, 4, 7),
+        "nested": {"values": [date(2025, 1, 2), datetime(2026, 4, 7, 8, 9, 10)]},
+        "tuple": (date(2024, 3, 4), "text"),
+        "string": "unchanged",
+        "number": 42,
+        "boolean": True,
+        "null": None,
+    }
+
+    normalized = normalize_json(original)
+
+    assert normalized == {
+        "date": "2026-04-07",
+        "nested": {"values": ["2025-01-02", "2026-04-07T08:09:10"]},
+        "tuple": ["2024-03-04", "text"],
+        "string": "unchanged",
+        "number": 42,
+        "boolean": True,
+        "null": None,
+    }
+    assert original["date"] == date(2026, 4, 7)
+    assert original["nested"]["values"][0] == date(2025, 1, 2)
+    assert original["tuple"] == (date(2024, 3, 4), "text")
+
 
 def test_split_frontmatter():
     fm, body = split_frontmatter("---\ntitle: X\n---\nhello\n")

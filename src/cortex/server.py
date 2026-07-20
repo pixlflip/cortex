@@ -50,6 +50,7 @@ _LOG = logging.getLogger("cortex.janitor")
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .search_index import IndexHit, SearchIndex
+from .serialization import normalize_json
 from .vault import VaultError, VaultStore, _FRONTMATTER_RE, canonical_note_path
 from .vaults import MAIN_VAULT_ID, VaultBundle, VaultManager
 
@@ -542,7 +543,12 @@ class CortexServer:
         note.frontmatter.update(patch)
         store.write_text(path, note.raw)
         sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "frontmatter": note.frontmatter, "commit": sha}
+        return {
+            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+            "path": path,
+            "frontmatter": normalize_json(note.frontmatter),
+            "commit": sha,
+        }
 
     def _do_delete_note(
         self, principal: Principal, path: str, reason: str,
@@ -713,7 +719,7 @@ class CortexServer:
             bundle, p = self._select_vault(p, vault)
             path = self._require_visible(p, path)
             try:
-                return bundle.store.read_frontmatter(path)
+                return normalize_json(bundle.store.read_frontmatter(path))
             except VaultError as exc:
                 raise ValueError(f"note not found or not in scope: {path}") from exc
 
