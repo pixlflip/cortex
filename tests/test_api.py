@@ -679,6 +679,45 @@ def test_permission_preview_uses_actual_enabled_tool_inventory(
     assert "disabled.hidden" not in preview
 
 
+@pytest.mark.parametrize(
+    ("initial_enabled", "patch_enabled"), [(False, None), (True, False)]
+)
+def test_connection_edit_preserves_disabled_mcp_server(
+    identity: IdentityService, initial_enabled: bool, patch_enabled: bool | None
+):
+    api = make_api(identity)
+    server = identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp", enabled=False
+    )
+    if initial_enabled:
+        server = identity.mcp_servers.set_inventory(
+            server["id"], [{"name": "list", "inputSchema": {"type": "object"}}]
+        )
+
+    async def successful_discovery(row):
+        identity.mcp_servers.set_inventory(
+            row["id"], [{"name": "list", "inputSchema": {"type": "object"}}]
+        )
+        return [{"name": "list", "inputSchema": {"type": "object"}}]
+
+    api.gateway.discover = successful_discovery
+    client = make_client(api)
+    csrf = login(client, "admin", "admin-pw")
+    payload = {"url": "https://example.com/mcp"}
+    if patch_enabled is not None:
+        payload["enabled"] = patch_enabled
+    response = client.patch(
+        f"{API_PREFIX}/mcp/servers/{server['id']}",
+        json=payload,
+        headers={CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["validation_error"] is None
+    assert response.json()["server"]["enabled"] is False
+    assert identity.mcp_servers.get(server["id"])["enabled"] == 0
+
+
 def test_ldap_sync_without_ldap_config(client: TestClient):
     csrf = login(client, "admin", "admin-pw")
     assert_envelope(

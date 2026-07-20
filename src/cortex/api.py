@@ -1267,6 +1267,10 @@ class ApiV1:
         connection_changed = bool(
             {"url", "auth_env", "headers_env_json"}.intersection(fields)
         )
+        # Discovery records a successful inventory by enabling the server.
+        # Remember the state intended by this PATCH so validating connection
+        # details cannot accidentally re-enable a deliberately disabled server.
+        requested_enabled = fields.get("enabled", bool(row["enabled"]))
         row = self.identity.mcp_servers.update(row["id"], **fields)
         validation_error = None
         if connection_changed:
@@ -1277,6 +1281,9 @@ class ApiV1:
                 # so a bad update cannot leave stale tools callable.
                 validation_error = str(exc)
             row = self.identity.mcp_servers.get(row["id"])
+            if validation_error is None and not requested_enabled:
+                row = self.identity.mcp_servers.update(row["id"], enabled=False)
+                self.gateway.sync_registration(row)
         else:
             self.gateway.sync_registration(row)
         return JSONResponse(
