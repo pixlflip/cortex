@@ -15,6 +15,7 @@ Covers the fixes for:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,22 @@ def test_dotdot_inside_vault_does_not_cross_scope_boundary(vault: Path):
         _call(srv, "read_frontmatter", path="Projects/../Private/secret.md")
     with pytest.raises(ToolError, match="not found or not in scope"):
         _call(srv, "read_section", path="Projects/../Private/secret.md", heading="Secret")
+
+
+def test_read_frontmatter_mcp_normalizes_yaml_dates(vault: Path):
+    (vault / "Projects" / "dated.md").write_text(
+        "---\ndate: 2026-04-07\nnested: [2026-04-08]\n---\nbody\n",
+        encoding="utf-8",
+    )
+    srv = _server(vault, ["Projects/**"])
+
+    result = _call(srv, "read_frontmatter", path="Projects/dated.md")
+    blocks = result[0] if isinstance(result, tuple) else result
+
+    assert json.loads(blocks[0].text) == {
+        "date": "2026-04-07",
+        "nested": ["2026-04-08"],
+    }
 
 
 def test_dotdot_rejected_for_write_tools(vault: Path):
