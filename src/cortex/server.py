@@ -20,7 +20,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+import logging
 
+import anyio
 import yaml
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -43,6 +45,8 @@ from .auth import (
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
 from .gateway import GatewayRuntime, GovernedFastMCP, ToolGovernor
+
+_LOG = logging.getLogger("cortex.janitor")
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .search_index import IndexHit, SearchIndex
@@ -193,11 +197,28 @@ class CortexServer:
     def _build_mcp(self, http: HttpServe | None) -> FastMCP:
         @asynccontextmanager
         async def lifespan(_server):
-            try:
-                yield {}
-            finally:
-                if self.gateway_runtime is not None:
-                    await self.gateway_runtime.aclose()
+            async def janitor_heartbeat() -> None:
+                from .janitor import run_janitor_all
+
+                assert self.identity is not None
+                while True:
+                    try:
+                        await anyio.to_thread.run_sync(
+                            run_janitor_all, self.config, self.identity.db
+                        )
+                    except Exception:  # keep maintenance outside the request path
+                        _LOG.exception("janitor heartbeat failed")
+                    await anyio.sleep(max(1, self.config.janitor.interval_seconds))
+
+            async with anyio.create_task_group() as tasks:
+                if self.config.janitor.enabled and self.identity is not None:
+                    tasks.start_soon(janitor_heartbeat)
+                try:
+                    yield {}
+                finally:
+                    tasks.cancel_scope.cancel()
+                    if self.gateway_runtime is not None:
+                        await self.gateway_runtime.aclose()
 
         if http is None:
             return GovernedFastMCP("cortex", lifespan=lifespan)

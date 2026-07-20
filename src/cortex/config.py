@@ -95,6 +95,8 @@ class VaultsConfig:
       creation. When false, run ``cortex vault provision <user>`` explicitly.
     * ``sync`` — the default sync adapter inherited by every per-user vault
       (the main vault keeps using the top-level ``sync:`` block).
+    * ``sync_overrides`` — optional username-to-sync mappings for vaults that
+      do not use the per-user default.
     """
 
     root: Path = Path("./data/vaults")
@@ -103,6 +105,7 @@ class VaultsConfig:
     archive_dir: Path = Path("./data/archive")
     auto_provision: bool = True
     sync: SyncConfig = field(default_factory=SyncConfig)
+    sync_overrides: dict[str, SyncConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -185,7 +188,7 @@ class ServerConfig:
 
 @dataclass
 class LLMConfig:
-    provider: str = "none"  # anthropic | openai | ollama | none
+    provider: str = "none"  # openrouter | openai | anthropic | ollama | none
     model: str = ""
     api_key_env: str | None = None
     api_key: str | None = None
@@ -344,6 +347,23 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     vaults_sync_raw = vaults_raw.get("sync", {}) or {}
     if not isinstance(vaults_sync_raw, dict):
         raise ConfigError("vaults.sync must be a mapping")
+    overrides_raw = vaults_raw.get("sync_overrides", {}) or {}
+    if not isinstance(overrides_raw, dict):
+        raise ConfigError("vaults.sync_overrides must be a mapping")
+    sync_overrides: dict[str, SyncConfig] = {}
+    for vault_id, override in overrides_raw.items():
+        if not isinstance(vault_id, str) or not isinstance(override, dict):
+            raise ConfigError(
+                "vaults.sync_overrides must map vault names to mappings"
+            )
+        options = override.get("options", {}) or {}
+        if not isinstance(options, dict):
+            raise ConfigError(
+                f"vaults.sync_overrides.{vault_id}.options must be a mapping"
+            )
+        sync_overrides[vault_id] = SyncConfig(
+            adapter=override.get("adapter", "none"), options=options
+        )
     vaults = VaultsConfig(
         root=_resolve_dir(vaults_raw.get("root"), "./data/vaults"),
         index_dir=_resolve_dir(vaults_raw.get("index_dir"), "./data/indexes"),
@@ -354,6 +374,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
             adapter=vaults_sync_raw.get("adapter", "none"),
             options=vaults_sync_raw.get("options", {}) or {},
         ),
+        sync_overrides=sync_overrides,
     )
 
     principals: list[Principal] = []

@@ -4,9 +4,10 @@ Every mutation to the vault is followed immediately by a commit whose message
 encodes *actor* and *reason*. Git is the only version store; there is no
 separate history database. Rollback is ordinary git (``revert`` / ``checkout``).
 
-In v1 the server is read-only, so the only writers are the bootstrap (initial
-snapshot) and — once enabled — the Janitor. This module gives them a consistent,
-attributable commit convention and the read side (log/diff) that tooling needs.
+Cortex can expose explicitly enabled write tools, and maintenance/sync paths
+also create snapshots. This module gives every writer a consistent,
+attributable commit convention and provides the log/diff side used by audit
+tooling.
 """
 
 from __future__ import annotations

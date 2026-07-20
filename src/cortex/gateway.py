@@ -122,13 +122,27 @@ class PermissionResolver:
         self.identity = identity
 
     def allowed(self, principal: Principal, tool_id: str) -> bool:
+        server = self._server(tool_id)
         user = self.identity.users.get_by_username(principal.name)
+        # Personal registrations are an ownership boundary for *every*
+        # identity kind.  In particular, config/legacy principals must not
+        # inherit their v1 allow-all behaviour for somebody's upstream.
+        if server is not None and server["owner_user_id"] is not None:
+            if user is None or server["owner_user_id"] != user["id"]:
+                return False
+            personal_owner = True
+        else:
+            personal_owner = False
         if user is None:
             return True  # static/config and legacy identities keep v1 behavior
         if user["disabled"]:
             return False
-        if user["is_admin"]:
-            return True
+        # Personal upstreams are an ownership boundary, not merely another
+        # permission default.  They must never become callable by an admin or
+        # another user just because that identity otherwise has broad tool
+        # access.  The owner still passes through the ordinary deny-wins rule
+        # evaluation below; ownership is an implicit fallback allow, not a way
+        # to bypass an explicit user/group denial.
         groups = self.identity.groups.groups_for_user(user["id"])
         server_id = self._server_id(tool_id)
         rules = self.identity.tool_permissions.matching(
@@ -138,13 +152,17 @@ class PermissionResolver:
         # user override from escaping a group-level security boundary.
         if any(rule["effect"] == "deny" for rule in rules):
             return False
+        # Administrators have an implicit allow, but an explicit deny remains
+        # authoritative just as it is for every other identity.
+        if user["is_admin"]:
+            return True
         if any(rule["effect"] == "allow" for rule in rules):
             return True
         if tool_id.startswith("cortex."):
             if tool_id in _WRITE_TOOLS:
                 return self.config.gateway.default_write_allow
             return self.config.gateway.default_read_allow
-        return False
+        return personal_owner
 
     def explain(self, user: dict, tool_id: str) -> dict:
         principal = self.identity.principal_for_username(user["username"])
@@ -159,11 +177,14 @@ class PermissionResolver:
         return {"tool_id": tool_id, "allowed": allowed, "rules": rules}
 
     def _server_id(self, tool_id: str) -> int | None:
+        server = self._server(tool_id)
+        return server["id"] if server is not None else None
+
+    def _server(self, tool_id: str) -> dict | None:
         server_name = tool_id.split(".", 1)[0]
         if server_name == "cortex":
             return None
-        server = self.identity.mcp_servers.get_by_name(server_name)
-        return server["id"] if server is not None else None
+        return self.identity.mcp_servers.get_by_name(server_name)
 
 
 def _audit_argument_shape(arguments: dict[str, Any]) -> tuple[str, str, str | None]:

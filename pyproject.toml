@@ -31,3 +31,4 @@ packages = ["src/cortex"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

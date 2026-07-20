@@ -304,6 +304,28 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def cmd_janitor(args: argparse.Namespace) -> int:
+    """Run one bounded, report-only maintenance pass across every vault."""
+    cfg = _load(args)
+    if not cfg.janitor.enabled and not args.force:
+        print("janitor is disabled; pass --force for an explicit dry-run", file=sys.stderr)
+        return 2
+    from .db import Database
+    from .janitor import JanitorReport, run_janitor_all
+
+    results = run_janitor_all(cfg, Database(cfg.database.path))
+    failed = False
+    for vault_id, outcome in results:
+        if isinstance(outcome, Exception):
+            failed = True
+            print(f"vault '{vault_id}': ERROR: {outcome}", file=sys.stderr)
+        else:
+            assert isinstance(outcome, JanitorReport)
+            print(f"vault '{vault_id}': {outcome.summary}")
+    print("dry run: no vault content was changed.")
+    return 1 if failed else 0
+
+
 def _bootstrap_identity(cfg: CortexConfig) -> int:
     """Shared first-run identity bootstrap for ``cortex init`` and
     ``cortex db init``: create/migrate the database, import any legacy
@@ -820,6 +842,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "sync", help="snapshot pending vault changes, reindex, and (adapter: git) pull/push"
     ).set_defaults(func=cmd_sync)
+
+    pj = sub.add_parser("janitor", help="run bounded maintenance analysis across all vaults")
+    pj.add_argument(
+        "--force", action="store_true",
+        help="run a report-only pass even when janitor.enabled is false",
+    )
+    pj.set_defaults(func=cmd_janitor)
 
     pd = sub.add_parser("db", help="manage the SQLite identity/gateway database")
     pd_sub = pd.add_subparsers(dest="db_command", required=True)

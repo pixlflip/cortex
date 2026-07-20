@@ -141,6 +141,11 @@ Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
   Sonnet) is the recommended way to enable `semantic_search`.
 - `janitor` — off by default; report-only before any write mode.
 
+Run one bounded report pass across the main and every user vault with
+`cortex janitor --force` (or omit `--force` when `janitor.enabled` is true).
+Reports are stored in SQLite for the admin vault panel; the current worker
+never modifies vault content.
+
 ---
 
 ## What v2 includes
