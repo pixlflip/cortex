@@ -1628,11 +1628,26 @@ class ApiV1:
         )
 
 
-def build_api(config: CortexConfig, identity: IdentityService) -> ApiV1:
+def build_api(
+    config: CortexConfig,
+    identity: IdentityService,
+    *,
+    gateway_runtime: GatewayRuntime | None = None,
+) -> ApiV1:
     """Standard construction used by ``build_http_server``: cookie Secure
-    flag follows the public base URL's scheme (the #19 rule)."""
+    flag follows the public base URL's scheme (the #19 rule).
+
+    The HTTP API and MCP transport must share one gateway runtime so API-driven
+    registration, refresh, disable, and removal update the live MCP tool
+    manager rather than an unattached shadow instance.
+    """
     base = (
         config.server.public_url or f"http://{config.server.host}:{config.server.port}"
     )
     session_auth = SessionAuth(identity, secure_cookies=base.startswith("https://"))
-    return ApiV1(config, identity, session_auth)
+    return ApiV1(
+        config,
+        identity,
+        session_auth,
+        gateway_runtime=gateway_runtime,
+    )

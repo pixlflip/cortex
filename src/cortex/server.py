@@ -1003,7 +1003,11 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         from .api import build_api
         from .webapp import register_web_app
 
-        server.api = build_api(config, identity)
+        server.api = build_api(
+            config,
+            identity,
+            gateway_runtime=server.gateway_runtime,
+        )
         server.api.register(server.mcp)
         register_web_app(server.mcp, config, server.vault_manager)
     return server
