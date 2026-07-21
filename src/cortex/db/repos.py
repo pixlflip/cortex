@@ -127,7 +127,9 @@ class UsersRepo:
 
     def list(self) -> list[dict]:
         with self.db.connection() as conn:
-            return _rows(conn.execute("SELECT * FROM users ORDER BY username").fetchall())
+            return _rows(
+                conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+            )
 
     def update(self, user_id: int, **fields: Any) -> dict | None:
         """Update whitelisted profile fields. Password changes go through
@@ -138,9 +140,7 @@ class UsersRepo:
         if not fields:
             return self.get(user_id)
         sets = ", ".join(f"{k} = ?" for k in fields)
-        values = [
-            int(v) if isinstance(v, bool) else v for v in fields.values()
-        ]
+        values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
         with self.db.transaction() as conn:
             conn.execute(f"UPDATE users SET {sets} WHERE id = ?", (*values, user_id))
             return _row(
@@ -247,7 +247,9 @@ class GroupsRepo:
     def get(self, group_id: int) -> dict | None:
         with self.db.connection() as conn:
             return _row(
-                conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+                conn.execute(
+                    "SELECT * FROM groups WHERE id = ?", (group_id,)
+                ).fetchone()
             )
 
     def get_by_name(self, name: str) -> dict | None:
@@ -272,7 +274,9 @@ class GroupsRepo:
                 f"UPDATE groups SET {sets} WHERE id = ?", (*fields.values(), group_id)
             )
             return _row(
-                conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+                conn.execute(
+                    "SELECT * FROM groups WHERE id = ?", (group_id,)
+                ).fetchone()
             )
 
     def set_scopes(self, group_id: int, scopes: list[str]) -> None:
@@ -562,7 +566,8 @@ class SessionsRepo:
         if touch:
             with self.db.transaction() as conn:
                 conn.execute(
-                    "UPDATE sessions SET last_seen_at = ? WHERE id = ?", (now, row["id"])
+                    "UPDATE sessions SET last_seen_at = ? WHERE id = ?",
+                    (now, row["id"]),
                 )
             row["last_seen_at"] = now
         return row
@@ -638,7 +643,7 @@ class McpServersRepo:
         self,
         name: str,
         *,
-        url: str,
+        url: str | None = None,
         owner_user_id: int | None = None,
         description: str | None = None,
         transport: str = "streamable-http",
@@ -646,7 +651,14 @@ class McpServersRepo:
         headers_env: dict[str, str] | None = None,
         visibility: str = "group",
         enabled: bool = True,
+        command: str | None = None,
+        args: list[str] | None = None,
+        env_refs: dict[str, str] | None = None,
+        cwd: str | None = None,
     ) -> dict:
+        self._validate_connection(
+            transport, url, auth_env, headers_env, command, args, env_refs, cwd
+        )
         now = _now()
         with self.db.transaction() as conn:
             cur = conn.execute(
@@ -654,8 +666,8 @@ class McpServersRepo:
                 INSERT INTO mcp_servers
                     (name, url, transport, auth_env, headers_env_json,
                      owner_user_id, visibility, enabled, description,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, command, args_json, env_refs_json, cwd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -669,6 +681,10 @@ class McpServersRepo:
                     description,
                     now,
                     now,
+                    command,
+                    json.dumps(args) if args is not None else None,
+                    json.dumps(env_refs) if env_refs is not None else None,
+                    cwd,
                 ),
             )
             return dict(
@@ -729,15 +745,45 @@ class McpServersRepo:
 
     def update(self, server_id: int, **fields: Any) -> dict | None:
         allowed = {
-            "url", "description", "transport", "auth_env", "headers_env_json",
-            "visibility", "enabled", "tools_json", "last_error",
-            "last_checked_at", "owner_user_id",
+            "url",
+            "description",
+            "transport",
+            "auth_env",
+            "headers_env_json",
+            "visibility",
+            "enabled",
+            "tools_json",
+            "last_error",
+            "last_checked_at",
+            "owner_user_id",
+            "command",
+            "args_json",
+            "env_refs_json",
+            "cwd",
         }
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"cannot update field(s): {', '.join(sorted(bad))}")
         if not fields:
             return self.get(server_id)
+        current = self.get(server_id)
+        if current is None:
+            return None
+        candidate = {**current, **fields}
+        self._validate_connection(
+            candidate["transport"],
+            candidate.get("url"),
+            candidate.get("auth_env"),
+            json.loads(candidate.get("headers_env_json") or "{}"),
+            candidate.get("command"),
+            json.loads(candidate.get("args_json") or "[]")
+            if candidate.get("args_json") is not None
+            else None,
+            json.loads(candidate.get("env_refs_json") or "{}")
+            if candidate.get("env_refs_json") is not None
+            else None,
+            candidate.get("cwd"),
+        )
         fields["updated_at"] = _now()
         sets = ", ".join(f"{key} = ?" for key in fields)
         values = [int(v) if isinstance(v, bool) else v for v in fields.values()]
@@ -767,6 +813,52 @@ class McpServersRepo:
         with self.db.transaction() as conn:
             cur = conn.execute("DELETE FROM mcp_servers WHERE id = ?", (server_id,))
             return cur.rowcount > 0
+
+    @staticmethod
+    def _validate_connection(
+        transport, url, auth_env, headers_env, command, args, env_refs, cwd
+    ) -> None:
+        if transport == "streamable-http":
+            if not isinstance(url, str) or not url:
+                raise ValueError("streamable-http requires url")
+            if (
+                command is not None
+                or args is not None
+                or env_refs is not None
+                or cwd is not None
+            ):
+                raise ValueError("streamable-http rejects stdio fields")
+            return
+        if transport != "stdio-cmd":
+            raise ValueError("unsupported MCP transport")
+        if url is not None or auth_env is not None or headers_env:
+            raise ValueError("stdio-cmd rejects HTTP fields")
+        if not isinstance(command, str) or not command or len(command) > 4096:
+            raise ValueError("stdio-cmd requires command")
+        if args is None:
+            args = []
+        if (
+            not isinstance(args, list)
+            or len(args) > 128
+            or not all(isinstance(v, str) and len(v) <= 4096 for v in args)
+        ):
+            raise ValueError("args must be an array of at most 128 strings")
+        if env_refs is None:
+            env_refs = {}
+        if (
+            not isinstance(env_refs, dict)
+            or len(env_refs) > 64
+            or not all(
+                isinstance(k, str)
+                and isinstance(v, str)
+                and len(k) <= 128
+                and len(v) <= 128
+                for k, v in env_refs.items()
+            )
+        ):
+            raise ValueError("env_refs must map at most 64 environment names")
+        if cwd is not None and (not isinstance(cwd, str) or len(cwd) > 4096):
+            raise ValueError("cwd must be a string")
 
 
 class ToolPermissionsRepo:
@@ -848,10 +940,7 @@ class ToolPermissionsRepo:
             for rule in rules
             if (
                 (rule["subject_type"] == "user" and rule["subject_id"] == user_id)
-                or (
-                    rule["subject_type"] == "group"
-                    and rule["subject_id"] in group_ids
-                )
+                or (rule["subject_type"] == "group" and rule["subject_id"] in group_ids)
             )
             and (rule["server_id"] is None or rule["server_id"] == server_id)
             and fnmatch.fnmatchcase(tool_id, rule["tool_pattern"])
@@ -888,8 +977,17 @@ class ToolAuditRepo:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    _now(), subject, user_id, api_token_id, server, tool,
-                    decision, error_kind, duration_ms, args_digest, vault,
+                    _now(),
+                    subject,
+                    user_id,
+                    api_token_id,
+                    server,
+                    tool,
+                    decision,
+                    error_kind,
+                    duration_ms,
+                    args_digest,
+                    vault,
                     (args_summary or "")[:512] or None,
                 ),
             )

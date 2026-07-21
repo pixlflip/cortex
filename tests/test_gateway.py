@@ -87,18 +87,22 @@ def test_personal_server_is_callable_only_by_its_owner(identity):
     alice = identity.get_user("alice")
     identity.create_user("bob", password="pw", is_admin=True)
     identity.mcp_servers.create(
-        "personal", url="https://personal.example.com/mcp",
-        owner_user_id=alice["id"], visibility="personal",
+        "personal",
+        url="https://personal.example.com/mcp",
+        owner_user_id=alice["id"],
+        visibility="personal",
     )
     resolver = PermissionResolver(CortexConfig(), identity)
 
-    assert resolver.allowed(
-        identity.principal_for_username("alice"), "personal.list"
-    ) is True
+    assert (
+        resolver.allowed(identity.principal_for_username("alice"), "personal.list")
+        is True
+    )
     # Even an administrator cannot invoke another user's personal upstream.
-    assert resolver.allowed(
-        identity.principal_for_username("bob"), "personal.list"
-    ) is False
+    assert (
+        resolver.allowed(identity.principal_for_username("bob"), "personal.list")
+        is False
+    )
     # Static/config principals retain broad v1 access only to Cortex and
     # globally registered upstreams, never to a user's personal credentials.
     assert resolver.allowed(Principal(name="automation"), "personal.list") is False
@@ -108,9 +112,10 @@ def test_personal_server_is_callable_only_by_its_owner(identity):
         tool_pattern="personal.*",
         effect="deny",
     )
-    assert resolver.allowed(
-        identity.principal_for_username("alice"), "personal.list"
-    ) is False
+    assert (
+        resolver.allowed(identity.principal_for_username("alice"), "personal.list")
+        is False
+    )
 
 
 def test_explicit_deny_applies_to_admin(identity):
@@ -123,9 +128,10 @@ def test_explicit_deny_applies_to_admin(identity):
     )
     resolver = PermissionResolver(CortexConfig(), identity)
 
-    assert resolver.allowed(
-        identity.principal_for_username("admin"), "cortex.search"
-    ) is False
+    assert (
+        resolver.allowed(identity.principal_for_username("admin"), "cortex.search")
+        is False
+    )
 
 
 def test_ssrf_guard_blocks_local_and_credentials(monkeypatch):
@@ -175,7 +181,13 @@ def test_cached_tools_are_hot_replaced_and_removed(identity):
     )
     row = identity.mcp_servers.set_inventory(
         row["id"],
-        [{"name": "list", "description": "List events", "inputSchema": {"type": "object"}}],
+        [
+            {
+                "name": "list",
+                "description": "List events",
+                "inputSchema": {"type": "object"},
+            }
+        ],
     )
     runtime = GatewayRuntime(CortexConfig(), identity)
     mcp = FastMCP("test")
@@ -184,7 +196,13 @@ def test_cached_tools_are_hot_replaced_and_removed(identity):
 
     row = identity.mcp_servers.set_inventory(
         row["id"],
-        [{"name": "create", "description": "Create", "inputSchema": {"type": "object"}}],
+        [
+            {
+                "name": "create",
+                "description": "Create",
+                "inputSchema": {"type": "object"},
+            }
+        ],
     )
     runtime.sync_registration(row)
     assert mcp._tool_manager.get_tool("calendar.list") is None
@@ -205,9 +223,7 @@ async def test_governor_rechecks_calls_and_audits_shape_without_values(identity)
         return {"ok": True}
 
     secret = "this-note-content-must-never-enter-the-audit-row"
-    result = await governor.call(
-        invoke, "search", {"query": secret, "vault": "alice"}
-    )
+    result = await governor.call(invoke, "search", {"query": secret, "vault": "alice"})
     assert result == {"ok": True}
     allowed = identity.tool_audit.list()[0]
     assert allowed["decision"] == "allowed"
@@ -278,9 +294,7 @@ async def test_fake_streamable_http_upstream_discovery_and_call(identity):
         time.sleep(0.01)
     assert server.started
 
-    row = identity.mcp_servers.create(
-        "fake", url=f"http://127.0.0.1:{port}/mcp"
-    )
+    row = identity.mcp_servers.create("fake", url=f"http://127.0.0.1:{port}/mcp")
     config = CortexConfig()
     config.gateway.block_private_networks = False
     runtime = GatewayRuntime(config, identity)
@@ -320,3 +334,64 @@ async def test_fake_streamable_http_upstream_discovery_and_call(identity):
         server.should_exit = True
         thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+@pytest.mark.anyio
+async def test_persistent_stdio_discovery_call_environment_and_close(
+    tmp_path, monkeypatch
+):
+    fixture = Path(__file__).parent / "fixtures" / "stdio_mcp_server.py"
+    marker = tmp_path / "starts"
+    monkeypatch.setenv("STDIO_MARKER_PARENT", str(marker))
+    monkeypatch.setenv("UNRELATED_CORTEX_SECRET", "must-not-reach-child")
+    config = CortexConfig()
+    config.gateway = GatewayConfig(
+        allow_stdio_servers=True,
+        stdio_allowed_executables=[str(fixture)],
+        stdio_allowed_workdirs=[str(tmp_path)],
+        timeout_seconds=5,
+    )
+    identity = IdentityService(Database(tmp_path / "stdio.sqlite"))
+    row = identity.mcp_servers.create(
+        "fixture",
+        transport="stdio-cmd",
+        command=str(fixture),
+        args=["space value", "; touch nope", "|", "$(false)", "`false`", ">nope"],
+        cwd=str(tmp_path),
+        env_refs={"FIXTURE_MARKER": "STDIO_MARKER_PARENT"},
+        enabled=False,
+    )
+    runtime = GatewayRuntime(config, identity)
+    tools = await runtime.discover(row)
+    assert {tool["name"] for tool in tools} >= {"echo", "add", "fail", "sleep"}
+    refreshed = identity.mcp_servers.get(row["id"])
+    assert (await runtime.call(refreshed, "add", {"a": 2, "b": 3}))["content"][0][
+        "text"
+    ] == "5"
+    hidden = await runtime.call(
+        refreshed, "environment", {"name": "UNRELATED_CORTEX_SECRET"}
+    )
+    assert hidden["content"][0]["text"] == "<unset>"
+    literal = await runtime.call(refreshed, "startup_args", {})
+    assert [item["text"] for item in literal["content"]] == [
+        "space value",
+        "; touch nope",
+        "|",
+        "$(false)",
+        "`false`",
+        ">nope",
+    ]
+    assert not (tmp_path / "nope").exists()
+    assert marker.read_text().count("start:") == 1
+    await runtime.aclose()
+    assert marker.read_text().count("stop:") == 1
+
+
+def test_stdio_repository_transport_invariants(tmp_path):
+    identity = IdentityService(Database(tmp_path / "repo.sqlite"))
+    with pytest.raises(ValueError, match="requires command"):
+        identity.mcp_servers.create("bad", transport="stdio-cmd")
+    with pytest.raises(ValueError, match="rejects stdio"):
+        identity.mcp_servers.create("badhttp", url="https://example.com/mcp", args=[])
+    http = identity.mcp_servers.create("httpok", url="https://example.com/mcp")
+    assert http["url"] == "https://example.com/mcp"

@@ -8,6 +8,7 @@ call.  Every allowed, denied, and failed invocation is recorded centrally.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import ipaddress
@@ -16,6 +17,7 @@ import os
 import re
 import socket
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import timedelta
 from fnmatch import fnmatchcase
@@ -26,6 +28,7 @@ import anyio
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -89,11 +92,15 @@ def validate_outbound_url(url: str, config: CortexConfig) -> str:
         raise GatewayError("upstream credentials must use env references, not the URL")
     host = parsed.hostname.rstrip(".").lower()
     allowlist = config.gateway.outbound_allowlist
-    if allowlist and not any(fnmatchcase(host, pattern.lower()) for pattern in allowlist):
+    if allowlist and not any(
+        fnmatchcase(host, pattern.lower()) for pattern in allowlist
+    ):
         raise GatewayError("upstream host is not in gateway.outbound_allowlist")
     if config.gateway.block_private_networks:
         try:
-            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+            infos = socket.getaddrinfo(
+                host, parsed.port or (443 if parsed.scheme == "https" else 80)
+            )
         except OSError as exc:
             raise GatewayError("upstream host could not be resolved") from exc
         for info in infos:
@@ -106,7 +113,9 @@ def validate_outbound_url(url: str, config: CortexConfig) -> str:
                 or ip.is_reserved
                 or ip.is_unspecified
             ):
-                raise GatewayError("upstream resolves to a blocked private/link-local address")
+                raise GatewayError(
+                    "upstream resolves to a blocked private/link-local address"
+                )
     return url
 
 
@@ -212,7 +221,11 @@ class ToolGovernor:
 
     def filter_names(self, names: list[str]) -> set[str]:
         principal = self.principal()
-        return {name for name in names if self.permissions.allowed(principal, _tool_id(name))}
+        return {
+            name
+            for name in names
+            if self.permissions.allowed(principal, _tool_id(name))
+        }
 
     async def call(self, invoke, name: str, arguments: dict[str, Any]):
         principal = self.principal()
@@ -300,6 +313,13 @@ class ClientPoolEntry:
     client: httpx.AsyncClient
 
 
+@dataclass
+class StdioPoolEntry:
+    fingerprint: str
+    queue: asyncio.Queue
+    task: asyncio.Task
+
+
 class GatewayRuntime:
     """Connection validation and bounded proxying for streamable HTTP MCP."""
 
@@ -309,6 +329,7 @@ class GatewayRuntime:
         self._limit = anyio.Semaphore(config.gateway.max_concurrency)
         self._circuits: dict[int, CircuitState] = {}
         self._clients: dict[int, ClientPoolEntry] = {}
+        self._stdio: dict[int, StdioPoolEntry] = {}
         self._client_lock = anyio.Lock()
         self._mcp: FastMCP | None = None
 
@@ -369,6 +390,141 @@ class GatewayRuntime:
                 await current.client.aclose()
             return client
 
+    def _stdio_parameters(self, row: dict) -> tuple[StdioServerParameters, str]:
+        if not self.config.gateway.allow_stdio_servers:
+            raise GatewayError("local stdio MCP servers are disabled")
+        command = Path(row.get("command") or "")
+        if not command.is_absolute():
+            raise GatewayError("stdio executable must be an absolute path")
+        try:
+            resolved_command = command.resolve(strict=True)
+            allowed = {
+                Path(value).resolve(strict=True)
+                for value in self.config.gateway.stdio_allowed_executables
+            }
+        except OSError as exc:
+            raise GatewayError("stdio executable is missing") from exc
+        if resolved_command not in allowed:
+            raise GatewayError("stdio executable is not exactly allowlisted")
+        if not resolved_command.is_file() or not os.access(resolved_command, os.X_OK):
+            raise GatewayError("stdio executable must be a regular executable file")
+        resolved_cwd = None
+        if row.get("cwd"):
+            cwd = Path(row["cwd"])
+            if not cwd.is_absolute():
+                raise GatewayError("stdio working directory must be absolute")
+            try:
+                resolved_cwd = cwd.resolve(strict=True)
+                roots = [
+                    Path(value).resolve(strict=True)
+                    for value in self.config.gateway.stdio_allowed_workdirs
+                ]
+            except OSError as exc:
+                raise GatewayError("stdio working directory is unavailable") from exc
+            if not resolved_cwd.is_dir() or not any(
+                resolved_cwd == root or resolved_cwd.is_relative_to(root)
+                for root in roots
+            ):
+                raise GatewayError("stdio working directory is outside allowed roots")
+        args = json.loads(row.get("args_json") or "[]")
+        refs = json.loads(row.get("env_refs_json") or "{}")
+        env = {}
+        for child_name, parent_name in refs.items():
+            validate_env_name(child_name)
+            validate_env_name(parent_name)
+            if parent_name not in os.environ:
+                raise GatewayError("a required stdio environment reference is unset")
+            env[child_name] = os.environ[parent_name]
+        material = json.dumps(
+            {
+                "command": str(resolved_command),
+                "args": args,
+                "cwd": str(resolved_cwd) if resolved_cwd else None,
+                "env": sorted(env.items()),
+            },
+            separators=(",", ":"),
+        )
+        fingerprint = hashlib.sha256(material.encode()).hexdigest()
+        return StdioServerParameters(
+            command=str(resolved_command), args=args, cwd=resolved_cwd, env=env
+        ), fingerprint
+
+    async def _stdio_worker(self, parameters, queue, ready):
+        try:
+            # Discard child stderr: it can contain credentials or hostile
+            # control sequences and must never enter logs, SQLite, or APIs.
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(parameters, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read,
+                        write,
+                        read_timeout_seconds=timedelta(
+                            seconds=self.config.gateway.timeout_seconds
+                        ),
+                    ) as session:
+                        await session.initialize()
+                        ready.set_result(None)
+                        while True:
+                            request = await queue.get()
+                            if request is None:
+                                return
+                            operation, future = request
+                            try:
+                                future.set_result(await operation(session))
+                            except BaseException as exc:
+                                if not future.done():
+                                    future.set_exception(exc)
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            while not queue.empty():
+                request = queue.get_nowait()
+                if request is not None and not request[1].done():
+                    request[1].set_exception(exc)
+
+    async def _stdio_entry(self, row: dict) -> StdioPoolEntry:
+        parameters, fingerprint = self._stdio_parameters(row)
+        async with self._client_lock:
+            current = self._stdio.get(row["id"])
+            if (
+                current
+                and current.fingerprint == fingerprint
+                and not current.task.done()
+            ):
+                return current
+            if current:
+                current.queue.put_nowait(None)
+                with anyio.move_on_after(self.config.gateway.timeout_seconds):
+                    await current.task
+            queue = asyncio.Queue()
+            ready = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(self._stdio_worker(parameters, queue, ready))
+            entry = StdioPoolEntry(fingerprint, queue, task)
+            self._stdio[row["id"]] = entry
+            try:
+                with anyio.fail_after(self.config.gateway.timeout_seconds):
+                    await ready
+            except BaseException:
+                queue.put_nowait(None)
+                with anyio.move_on_after(self.config.gateway.timeout_seconds):
+                    await task
+                self._stdio.pop(row["id"], None)
+                raise
+            return entry
+
+    async def close_registration(self, server_id: int) -> None:
+        async with self._client_lock:
+            entry = self._stdio.pop(server_id, None)
+            http = self._clients.pop(server_id, None)
+        if http:
+            await http.client.aclose()
+        if entry:
+            entry.queue.put_nowait(None)
+            with anyio.move_on_after(self.config.gateway.timeout_seconds):
+                await entry.task
+            if not entry.task.done():
+                entry.task.cancel()
+
     async def aclose(self) -> None:
         """Close all lazy upstream pools (primarily for graceful shutdown/tests)."""
         async with self._client_lock:
@@ -376,12 +532,23 @@ class GatewayRuntime:
             self._clients.clear()
         for entry in entries:
             await entry.client.aclose()
+        for server_id in list(self._stdio):
+            await self.close_registration(server_id)
 
     async def _session_call(self, row: dict, operation):
+        if row["transport"] == "stdio-cmd":
+            entry = await self._stdio_entry(row)
+            future = asyncio.get_running_loop().create_future()
+            async with self._limit:
+                await entry.queue.put((operation, future))
+                with anyio.fail_after(self.config.gateway.timeout_seconds):
+                    return await future
         validate_outbound_url(row["url"], self.config)
         client = await self._pooled_client(row)
         async with self._limit:
-            async with streamable_http_client(row["url"], http_client=client) as streams:
+            async with streamable_http_client(
+                row["url"], http_client=client
+            ) as streams:
                 read, write, _ = streams
                 async with ClientSession(
                     read,
@@ -419,10 +586,17 @@ class GatewayRuntime:
                 except Exception:
                     if attempt:
                         raise
+                    await self.close_registration(row["id"])
                     await anyio.sleep(0.1)
         except Exception as exc:
-            message = str(exc)[:500] or type(exc).__name__
-            failed = self.identity.mcp_servers.set_inventory(row["id"], [], error=message)
+            message = (
+                "local MCP server failed to start or respond"
+                if row["transport"] == "stdio-cmd"
+                else str(exc)[:500] or type(exc).__name__
+            )
+            failed = self.identity.mcp_servers.set_inventory(
+                row["id"], [], error=message
+            )
             if failed is not None:
                 self.sync_registration(failed)
             raise GatewayError(f"upstream connection failed: {message}") from exc
@@ -443,6 +617,8 @@ class GatewayRuntime:
         try:
             result = await self._session_call(row, operation)
         except Exception as exc:
+            if row["transport"] == "stdio-cmd":
+                await self.close_registration(row["id"])
             state.failures += 1
             if state.failures >= 3:
                 state.opened_at = time.monotonic()
@@ -470,7 +646,8 @@ class GatewayRuntime:
         for inventory in json.loads(row.get("tools_json") or "[]"):
             self._register_one(self._mcp, row, inventory)
 
-    def unregister(self, row: dict) -> None:
+    async def unregister(self, row: dict) -> None:
+        await self.close_registration(row["id"])
         if self._mcp is None:
             return
         prefix = f"{row['name']}."
@@ -485,9 +662,11 @@ class GatewayRuntime:
         exposed = f"{row['name']}.{upstream_name}"
         schema = inventory.get("inputSchema") or {"type": "object", "properties": {}}
         properties = schema.get("properties") if isinstance(schema, dict) else {}
-        required = set(schema.get("required") or []) if isinstance(schema, dict) else set()
+        required = (
+            set(schema.get("required") or []) if isinstance(schema, dict) else set()
+        )
         parameters: list[inspect.Parameter] = []
-        for name in (properties or {}):
+        for name in properties or {}:
             if not isinstance(name, str) or not name.isidentifier():
                 continue
             default = inspect.Parameter.empty if name in required else None
@@ -510,7 +689,11 @@ class GatewayRuntime:
         proxy.__doc__ = _safe_upstream_text(
             inventory.get("description") or f"Proxied tool from {row['name']}"
         )
-        proxy.__signature__ = inspect.Signature(parameters=parameters, return_annotation=Any)
-        tool = mcp._tool_manager.add_tool(proxy, name=exposed, description=proxy.__doc__)
+        proxy.__signature__ = inspect.Signature(
+            parameters=parameters, return_annotation=Any
+        )
+        tool = mcp._tool_manager.add_tool(
+            proxy, name=exposed, description=proxy.__doc__
+        )
         if isinstance(schema, dict):
             tool.parameters = schema

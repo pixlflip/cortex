@@ -60,3 +60,19 @@ authorization, and audit-value exclusion.
 - Store the DB, config, env file, and all vault roots outside the source tree
   with least-privilege ownership; back up vault `.git` directories.
 - Review denied/error audit events and stale tokens regularly.
+
+## Local MCP process boundary
+
+`stdio-cmd` is disabled by default and administrator-only. Registration stores a
+structured absolute executable, literal argument array, optional constrained
+working directory, and environment-variable name mappings—never a command
+string or resolved secret. Runtime resolution requires an exact allowlisted,
+regular executable and uses resolved path containment for working directories;
+no shell or privilege transition is involved. The persistent child runs as the
+Cortex service user, has serialized MCP operations, participates in global
+concurrency/timeouts/circuit breaking, and is reaped on replacement, failure,
+disable, delete, and shutdown. Child stderr is discarded because it is an
+untrusted potential secret channel. The remaining operator trust decision is
+material: an allowlisted MCP entry point has all filesystem and network access
+of the Cortex service identity, so installations and permissions must be
+isolated and reviewed before enabling the feature.

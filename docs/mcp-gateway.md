@@ -63,8 +63,58 @@ reference. Personal server registration is off unless
   always namespaced. Results remain untrusted upstream content; registering a
   server is a trust decision.
 
-Only Streamable HTTP upstreams are active today. `stdio-cmd` remains disabled by
-default and is not executed by the gateway runtime.
+## Local stdio upstreams
+
+Local processes are a privileged execution boundary and are disabled by
+default. Only administrators can register them; `allow_user_servers` never
+widens this rule. Enable the feature with exact, operator-controlled paths:
+
+```yaml
+gateway:
+  allow_stdio_servers: true
+  stdio_allowed_executables:
+    - /opt/cortex-mcp/harmless/.venv/bin/harmless-mcp-server
+  stdio_allowed_workdirs:
+    - /opt/cortex-mcp
+```
+
+```json
+{
+  "name": "harmless",
+  "transport": "stdio-cmd",
+  "command": "/opt/cortex-mcp/harmless/.venv/bin/harmless-mcp-server",
+  "args": ["run", "--transport", "stdio"],
+  "cwd": "/opt/cortex-mcp/harmless",
+  "env_refs": {"SERVICE_TOKEN": "HARMLESS_MCP_TOKEN"},
+  "global": true
+}
+```
+
+Install each MCP in a dedicated root/operator-managed virtual environment and
+allowlist its dedicated entry point. **Never allowlist a shell, generic Python
+or Node interpreter, package manager, `env`, or `uvx`**: doing so would turn a
+structured registration API into arbitrary command execution. Paths are
+resolved before exact executable comparison; working directories must resolve
+beneath an allowed root, so traversal and symlink escapes are rejected. The
+child runs as the same unprivileged service identity as Cortex—there is no
+sudo, setuid helper, or privilege escalation.
+
+Put credentials in the service manager's protected `EnvironmentFile` and map
+only child-variable names to parent-variable names. Values are resolved at
+launch, included only in a one-way connection fingerprint, and never stored or
+returned. Arguments are visible administrative configuration, **not secret
+storage**. Restrict the service user's filesystem permissions to only the MCP
+installation and data it needs.
+
+Cortex starts one child lazily, initializes and reuses its MCP session, and
+serializes session operations under the gateway's global concurrency bound.
+Changing a path, arguments, working directory, or referenced value replaces
+the child. Disable, delete, failed discovery, timeout, and Cortex shutdown close
+stdin, terminate after a bounded grace period, kill if necessary, and reap the
+process. Tool calls are never retried; idempotent discovery retains one retry.
+Stderr is not stored or returned, and local failures use generic diagnostics.
+For troubleshooting, verify the executable bit, exact resolved allowlist path,
+working-directory root, referenced variable presence, and service-user access.
 
 ## Audit
 
