@@ -123,6 +123,11 @@ gateway:
   enabled: true
   allow_user_servers: false
   allow_stdio_servers: false
+  # Exact, resolved executable paths only. Never allowlist shells, generic
+  # interpreters, package managers, env, or uvx.
+  stdio_allowed_executables: []
+  # Optional cwd must resolve beneath one of these operator-managed roots.
+  stdio_allowed_workdirs: []
   block_private_networks: true
   # Strongly recommended for internet-reachable installs. Globs match hosts.
   outbound_allowlist: []       # e.g. ["mcp.example.com", "*.trusted.example"]

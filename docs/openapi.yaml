@@ -742,7 +742,7 @@ paths:
     post:
       tags: [gateway]
       operationId: createMcpServer
-      summary: Register and test a Streamable HTTP upstream.
+      summary: Register and test an HTTP or administrator-only local stdio upstream.
       parameters:
         - $ref: "#/components/parameters/CsrfHeader"
       requestBody:
@@ -987,20 +987,43 @@ components:
         revoked_at: { type: [integer, "null"], description: Unix seconds. }
 
     McpServerInput:
+      oneOf:
+        - $ref: "#/components/schemas/HttpMcpServerInput"
+        - $ref: "#/components/schemas/StdioMcpServerInput"
+      discriminator: { propertyName: transport }
+
+    HttpMcpServerInput:
       type: object
       required: [name, url]
       properties:
         name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
+        transport: { type: string, enum: [streamable-http], default: streamable-http }
         url: { type: string, format: uri }
         description: { type: string }
-        auth_env:
-          type: string
-          description: Environment-variable name, never a credential value.
-        headers_env:
-          type: object
-          additionalProperties: { type: string }
-          description: HTTP header name to environment-variable name.
+        auth_env: { type: string, description: Environment-variable name, never a value. }
+        headers_env: { type: object, additionalProperties: { type: string } }
         global: { type: boolean, default: true }
+      additionalProperties: false
+
+    StdioMcpServerInput:
+      type: object
+      required: [name, transport, command]
+      description: Administrator-only; rejected unless gateway.allow_stdio_servers is enabled.
+      properties:
+        name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
+        transport: { type: string, const: stdio-cmd }
+        command: { type: string, description: Absolute exact-allowlisted executable path. }
+        args: { type: array, maxItems: 128, items: { type: string, maxLength: 4096 } }
+        cwd: { type: string, description: Optional absolute directory beneath an allowed root. }
+        env_refs:
+          type: object
+          maxProperties: 64
+          additionalProperties: { type: string }
+          description: Child variable name to Cortex parent variable name; never values.
+        description: { type: string }
+        global: { type: boolean, const: true }
+      additionalProperties: false
+      example: { name: harmless, transport: stdio-cmd, command: /opt/cortex-mcp/harmless/.venv/bin/harmless-mcp-server, args: [run, --transport, stdio], cwd: /opt/cortex-mcp/harmless, env_refs: { SERVICE_TOKEN: HARMLESS_MCP_TOKEN }, global: true }
 
     SyncReport:
       type: object

@@ -156,7 +156,9 @@ class LoginRateLimiter:
         self._failures: dict[str, list[float]] = {}
 
     def _prune(self, key: str, now: float) -> list[float]:
-        stamps = [t for t in self._failures.get(key, []) if now - t < self.window_seconds]
+        stamps = [
+            t for t in self._failures.get(key, []) if now - t < self.window_seconds
+        ]
         if stamps:
             self._failures[key] = stamps
         else:
@@ -198,7 +200,9 @@ class ApiV1:
         self._directory = directory
         self._throttle = rate_limiter or LoginRateLimiter()
         self._log_requests = bool(config.server.request_log)
-        self.vault_manager = identity.vault_manager or attach_vault_manager(identity, config)
+        self.vault_manager = identity.vault_manager or attach_vault_manager(
+            identity, config
+        )
         self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
         self.gateway = gateway_runtime or GatewayRuntime(config, identity)
         self.permissions = PermissionResolver(config, identity)
@@ -233,15 +237,31 @@ class ApiV1:
             (f"{p}/vaults/{{vault}}/links/{{path:path}}", ["GET"], self.vault_links),
             (f"{p}/vaults/{{vault}}/notes/{{path:path}}", ["GET"], self.vault_note),
             (f"{p}/vaults/{{vault}}/assets/{{path:path}}", ["GET"], self.vault_asset),
-            (f"{p}/admin/vaults/{{vault}}/{{action}}", ["POST"], self.admin_vault_action),
+            (
+                f"{p}/admin/vaults/{{vault}}/{{action}}",
+                ["POST"],
+                self.admin_vault_action,
+            ),
             (f"{p}/audit/commits", ["GET"], self.commit_audit),
             (f"{p}/audit/tools", ["GET"], self.tool_audit),
             (f"{p}/mcp/tools", ["GET"], self.mcp_tools),
             (f"{p}/mcp/servers", ["GET", "POST"], self.mcp_servers),
-            (f"{p}/mcp/servers/{{server_id}}", ["GET", "PATCH", "DELETE"], self.mcp_server_item),
-            (f"{p}/mcp/servers/{{server_id}}/{{action}}", ["POST"], self.mcp_server_action),
+            (
+                f"{p}/mcp/servers/{{server_id}}",
+                ["GET", "PATCH", "DELETE"],
+                self.mcp_server_item,
+            ),
+            (
+                f"{p}/mcp/servers/{{server_id}}/{{action}}",
+                ["POST"],
+                self.mcp_server_action,
+            ),
             (f"{p}/admin/permissions", ["GET", "POST"], self.tool_permissions),
-            (f"{p}/admin/permissions/{{permission_id}}", ["DELETE"], self.tool_permission_item),
+            (
+                f"{p}/admin/permissions/{{permission_id}}",
+                ["DELETE"],
+                self.tool_permission_item,
+            ),
             (f"{p}/admin/janitor", ["GET"], self.janitor_status),
         ]
 
@@ -295,7 +315,9 @@ class ApiV1:
                 log.exception(
                     "unhandled error on %s %s", request.method, request.url.path
                 )
-                response = error_response(500, "internal_error", "internal server error")
+                response = error_response(
+                    500, "internal_error", "internal server error"
+                )
             if self._log_requests:
                 access_log.info(
                     "method=%s path=%s principal=%s status=%d duration_ms=%.1f",
@@ -345,7 +367,9 @@ class ApiV1:
             allowed.add(f"https://{host}")
         return origin in allowed
 
-    def _require_identity(self, request: Request, *, admin: bool = False) -> ApiIdentity:
+    def _require_identity(
+        self, request: Request, *, admin: bool = False
+    ) -> ApiIdentity:
         """The auth pipeline every route (except login) runs first.
 
         Bearer wins when presented; otherwise the session cookie. Cookie-
@@ -397,7 +421,9 @@ class ApiV1:
                 raise ApiError(400, "invalid_request", f"'{name}' is required")
             return None
         if not isinstance(value, str) or not value.strip():
-            raise ApiError(400, "invalid_request", f"'{name}' must be a non-empty string")
+            raise ApiError(
+                400, "invalid_request", f"'{name}' must be a non-empty string"
+            )
         return value
 
     @staticmethod
@@ -468,7 +494,9 @@ class ApiV1:
         }
 
     def _group_summary(self, group: dict) -> dict:
-        read_scopes = list(json.loads(group["scopes_json"])) if group["scopes_json"] else []
+        read_scopes = (
+            list(json.loads(group["scopes_json"])) if group["scopes_json"] else []
+        )
         raw_write = group.get("write_scopes_json")
         return {
             "name": group["name"],
@@ -489,7 +517,9 @@ class ApiV1:
             "id": row["id"],
             "name": row["name"],
             "token_prefix": row["token_prefix"],
-            "scopes": list(json.loads(row["scopes_json"])) if row["scopes_json"] else None,
+            "scopes": list(json.loads(row["scopes_json"]))
+            if row["scopes_json"]
+            else None,
             "created_at": row["created_at"],
             "expires_at": row["expires_at"],
             "last_used_at": row["last_used_at"],
@@ -631,12 +661,12 @@ class ApiV1:
         password = self._str_field(body, "password")
         if password is not None:
             try:
-                self.identity.set_password(
-                    user["username"], password, actor=ident.user
-                )
+                self.identity.set_password(user["username"], password, actor=ident.user)
             except ValueError as exc:  # e.g. an LDAP user carries no password
                 raise ApiError(400, "invalid_request", str(exc))
-        return JSONResponse({"user": self._user_summary(self.identity.get_user(username))})
+        return JSONResponse(
+            {"user": self._user_summary(self.identity.get_user(username))}
+        )
 
     # -- admin: groups ----------------------------------------------------------------
 
@@ -690,7 +720,10 @@ class ApiV1:
             user["username"], group["name"], actor=ident.user
         )
         return JSONResponse(
-            {"group": self._group_summary(self._get_group_or_404(group["name"])), "added": added}
+            {
+                "group": self._group_summary(self._get_group_or_404(group["name"])),
+                "added": added,
+            }
         )
 
     async def group_member_item(self, request: Request) -> Response:
@@ -828,14 +861,18 @@ class ApiV1:
                     self.config.ldap and self.config.ldap.jit_provisioning
                 ),
                 "server_uri": self.config.ldap.server_uri if self.config.ldap else None,
-                "group_mappings": self.config.ldap.group_mappings if self.config.ldap else {},
+                "group_mappings": self.config.ldap.group_mappings
+                if self.config.ldap
+                else {},
             }
         )
 
     # -- B2/B3: one authorization path for every vault-facing API -------------
 
     def _api_principal(self, ident: ApiIdentity):
-        principal = ident.principal or self.identity.principal_for_username(ident.username)
+        principal = ident.principal or self.identity.principal_for_username(
+            ident.username
+        )
         if principal is None:
             raise _unauthenticated()
         return principal
@@ -874,7 +911,9 @@ class ApiV1:
                     "last_commit_iso": bundle.git.head_time(),
                     "last_indexed_iso": stats["last_indexed"],
                     "index_note_count": stats["note_count"],
-                    "sync_adapter": self.vault_manager.sync_config_for(grant.vault_id).adapter,
+                    "sync_adapter": self.vault_manager.sync_config_for(
+                        grant.vault_id
+                    ).adapter,
                 }
             )
         return JSONResponse({"vaults": items})
@@ -901,7 +940,9 @@ class ApiV1:
             if node["type"] == "note":
                 return node
             children = [freeze(child) for child in node["children"].values()]
-            children.sort(key=lambda item: (item["type"] != "folder", item["name"].lower()))
+            children.sort(
+                key=lambda item: (item["type"] != "folder", item["name"].lower())
+            )
             return {"name": node["name"], "type": "folder", "children": children}
 
         return JSONResponse({"vault": bundle.vault_id, "tree": freeze(root)})
@@ -1048,8 +1089,12 @@ class ApiV1:
         outbound = []
         for raw in link_re.findall(note.body):
             target = raw.strip()
-            resolved = by_key.get(target.lower()) or by_key.get((target + ".md").lower())
-            outbound.append({"target": target, "path": resolved, "broken": resolved is None})
+            resolved = by_key.get(target.lower()) or by_key.get(
+                (target + ".md").lower()
+            )
+            outbound.append(
+                {"target": target, "path": resolved, "broken": resolved is None}
+            )
         inbound = []
         aliases = {path.lower(), Path(path).stem.lower()}
         for candidate in visible:
@@ -1092,7 +1137,9 @@ class ApiV1:
             )
         if action == "archive":
             path = self.vault_manager.archive(vault)
-            return JSONResponse({"vault": vault, "archived": True, "archive": str(path)})
+            return JSONResponse(
+                {"vault": vault, "archived": True, "archive": str(path)}
+            )
         raise ApiError(404, "not_found", _NOT_FOUND)
 
     async def commit_audit(self, request: Request) -> Response:
@@ -1100,8 +1147,7 @@ class ApiV1:
         principal = self._api_principal(ident)
         vault_filter = request.query_params.get("vault")
         actor_filter = (
-            request.query_params.get("user")
-            or request.query_params.get("actor", "")
+            request.query_params.get("user") or request.query_params.get("actor", "")
         ).lower()
         path_filter = request.query_params.get("path")
         since = self._query_time(request, "from")
@@ -1119,7 +1165,11 @@ class ApiV1:
                 continue
             bundle = self.vault_manager.get(grant.vault_id)
             for commit in bundle.git.log(limit=limit, path=path_filter):
-                if actor_filter and actor_filter not in commit.actor.lower() and actor_filter not in commit.subject.lower():
+                if (
+                    actor_filter
+                    and actor_filter not in commit.actor.lower()
+                    and actor_filter not in commit.subject.lower()
+                ):
                     continue
                 try:
                     commit_ts = int(
@@ -1170,6 +1220,11 @@ class ApiV1:
         if include_env_refs:
             result["auth_env"] = row.get("auth_env")
             result["headers_env"] = json.loads(row.get("headers_env_json") or "{}")
+            if row["transport"] == "stdio-cmd":
+                result["command"] = row.get("command")
+                result["args"] = json.loads(row.get("args_json") or "[]")
+                result["cwd"] = row.get("cwd")
+                result["env_refs"] = json.loads(row.get("env_refs_json") or "{}")
         return result
 
     def _server_for_identity(self, ident: ApiIdentity, raw_id: str) -> dict:
@@ -1197,33 +1252,102 @@ class ApiV1:
                         for row in rows
                     ],
                     "allow_user_servers": self.config.gateway.allow_user_servers,
+                    "allow_stdio_servers": self.config.gateway.allow_stdio_servers
+                    and ident.is_admin,
                 }
             )
         if not ident.is_admin and not self.config.gateway.allow_user_servers:
             raise ApiError(403, "forbidden", "personal MCP servers are disabled")
         body = await self._json_body(request)
         name = validate_server_name(self._str_field(body, "name", required=True))
-        url = validate_outbound_url(self._str_field(body, "url", required=True), self.config)
-        owner = None if ident.is_admin and body.get("global", True) else ident.user["id"]
+        transport = body.get("transport", "streamable-http")
+        if transport == "stdio-cmd" and not ident.is_admin:
+            raise ApiError(
+                403, "forbidden", "local stdio MCP servers require an administrator"
+            )
+        if transport == "stdio-cmd" and not self.config.gateway.allow_stdio_servers:
+            raise ApiError(403, "forbidden", "local stdio MCP servers are disabled")
+        if transport not in ("streamable-http", "stdio-cmd"):
+            raise ApiError(400, "invalid_request", "unsupported MCP transport")
+        url = (
+            validate_outbound_url(
+                self._str_field(body, "url", required=True), self.config
+            )
+            if transport == "streamable-http"
+            else None
+        )
+        owner = (
+            None if ident.is_admin and body.get("global", True) else ident.user["id"]
+        )
         headers_env = body.get("headers_env", {})
         if not isinstance(headers_env, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in headers_env.items()
         ):
-            raise ApiError(400, "invalid_request", "headers_env must map header names to env names")
+            raise ApiError(
+                400, "invalid_request", "headers_env must map header names to env names"
+            )
         headers_env = {
             validate_header_name(key): validate_env_name(value)
             for key, value in headers_env.items()
         }
-        row = self.identity.mcp_servers.create(
-            name,
-            url=url,
-            owner_user_id=owner,
-            description=self._str_field(body, "description"),
-            auth_env=validate_env_name(self._str_field(body, "auth_env")),
-            headers_env=headers_env,
-            visibility="group" if owner is None else "personal",
-            enabled=False,
+        args = (
+            body.get("args")
+            if "args" in body
+            else ([] if transport == "stdio-cmd" else None)
         )
+        env_refs = (
+            body.get("env_refs")
+            if "env_refs" in body
+            else ({} if transport == "stdio-cmd" else None)
+        )
+        if env_refs is not None and (
+            not isinstance(env_refs, dict)
+            or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in env_refs.items()
+            )
+        ):
+            raise ApiError(
+                400,
+                "invalid_request",
+                "env_refs must map child variable names to Cortex variable names",
+            )
+        if env_refs is not None:
+            env_refs = {
+                validate_env_name(k): validate_env_name(v) for k, v in env_refs.items()
+            }
+        command = self._str_field(body, "command")
+        cwd = self._str_field(body, "cwd")
+        candidate = {
+            "transport": transport,
+            "url": url,
+            "command": command,
+            "cwd": cwd,
+            "args_json": json.dumps(args) if args is not None else None,
+            "env_refs_json": json.dumps(env_refs) if env_refs is not None else None,
+        }
+        if transport == "stdio-cmd":
+            try:
+                self.gateway._stdio_parameters(candidate)
+            except (GatewayError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ApiError(400, "invalid_request", str(exc)) from exc
+        try:
+            row = self.identity.mcp_servers.create(
+                name,
+                url=url,
+                transport=transport,
+                owner_user_id=owner,
+                description=self._str_field(body, "description"),
+                auth_env=validate_env_name(self._str_field(body, "auth_env")),
+                headers_env=headers_env,
+                command=command,
+                args=args,
+                env_refs=env_refs,
+                cwd=cwd,
+                visibility="group" if owner is None else "personal",
+                enabled=False,
+            )
+        except ValueError as exc:
+            raise ApiError(400, "invalid_request", str(exc)) from exc
         error = None
         try:
             await self.gateway.discover(row)
@@ -1231,7 +1355,10 @@ class ApiV1:
             error = str(exc)
         row = self.identity.mcp_servers.get(row["id"])
         return JSONResponse(
-            {"server": self._server_summary(row, include_env_refs=ident.is_admin), "validation_error": error},
+            {
+                "server": self._server_summary(row, include_env_refs=ident.is_admin),
+                "validation_error": error,
+            },
             status_code=201,
         )
 
@@ -1239,9 +1366,11 @@ class ApiV1:
         ident = self._require_identity(request)
         row = self._server_for_identity(ident, request.path_params["server_id"])
         if request.method == "GET":
-            return JSONResponse({"server": self._server_summary(row, include_env_refs=ident.is_admin)})
+            return JSONResponse(
+                {"server": self._server_summary(row, include_env_refs=ident.is_admin)}
+            )
         if request.method == "DELETE":
-            self.gateway.unregister(row)
+            await self.gateway.unregister(row)
             self.identity.mcp_servers.delete(row["id"])
             return Response(status_code=204)
         body = await self._json_body(request)
@@ -1254,7 +1383,9 @@ class ApiV1:
         if "enabled" in body:
             fields["enabled"] = bool(self._bool_field(body, "enabled"))
         if "url" in body:
-            fields["url"] = validate_outbound_url(self._str_field(body, "url", required=True), self.config)
+            fields["url"] = validate_outbound_url(
+                self._str_field(body, "url", required=True), self.config
+            )
         if "headers_env" in body:
             headers = body["headers_env"]
             if not isinstance(headers, dict):
@@ -1266,8 +1397,45 @@ class ApiV1:
                 }
             )
         connection_changed = bool(
-            {"url", "auth_env", "headers_env_json"}.intersection(fields)
+            {
+                "url",
+                "auth_env",
+                "headers_env_json",
+                "command",
+                "args_json",
+                "env_refs_json",
+                "cwd",
+            }.intersection(fields)
         )
+        if row["transport"] == "stdio-cmd" and not ident.is_admin:
+            raise ApiError(
+                403, "forbidden", "local stdio MCP servers require an administrator"
+            )
+        if row["transport"] == "stdio-cmd":
+            for key in ("command", "cwd"):
+                if key in body:
+                    fields[key] = self._str_field(body, key)
+            if "args" in body:
+                fields["args_json"] = json.dumps(body["args"])
+            if "env_refs" in body:
+                refs = body["env_refs"]
+                if not isinstance(refs, dict):
+                    raise ApiError(400, "invalid_request", "env_refs must be an object")
+                fields["env_refs_json"] = json.dumps(
+                    {
+                        validate_env_name(k): validate_env_name(v)
+                        for k, v in refs.items()
+                    }
+                )
+            connection_changed = connection_changed or bool(
+                {"command", "cwd", "args", "env_refs"}.intersection(body)
+            )
+            candidate = {**row, **fields}
+            self.gateway._stdio_parameters(candidate)
+        if fields.get("enabled") is False:
+            await self.gateway.close_registration(row["id"])
+        if connection_changed:
+            await self.gateway.close_registration(row["id"])
         row = self.identity.mcp_servers.update(row["id"], **fields)
         validation_error = None
         if connection_changed:
@@ -1282,9 +1450,7 @@ class ApiV1:
             self.gateway.sync_registration(row)
         return JSONResponse(
             {
-                "server": self._server_summary(
-                    row, include_env_refs=ident.is_admin
-                ),
+                "server": self._server_summary(row, include_env_refs=ident.is_admin),
                 "validation_error": validation_error,
             }
         )
@@ -1296,18 +1462,36 @@ class ApiV1:
             raise ApiError(404, "not_found", _NOT_FOUND)
         tools = await self.gateway.discover(row)
         refreshed = self.identity.mcp_servers.get(row["id"])
-        return JSONResponse({"server": self._server_summary(refreshed, include_env_refs=ident.is_admin), "tools": tools})
+        return JSONResponse(
+            {
+                "server": self._server_summary(
+                    refreshed, include_env_refs=ident.is_admin
+                ),
+                "tools": tools,
+            }
+        )
 
     def _tool_catalog(self, user_id: int, *, is_admin: bool) -> list[dict]:
         """Return the real tool inventory visible to one identity."""
         builtin = [
-            "discover_scopes", "status", "list_notes", "search", "read_note",
-            "read_frontmatter", "read_section", "context_pack", "semantic_search",
+            "discover_scopes",
+            "status",
+            "list_notes",
+            "search",
+            "read_note",
+            "read_frontmatter",
+            "read_section",
+            "context_pack",
+            "semantic_search",
         ]
         if self.config.writes.enabled:
             builtin += [
-                "write_note", "patch_note", "append_note",
-                "update_frontmatter", "delete_note", "move_note",
+                "write_note",
+                "patch_note",
+                "append_note",
+                "update_frontmatter",
+                "delete_note",
+                "move_note",
             ]
         items = [
             {"id": f"cortex.{name}", "server": "cortex", "name": name}
@@ -1349,10 +1533,14 @@ class ApiV1:
                     user["id"], is_admin=bool(user["is_admin"])
                 )
                 preview = [
-                    self.permissions.explain(user, item["id"])
-                    for item in catalog
+                    self.permissions.explain(user, item["id"]) for item in catalog
                 ]
-            return JSONResponse({"permissions": self.identity.tool_permissions.list(), "preview": preview})
+            return JSONResponse(
+                {
+                    "permissions": self.identity.tool_permissions.list(),
+                    "preview": preview,
+                }
+            )
         body = await self._json_body(request)
         subject_type = self._str_field(body, "subject_type", required=True)
         subject_name = self._str_field(body, "subject", required=True)
@@ -1443,6 +1631,8 @@ class ApiV1:
 def build_api(config: CortexConfig, identity: IdentityService) -> ApiV1:
     """Standard construction used by ``build_http_server``: cookie Secure
     flag follows the public base URL's scheme (the #19 rule)."""
-    base = config.server.public_url or f"http://{config.server.host}:{config.server.port}"
+    base = (
+        config.server.public_url or f"http://{config.server.host}:{config.server.port}"
+    )
     session_auth = SessionAuth(identity, secure_cookies=base.startswith("https://"))
     return ApiV1(config, identity, session_auth)

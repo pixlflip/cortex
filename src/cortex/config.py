@@ -36,6 +36,7 @@ class ConfigError(Exception):
 def _interpolate(value: Any) -> Any:
     """Recursively replace ``${ENV_VAR}`` references with environment values."""
     if isinstance(value, str):
+
         def repl(match: re.Match[str]) -> str:
             name = match.group(1)
             if name not in os.environ:
@@ -140,6 +141,7 @@ class AuthConfig:
     # http is a bearer-only resource server.
     oauth_enabled: bool = False
 
+
 @dataclass
 class AdminConfig:
     enabled: bool = True
@@ -165,6 +167,7 @@ class IndexConfig:
     path: Path = Path("./cortex.index.sqlite")
     chunk_chars: int = 1500
     overlap: int = 150
+
 
 @dataclass
 class ServerConfig:
@@ -279,6 +282,8 @@ class GatewayConfig:
     enabled: bool = True
     allow_user_servers: bool = False
     allow_stdio_servers: bool = False
+    stdio_allowed_executables: list[str] = field(default_factory=list)
+    stdio_allowed_workdirs: list[str] = field(default_factory=list)
     block_private_networks: bool = True
     outbound_allowlist: list[str] = field(default_factory=list)
     timeout_seconds: float = 20.0
@@ -353,9 +358,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     sync_overrides: dict[str, SyncConfig] = {}
     for vault_id, override in overrides_raw.items():
         if not isinstance(vault_id, str) or not isinstance(override, dict):
-            raise ConfigError(
-                "vaults.sync_overrides must map vault names to mappings"
-            )
+            raise ConfigError("vaults.sync_overrides must map vault names to mappings")
         options = override.get("options", {}) or {}
         if not isinstance(options, dict):
             raise ConfigError(
@@ -477,6 +480,12 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         enabled=bool(gateway_raw.get("enabled", True)),
         allow_user_servers=bool(gateway_raw.get("allow_user_servers", False)),
         allow_stdio_servers=bool(gateway_raw.get("allow_stdio_servers", False)),
+        stdio_allowed_executables=list(
+            gateway_raw.get("stdio_allowed_executables", []) or []
+        ),
+        stdio_allowed_workdirs=list(
+            gateway_raw.get("stdio_allowed_workdirs", []) or []
+        ),
         block_private_networks=bool(gateway_raw.get("block_private_networks", True)),
         outbound_allowlist=list(gateway_raw.get("outbound_allowlist", []) or []),
         timeout_seconds=float(gateway_raw.get("timeout_seconds", 20.0)),
@@ -528,8 +537,10 @@ def _build_ldap(ldap_raw: Any) -> LdapConfig | None:
 
     mappings_raw = ldap_raw.get("group_mappings", {}) or {}
     if not isinstance(mappings_raw, dict):
-        raise ConfigError("ldap.group_mappings must be a mapping of "
-                          "LDAP group (DN or name) -> Cortex group name")
+        raise ConfigError(
+            "ldap.group_mappings must be a mapping of "
+            "LDAP group (DN or name) -> Cortex group name"
+        )
     group_mappings: dict[str, str] = {}
     for ldap_group, cortex_group in mappings_raw.items():
         if not str(ldap_group).strip() or not str(cortex_group or "").strip():
@@ -621,8 +632,14 @@ def _validate(cfg: CortexConfig) -> None:
             f"auth.local_principal '{cfg.auth.local_principal}' is not a defined principal"
         )
     if cfg.server.transport == "http" and not cfg.auth.enabled:
-        raise ConfigError("auth must be enabled for http transport (no public exposure unmapped)")
-    if cfg.server.transport == "http" and not any(p.token for p in cfg.principals) and not cfg.admin.enabled:
+        raise ConfigError(
+            "auth must be enabled for http transport (no public exposure unmapped)"
+        )
+    if (
+        cfg.server.transport == "http"
+        and not any(p.token for p in cfg.principals)
+        and not cfg.admin.enabled
+    ):
         raise ConfigError(
             "http transport requires at least one principal with a token_env or admin.enabled; "
             "otherwise no client can authenticate."

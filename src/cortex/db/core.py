@@ -64,6 +64,7 @@ class Migration:
 # churn. Columns follow the §4 sketch; deviations are commented inline.
 # --------------------------------------------------------------------------
 
+
 def _m0001_initial_schema(conn: sqlite3.Connection) -> None:
     # Individual execute() calls, not executescript(): executescript issues an
     # implicit COMMIT first, which would break the migration runner's
@@ -235,6 +236,14 @@ def _m0002_gateway_and_shared_writes(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m0004_stdio_mcp_servers(conn: sqlite3.Connection) -> None:
+    """Add structured local-process fields without rewriting registry rows."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(mcp_servers)")}
+    for name in ("command", "args_json", "env_refs_json", "cwd"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {name} TEXT")
+
+
 def _m0003_runtime_settings(conn: sqlite3.Connection) -> None:
     """Persist public-safe policy overrides edited in the admin panel.
 
@@ -282,6 +291,7 @@ MIGRATIONS: list[Migration] = [
     Migration(1, "initial_schema", _m0001_initial_schema),
     Migration(2, "gateway_and_shared_writes", _m0002_gateway_and_shared_writes),
     Migration(3, "runtime_settings", _m0003_runtime_settings),
+    Migration(4, "stdio_mcp_servers", _m0004_stdio_mcp_servers),
 ]
 
 
