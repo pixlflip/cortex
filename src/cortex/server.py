@@ -31,7 +31,7 @@ from mcp.server.auth.settings import (
     ClientRegistrationOptions,
     RevocationOptions,
 )
-from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import request_ctx
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .admin import ADMIN_PATH, AdminStore, AdminUI
@@ -44,7 +44,12 @@ from .auth import (
 )
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
-from .gateway import GatewayRuntime, GovernedFastMCP, ToolGovernor
+from .gateway import (
+    GatewayRuntime,
+    GovernedFastMCP,
+    LazyMcpCatalog,
+    ToolGovernor,
+)
 
 _LOG = logging.getLogger("cortex.janitor")
 from .llm import LLMError, build_provider
@@ -192,10 +197,18 @@ class CortexServer:
         self.mcp = self._build_mcp(http)
         self._register()
         if self.gateway_runtime is not None and config.gateway.enabled:
+            catalog = LazyMcpCatalog(
+                config,
+                identity,
+                self._get_principal,
+                self._get_mcp_client_key,
+            )
+            self.mcp.lazy_catalog = catalog
+            self.gateway_runtime.register_discovery_tools(self.mcp, catalog)
             self.gateway_runtime.register_cached_tools(self.mcp)
             self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
 
-    def _build_mcp(self, http: HttpServe | None) -> FastMCP:
+    def _build_mcp(self, http: HttpServe | None) -> GovernedFastMCP:
         @asynccontextmanager
         async def lifespan(_server):
             async def janitor_heartbeat() -> None:
@@ -229,7 +242,7 @@ class CortexServer:
             host=http.host,
             port=http.port,
             streamable_http_path=http.path,
-            stateless_http=True,
+            stateless_http=False,
             lifespan=lifespan,
         )
         if http.oauth_provider is not None:
@@ -254,6 +267,13 @@ class CortexServer:
         return mcp
 
     # -- principal resolution ---------------------------------------------
+
+    def _get_mcp_client_key(self) -> object:
+        """Return the current MCP transport session as the load-state key."""
+        try:
+            return request_ctx.get().session
+        except LookupError as exc:
+            raise ValueError("MCP client session is unavailable") from exc
 
     def _get_principal(self) -> Principal:
         """The principal for the current call: the bound one (stdio) or the one

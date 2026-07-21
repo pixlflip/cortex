@@ -11,10 +11,15 @@ import threading
 import time
 import venv
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp import ClientSession, types as mcp_types
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import request_ctx
 import uvicorn
 
 from cortex.config import CortexConfig, GatewayConfig, Principal
@@ -22,11 +27,17 @@ from cortex.db import Database
 from cortex.gateway import (
     GatewayError,
     GatewayRuntime,
+    GovernedFastMCP,
+    LazyMcpCatalog,
     PermissionResolver,
     ToolGovernor,
     validate_outbound_url,
 )
 from cortex.users import IdentityService
+
+
+class _ClientKey:
+    pass
 
 
 @pytest.fixture
@@ -226,6 +237,275 @@ def test_cached_tools_are_hot_replaced_and_removed(identity):
     row = identity.mcp_servers.update(row["id"], enabled=False)
     runtime.sync_registration(row)
     assert mcp._tool_manager.get_tool("calendar.create") is None
+
+
+def test_lazy_catalog_search_peek_and_policy_filtering(identity):
+    calendar = identity.mcp_servers.create(
+        "calendar",
+        url="https://calendar.example.com/mcp",
+        description="Team calendar",
+    )
+    identity.mcp_servers.set_inventory(
+        calendar["id"],
+        [
+            {"name": "list", "inputSchema": {"type": "object"}},
+            {"name": "delete", "inputSchema": {"type": "object"}},
+        ],
+    )
+    mail = identity.mcp_servers.create(
+        "mail", url="https://mail.example.com/mcp", description="Private mail"
+    )
+    identity.mcp_servers.set_inventory(
+        mail["id"], [{"name": "send", "inputSchema": {"type": "object"}}]
+    )
+    group = identity.get_group("staff")
+    identity.tool_permissions.set(
+        subject_type="group",
+        subject_id=group["id"],
+        server_id=calendar["id"],
+        tool_pattern="calendar.*",
+        effect="allow",
+    )
+    user = identity.get_user("alice")
+    identity.tool_permissions.set(
+        subject_type="user",
+        subject_id=user["id"],
+        server_id=calendar["id"],
+        tool_pattern="calendar.delete",
+        effect="deny",
+    )
+    principal = identity.principal_for_username("alice")
+    client_key = _ClientKey()
+    catalog = LazyMcpCatalog(
+        CortexConfig(), identity, lambda: principal, lambda: client_key
+    )
+
+    assert catalog.search() == [
+        {
+            "name": "calendar",
+            "description": "Team calendar",
+            "tool_count": 1,
+        }
+    ]
+    assert catalog.search("team") == catalog.search()
+    assert catalog.search("mail") == []
+    assert catalog.peek("calendar") == ["calendar.list"]
+    with pytest.raises(ToolError, match="not available"):
+        catalog.peek("mail")
+
+
+@pytest.mark.anyio
+async def test_lazy_catalog_hides_calls_until_loaded_and_load_tool_notifies(identity):
+    row = identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp"
+    )
+    identity.mcp_servers.set_inventory(
+        row["id"], [{"name": "list", "inputSchema": {"type": "object"}}]
+    )
+    group = identity.get_group("staff")
+    identity.tool_permissions.set(
+        subject_type="group",
+        subject_id=group["id"],
+        server_id=row["id"],
+        tool_pattern="calendar.*",
+        effect="allow",
+    )
+    principal = identity.principal_for_username("alice")
+    client_key = _ClientKey()
+    catalog = LazyMcpCatalog(
+        CortexConfig(), identity, lambda: principal, lambda: client_key
+    )
+    mcp = GovernedFastMCP("test")
+    mcp.governor = ToolGovernor(CortexConfig(), identity, lambda: principal)
+    mcp.lazy_catalog = catalog
+
+    @mcp.tool(name="calendar.list")
+    def calendar_list() -> str:
+        return "events"
+
+    runtime = GatewayRuntime(CortexConfig(), identity)
+    runtime.register_discovery_tools(mcp, catalog)
+
+    initial = {tool.name for tool in await mcp.list_tools()}
+    assert initial == {"search_mcps", "peek_mcp", "load_mcp"}
+    assert "calendar.list" not in initial
+    with pytest.raises(ToolError, match="not loaded"):
+        await mcp.call_tool("calendar.list", {})
+
+    notification = AsyncMock()
+    ctx = Context(
+        request_context=SimpleNamespace(
+            session=SimpleNamespace(send_tool_list_changed=notification)
+        ),
+        fastmcp=mcp,
+    )
+    loaded = await mcp._tool_manager.call_tool(
+        "load_mcp", {"name": "calendar"}, context=ctx
+    )
+    assert loaded == {"name": "calendar", "tool_count": 1, "loaded": True}
+    notification.assert_awaited_once_with()
+    assert "calendar.list" in {tool.name for tool in await mcp.list_tools()}
+    result = await mcp.call_tool("calendar.list", {})
+    assert result[0][0].text == "events"
+
+    # Loading never becomes an authorization grant. A later deny removes the
+    # stale schema and blocks a client that retained it.
+    user = identity.get_user("alice")
+    identity.tool_permissions.set(
+        subject_type="user",
+        subject_id=user["id"],
+        server_id=row["id"],
+        tool_pattern="calendar.list",
+        effect="deny",
+    )
+    assert "calendar.list" not in {tool.name for tool in await mcp.list_tools()}
+    with pytest.raises(ToolError, match="not available"):
+        await mcp.call_tool("calendar.list", {})
+
+
+def test_lazy_catalog_loadouts_are_isolated_by_client_key(identity):
+    row = identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp"
+    )
+    identity.mcp_servers.set_inventory(
+        row["id"], [{"name": "list", "inputSchema": {"type": "object"}}]
+    )
+    group = identity.get_group("staff")
+    identity.tool_permissions.set(
+        subject_type="group",
+        subject_id=group["id"],
+        server_id=row["id"],
+        tool_pattern="calendar.*",
+        effect="allow",
+    )
+    principal = identity.principal_for_username("alice")
+    first = _ClientKey()
+    second = _ClientKey()
+    client = {"key": first}
+    catalog = LazyMcpCatalog(
+        CortexConfig(), identity, lambda: principal, lambda: client["key"]
+    )
+
+    catalog.load("calendar")
+    assert catalog.is_loaded("calendar") is True
+    client["key"] = second
+    assert catalog.is_loaded("calendar") is False
+
+
+@pytest.mark.anyio
+async def test_streamable_http_load_refresh_is_standard_and_session_scoped(identity):
+    row = identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp"
+    )
+    identity.mcp_servers.set_inventory(
+        row["id"],
+        [
+            {
+                "name": "list",
+                "description": "List events",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer"}},
+                },
+            }
+        ],
+    )
+    group = identity.get_group("staff")
+    identity.tool_permissions.set(
+        subject_type="group",
+        subject_id=group["id"],
+        server_id=row["id"],
+        tool_pattern="calendar.*",
+        effect="allow",
+    )
+    principal = identity.principal_for_username("alice")
+    catalog = LazyMcpCatalog(
+        CortexConfig(),
+        identity,
+        lambda: principal,
+        lambda: request_ctx.get().session,
+    )
+    mcp = GovernedFastMCP("lazy-test", stateless_http=False)
+    mcp.governor = ToolGovernor(CortexConfig(), identity, lambda: principal)
+    mcp.lazy_catalog = catalog
+
+    @mcp.tool(name="calendar.list")
+    def calendar_list(limit: int | None = None) -> dict:
+        return {"limit": limit}
+
+    runtime = GatewayRuntime(CortexConfig(), identity)
+    runtime.register_discovery_tools(mcp, catalog)
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            mcp.streamable_http_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+        )
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if server.started:
+            break
+        time.sleep(0.01)
+    assert server.started
+
+    async def names(session: ClientSession) -> dict[str, mcp_types.Tool]:
+        result = await session.list_tools()
+        return {tool.name: tool for tool in result.tools}
+
+    notifications: list[object] = []
+
+    async def capture(message) -> None:
+        notifications.append(message)
+
+    try:
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as streams:
+            async with ClientSession(
+                streams[0], streams[1], message_handler=capture
+            ) as session:
+                initialized = await session.initialize()
+                assert initialized.capabilities.tools is not None
+                assert initialized.capabilities.tools.listChanged is True
+                initial = await names(session)
+                assert "calendar.list" not in initial
+                assert {"search_mcps", "peek_mcp", "load_mcp"} <= initial.keys()
+
+                loaded = await session.call_tool("load_mcp", {"name": "calendar"})
+                assert loaded.isError is False
+                assert any(
+                    isinstance(message, mcp_types.ServerNotification)
+                    and isinstance(
+                        message.root, mcp_types.ToolListChangedNotification
+                    )
+                    for message in notifications
+                )
+                refreshed = await names(session)
+                limit_schema = refreshed["calendar.list"].inputSchema["properties"][
+                    "limit"
+                ]
+                assert {option.get("type") for option in limit_schema["anyOf"]} == {
+                    "integer",
+                    "null",
+                }
+                called = await session.call_tool("calendar.list", {"limit": 3})
+                assert called.isError is False
+
+        # A separate MCP transport session starts from the compact baseline.
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as streams:
+            async with ClientSession(streams[0], streams[1]) as second:
+                await second.initialize()
+                assert "calendar.list" not in await names(second)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 @pytest.mark.anyio

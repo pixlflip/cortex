@@ -360,6 +360,7 @@ def test_http_api_and_mcp_share_gateway_runtime_for_hot_registration(tmp_path: P
     assert srv.identity is not None
     assert srv.gateway_runtime is not None
     assert srv.api.gateway is srv.gateway_runtime
+    assert srv.mcp.settings.stateless_http is False
 
     row = srv.identity.mcp_servers.create(
         "calendar", url="https://calendar.example.com/mcp"
@@ -377,6 +378,27 @@ def test_http_api_and_mcp_share_gateway_runtime_for_hot_registration(tmp_path: P
     srv.api.gateway.sync_registration(row)
 
     assert srv.mcp._tool_manager.get_tool("calendar.list") is not None
+
+
+def test_lazy_mcp_client_key_is_transport_session_scoped(tmp_path: Path):
+    from mcp.server.lowlevel.server import request_ctx
+    from cortex.server import build_http_server
+
+    db = Database(tmp_path / "cortex.sqlite")
+    srv = build_http_server(_config(tmp_path, db.path))
+
+    class Session:
+        pass
+
+    first = Session()
+    second = Session()
+    token = request_ctx.set(SimpleNamespace(session=first))
+    try:
+        assert srv._get_mcp_client_key() is first
+        request_ctx.set(SimpleNamespace(session=second))
+        assert srv._get_mcp_client_key() is second
+    finally:
+        request_ctx.reset(token)
 
 
 def test_token_mint_resolve_revoke(identity: IdentityService, clock):
