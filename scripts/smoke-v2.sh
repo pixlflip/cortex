@@ -3,21 +3,16 @@ set -euo pipefail
 
 image="${1:-cortex:ci}"
 name="cortex-v2-smoke-${RANDOM}"
+volume="${name}-data"
 root="$(mktemp -d)"
 cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
+  docker volume rm -f "$volume" >/dev/null 2>&1 || true
   rm -rf "$root"
 }
 trap cleanup EXIT
 
-mkdir -p "$root/vault" "$root/data"
-# mktemp creates a 0700 directory owned by the host runner.  The image runs as
-# its unprivileged `cortex` user, so it must be able to traverse the bind mount.
-chmod 0755 "$root"
-# The host runner UID is unrelated to the image's unprivileged UID.  These are
-# disposable smoke-test mounts and must be writable by that container user.
-chmod 0777 "$root/vault" "$root/data"
-printf '# Smoke vault\n' >"$root/vault/Welcome.md"
+docker volume create "$volume" >/dev/null
 cat >"$root/cortex.yaml" <<'YAML'
 vault:
   path: /data/vault
@@ -41,14 +36,21 @@ gateway: { enabled: true, block_private_networks: true }
 llm: { provider: none }
 YAML
 
-run=(docker run --rm -v "$root:/data" "$image")
+# Use a named volume so Docker initializes /data with the image's real cortex
+# ownership. A host bind mount is owned by the runner and modern Git correctly
+# rejects it as a different owner's worktree inside the unprivileged container.
+mounts=(-v "$volume:/data" -v "$root/cortex.yaml:/data/cortex.yaml:ro")
+docker run --rm -v "$volume:/data" --entrypoint sh "$image" \
+  -c "printf '# Smoke vault\\n' > /data/vault/Welcome.md"
+run=(docker run --rm "${mounts[@]}" "$image")
 "${run[@]}" init >/dev/null
 "${run[@]}" user add smoke --password smoke-password >/dev/null
 token="$("${run[@]}" token mint smoke smoke-test | tail -n 1)"
-test -d "$root/data/vaults/smoke/.git"
+docker run --rm -v "$volume:/data" --entrypoint test "$image" \
+  -d /data/data/vaults/smoke/.git
 
 docker run -d --name "$name" -p 127.0.0.1:18765:8765 \
-  -v "$root:/data" "$image" serve >/dev/null
+  "${mounts[@]}" "$image" serve >/dev/null
 for _ in $(seq 1 30); do
   if curl -fsS http://127.0.0.1:18765/healthz >/dev/null; then break; fi
   sleep 1
