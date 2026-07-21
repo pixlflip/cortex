@@ -349,6 +349,36 @@ def _config(tmp_path: Path, db_path: Path) -> CortexConfig:
     )
 
 
+def test_http_api_and_mcp_share_gateway_runtime_for_hot_registration(tmp_path: Path):
+    from cortex.server import build_http_server
+
+    db = Database(tmp_path / "cortex.sqlite")
+    cfg = _config(tmp_path, db.path)
+    srv = build_http_server(cfg)
+
+    assert srv.api is not None
+    assert srv.identity is not None
+    assert srv.gateway_runtime is not None
+    assert srv.api.gateway is srv.gateway_runtime
+
+    row = srv.identity.mcp_servers.create(
+        "calendar", url="https://calendar.example.com/mcp"
+    )
+    row = srv.identity.mcp_servers.set_inventory(
+        row["id"],
+        [
+            {
+                "name": "list",
+                "description": "List events",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+    srv.api.gateway.sync_registration(row)
+
+    assert srv.mcp._tool_manager.get_tool("calendar.list") is not None
+
+
 def test_token_mint_resolve_revoke(identity: IdentityService, clock):
     identity.create_user("bob", password="pw")
     identity.create_group("staff", scopes=["Public/**"])
