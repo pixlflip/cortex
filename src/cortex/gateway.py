@@ -330,6 +330,10 @@ class GatewayRuntime:
         self._circuits: dict[int, CircuitState] = {}
         self._clients: dict[int, ClientPoolEntry] = {}
         self._stdio: dict[int, StdioPoolEntry] = {}
+        # Connection lifecycle operations are serialized per registration.  In
+        # particular, child shutdown must not happen while holding the global
+        # pool lock: the SDK may need several seconds to reap a stubborn child.
+        self._stdio_locks: dict[int, anyio.Lock] = {}
         self._client_lock = anyio.Lock()
         self._mcp: FastMCP | None = None
 
@@ -399,14 +403,18 @@ class GatewayRuntime:
         try:
             resolved_command = command.resolve(strict=True)
             allowed = {
-                Path(value).resolve(strict=True)
+                Path(value): Path(value).resolve(strict=True)
                 for value in self.config.gateway.stdio_allowed_executables
+                if Path(value).is_absolute()
             }
         except OSError as exc:
             raise GatewayError("stdio executable is missing") from exc
-        if resolved_command not in allowed:
+        # Both checks are intentional.  The lexical check requires the exact
+        # administrator-allowlisted launcher, while the canonical check keeps
+        # traversal or a changed symlink from escaping that allowlist.
+        if command not in allowed or resolved_command != allowed[command]:
             raise GatewayError("stdio executable is not exactly allowlisted")
-        if not resolved_command.is_file() or not os.access(resolved_command, os.X_OK):
+        if not command.is_file() or not os.access(command, os.X_OK):
             raise GatewayError("stdio executable must be a regular executable file")
         resolved_cwd = None
         if row.get("cwd"):
@@ -437,7 +445,7 @@ class GatewayRuntime:
             env[child_name] = os.environ[parent_name]
         material = json.dumps(
             {
-                "command": str(resolved_command),
+                "command": str(command),
                 "args": args,
                 "cwd": str(resolved_cwd) if resolved_cwd else None,
                 "env": sorted(env.items()),
@@ -446,7 +454,9 @@ class GatewayRuntime:
         )
         fingerprint = hashlib.sha256(material.encode()).hexdigest()
         return StdioServerParameters(
-            command=str(resolved_command), args=args, cwd=resolved_cwd, env=env
+            # Execute the allowlisted spelling.  Resolving a venv's python
+            # symlink here silently discards the venv's sys.path semantics.
+            command=str(command), args=args, cwd=resolved_cwd, env=env
         ), fingerprint
 
     async def _stdio_worker(self, parameters, queue, ready):
@@ -484,7 +494,8 @@ class GatewayRuntime:
 
     async def _stdio_entry(self, row: dict) -> StdioPoolEntry:
         parameters, fingerprint = self._stdio_parameters(row)
-        async with self._client_lock:
+        lifecycle = self._stdio_locks.setdefault(row["id"], anyio.Lock())
+        async with lifecycle:
             current = self._stdio.get(row["id"])
             if (
                 current
@@ -493,9 +504,9 @@ class GatewayRuntime:
             ):
                 return current
             if current:
-                current.queue.put_nowait(None)
-                with anyio.move_on_after(self.config.gateway.timeout_seconds):
-                    await current.task
+                await self._cleanup_stdio_entry(current)
+                if self._stdio.get(row["id"]) is current:
+                    self._stdio.pop(row["id"], None)
             queue = asyncio.Queue()
             ready = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(self._stdio_worker(parameters, queue, ready))
@@ -505,25 +516,41 @@ class GatewayRuntime:
                 with anyio.fail_after(self.config.gateway.timeout_seconds):
                     await ready
             except BaseException:
-                queue.put_nowait(None)
-                with anyio.move_on_after(self.config.gateway.timeout_seconds):
-                    await task
-                self._stdio.pop(row["id"], None)
+                await self._cleanup_stdio_entry(entry)
+                if self._stdio.get(row["id"]) is entry:
+                    self._stdio.pop(row["id"], None)
                 raise
             return entry
 
-    async def close_registration(self, server_id: int) -> None:
-        async with self._client_lock:
-            entry = self._stdio.pop(server_id, None)
-            http = self._clients.pop(server_id, None)
-        if http:
-            await http.client.aclose()
-        if entry:
+    async def _cleanup_stdio_entry(self, entry: StdioPoolEntry) -> None:
+        """Gracefully close and, if necessary, cancel and reap one SDK worker."""
+        if not entry.task.done():
             entry.queue.put_nowait(None)
             with anyio.move_on_after(self.config.gateway.timeout_seconds):
                 await entry.task
-            if not entry.task.done():
-                entry.task.cancel()
+        if not entry.task.done():
+            entry.task.cancel()
+        # Always retrieve the task result.  Cancellation drives stdio_client's
+        # bounded stdin-close/SIGTERM/SIGKILL/process-wait cleanup sequence.
+        try:
+            await entry.task
+        except asyncio.CancelledError:
+            pass
+        except BaseException:
+            pass
+
+    async def close_registration(self, server_id: int) -> None:
+        async with self._client_lock:
+            http = self._clients.pop(server_id, None)
+        if http:
+            await http.client.aclose()
+        lifecycle = self._stdio_locks.setdefault(server_id, anyio.Lock())
+        async with lifecycle:
+            entry = self._stdio.get(server_id)
+            if entry:
+                await self._cleanup_stdio_entry(entry)
+                if self._stdio.get(server_id) is entry:
+                    self._stdio.pop(server_id, None)
 
     async def aclose(self) -> None:
         """Close all lazy upstream pools (primarily for graceful shutdown/tests)."""
@@ -589,6 +616,11 @@ class GatewayRuntime:
                     await self.close_registration(row["id"])
                     await anyio.sleep(0.1)
         except Exception as exc:
+            if row["transport"] == "stdio-cmd":
+                # The final failed attempt may still have a healthy transport
+                # worker (for example, list_tools itself failed).  Never leave
+                # that child pooled behind a failed discovery.
+                await self.close_registration(row["id"])
             message = (
                 "local MCP server failed to start or respond"
                 if row["transport"] == "stdio-cmd"

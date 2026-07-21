@@ -49,5 +49,11 @@ def startup_args() -> list[str]:
     return sys.argv[1:]
 
 
+@mcp.tool()
+def python_prefix() -> str:
+    """Expose interpreter identity for the venv-launcher regression test."""
+    return sys.prefix
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
