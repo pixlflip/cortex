@@ -19,6 +19,36 @@ Permissions are glob rules over `<server>.<tool>` attached to users or groups.
 The global `writes.enabled` switch still removes Cortex mutation tools entirely.
 Configure rules under **Administration → Gateway → Permission matrix**.
 
+## Lazy discovery
+
+Cortex keeps upstream tool schemas out of the initial catalog. Built-in Cortex
+tools remain available, alongside three compact gateway tools:
+
+- `search_mcps(query="")` lists or searches only upstream namespaces with at
+  least one tool authorized for the current identity. Results contain namespace,
+  bounded description, and authorized tool count, but no tool schemas.
+- `peek_mcp(name)` returns authorized names such as `calendar.list_events` for
+  one visible namespace. It returns names only, without descriptions or
+  parameter schemas.
+- `load_mcp(name)` activates that namespace's currently authorized tools for
+  the current MCP transport session. Loads are cumulative within the session.
+
+After a successful load, Cortex sends the standard
+`notifications/tools/list_changed` notification. A subsequent standard
+`tools/list` returns the loaded tools as first-class MCP tools with their full
+schemas. Cortex advertises `tools.listChanged: true`, so no Cortex-specific
+client extension or generic invocation proxy is required.
+
+Load state belongs to the transport session, not the bearer token or identity.
+A second connection using the same credentials has an independent catalog, and
+a reconnect starts again from the compact baseline. Loading is not an
+authorization grant: policy is rechecked both when listing and on every call.
+
+Clients that ignore `notifications/tools/list_changed` must refresh their tool
+list manually or reconnect. Cortex can change future discovery responses, but
+it cannot remove schemas already copied into a client's model context or
+reclaim tokens that client already consumed.
+
 ## Register an upstream
 
 The admin panel accepts a namespace, Streamable HTTP URL, optional bearer-token

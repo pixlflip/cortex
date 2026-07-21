@@ -16,21 +16,24 @@ import json
 import os
 import re
 import socket
+import threading
 import time
-from pathlib import Path
 from dataclasses import dataclass
 from datetime import timedelta
 from fnmatch import fnmatchcase
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import urlparse
+from weakref import WeakKeyDictionary
 
 import anyio
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.lowlevel.server import NotificationOptions
 
 from .config import CortexConfig, Principal
 
@@ -279,19 +282,133 @@ class ToolGovernor:
         return result
 
 
+class LazyMcpCatalog:
+    """Policy-filtered external MCP discovery and per-client activation.
+
+    Cached upstream tools stay registered internally so FastMCP can preserve
+    their first-class schemas. The caller supplies a client-key getter because
+    transport sessions, not user identities, own load state.
+    """
+
+    def __init__(
+        self, config: CortexConfig, identity, principal_getter, client_key_getter
+    ):
+        self.identity = identity
+        self.principal_getter = principal_getter
+        self.client_key_getter = client_key_getter
+        self.permissions = PermissionResolver(config, identity)
+        self._loaded: WeakKeyDictionary[object, set[str]] = WeakKeyDictionary()
+
+    def _authorized_tools(self, row: dict) -> list[str]:
+        if not row.get("enabled"):
+            return []
+        principal = self.principal_getter()
+        names: list[str] = []
+        for inventory in json.loads(row.get("tools_json") or "[]"):
+            upstream = inventory.get("name")
+            if not isinstance(upstream, str) or not upstream:
+                continue
+            exposed = f"{row['name']}.{upstream}"
+            if self.permissions.allowed(principal, exposed):
+                names.append(exposed)
+        return sorted(set(names))
+
+    def _visible_row(self, name: str) -> tuple[dict, list[str]]:
+        row = self.identity.mcp_servers.get_by_name(name)
+        tools = self._authorized_tools(row) if row is not None else []
+        if row is None or not tools:
+            # Do not distinguish absent, disabled, and unauthorized MCPs.
+            raise ToolError("MCP not found or not available for this identity")
+        return row, tools
+
+    def search(self, query: str = "") -> list[dict]:
+        """Return compact metadata for MCP namespaces visible to this caller."""
+        needle = (query or "").strip().casefold()[:200]
+        results: list[dict] = []
+        for row in self.identity.mcp_servers.list():
+            tools = self._authorized_tools(row)
+            if not tools:
+                continue
+            name = str(row["name"])
+            description = _safe_upstream_text(row.get("description") or "", 300)
+            if (
+                needle
+                and needle not in name.casefold()
+                and needle not in description.casefold()
+            ):
+                continue
+            results.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "tool_count": len(tools),
+                }
+            )
+        return results[:100]
+
+    def peek(self, name: str) -> list[str]:
+        """Return authorized first-class tool names, never their schemas."""
+        _, tools = self._visible_row((name or "").strip())
+        return tools
+
+    def load(self, name: str) -> dict:
+        """Activate one authorized namespace for the current MCP client."""
+        row, tools = self._visible_row((name or "").strip())
+        self._loaded.setdefault(self.client_key_getter(), set()).add(row["name"])
+        return {"name": row["name"], "tool_count": len(tools), "loaded": True}
+
+    def is_loaded(self, server_name: str) -> bool:
+        return server_name in self._loaded.get(self.client_key_getter(), set())
+
+
 class GovernedFastMCP(FastMCP):
     """FastMCP variant whose advertised and callable surfaces share a guard."""
 
     governor: ToolGovernor | None = None
+    lazy_catalog: LazyMcpCatalog | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        create_options = self._mcp_server.create_initialization_options
+
+        def dynamic_initialization_options(
+            notification_options=None, experimental_capabilities=None
+        ):
+            options = notification_options or NotificationOptions()
+            options.tools_changed = bool(options.tools_changed or self.lazy_catalog)
+            return create_options(options, experimental_capabilities)
+
+        # FastMCP 1.x does not expose notification capabilities in its public
+        # constructor. Wrap the low-level option factory so every transport
+        # truthfully advertises the standard tools/list_changed support Cortex
+        # uses for lazy namespaces.
+        self._mcp_server.create_initialization_options = dynamic_initialization_options
 
     async def list_tools(self):
         tools = await super().list_tools()
         if self.governor is None:
-            return tools
-        allowed = self.governor.filter_names([tool.name for tool in tools])
-        return [tool for tool in tools if tool.name in allowed]
+            visible = tools
+        else:
+            allowed = self.governor.filter_names([tool.name for tool in tools])
+            visible = [tool for tool in tools if tool.name in allowed]
+        if self.lazy_catalog is None:
+            return visible
+        return [
+            tool
+            for tool in visible
+            if "." not in tool.name
+            or tool.name.startswith("cortex.")
+            or self.lazy_catalog.is_loaded(tool.name.split(".", 1)[0])
+        ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]):
+        if (
+            self.lazy_catalog is not None
+            and "." in name
+            and not name.startswith("cortex.")
+            and not self.lazy_catalog.is_loaded(name.split(".", 1)[0])
+        ):
+            raise ToolError("MCP namespace is not loaded for this client")
         if self.governor is None:
             return await super().call_tool(name, arguments)
 
@@ -658,6 +775,37 @@ class GatewayRuntime:
         state.failures = 0
         state.opened_at = None
         return result.model_dump(mode="json", exclude_none=True)
+
+    def register_discovery_tools(
+        self, mcp: FastMCP, catalog: LazyMcpCatalog
+    ) -> None:
+        """Register Cortex's compact, portable lazy-discovery surface."""
+
+        @mcp.tool()
+        def search_mcps(query: str = "") -> list[dict]:
+            """List or search MCP namespaces available to this identity.
+
+            Returns compact names, descriptions, and authorized tool counts.
+            Pass an empty query to list every visible MCP namespace.
+            """
+            return catalog.search(query)
+
+        @mcp.tool()
+        def peek_mcp(name: str) -> list[str]:
+            """Preview authorized tool names in one MCP without loading schemas."""
+            return catalog.peek(name)
+
+        @mcp.tool()
+        async def load_mcp(name: str, ctx: Context) -> dict:
+            """Load one MCP's authorized tools into this client's tool catalog.
+
+            The tools become available as ordinary first-class MCP tools after
+            the client handles the standard tools/list_changed notification and
+            refreshes tools/list.
+            """
+            result = catalog.load(name)
+            await ctx.request_context.session.send_tool_list_changed()
+            return result
 
     def register_cached_tools(self, mcp: FastMCP) -> None:
         """Register cached upstream schemas as namespaced FastMCP tools."""
