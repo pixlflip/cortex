@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sys
+import sysconfig
 import threading
 import time
 import venv
@@ -408,6 +409,15 @@ async def test_stdio_executes_allowlisted_venv_launcher_without_resolving_it(
     environment = tmp_path / "dedicated"
     venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
     python = environment / "bin" / "python"
+    child_purelib = (
+        environment
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    (child_purelib / "parent-venv.pth").write_text(
+        f"{sysconfig.get_path('purelib')}\n"
+    )
     fixture = Path(__file__).parent / "fixtures" / "stdio_mcp_server.py"
     marker = tmp_path / "venv-markers"
     monkeypatch.setenv("STDIO_MARKER_PARENT", str(marker))

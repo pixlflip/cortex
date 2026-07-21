@@ -30,7 +30,7 @@ database: { path: /data/data/cortex.sqlite }
 index: { path: /data/data/main.index.sqlite }
 principals: []
 auth: { enabled: true, oauth_enabled: false }
-admin: { enabled: true, path: /data/cortex.admin.json }
+admin: { enabled: true, path: /data/data/cortex.admin.json }
 server:
   transport: http
   host: 0.0.0.0
