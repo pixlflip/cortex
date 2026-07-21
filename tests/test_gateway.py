@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from mcp import ClientSession, types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
@@ -292,6 +293,15 @@ def test_lazy_catalog_search_peek_and_policy_filtering(identity):
     assert catalog.peek("calendar") == ["calendar.list"]
     with pytest.raises(ToolError, match="not available"):
         catalog.peek("mail")
+    with pytest.raises(ToolError, match="not available"):
+        catalog.load("mail")
+    with pytest.raises(ToolError, match="not available"):
+        catalog.load("missing")
+
+    identity.mcp_servers.update(calendar["id"], enabled=False)
+    assert catalog.search() == []
+    with pytest.raises(ToolError, match="not available"):
+        catalog.load("calendar")
 
 
 @pytest.mark.anyio
@@ -450,10 +460,9 @@ async def test_streamable_http_load_refresh_is_standard_and_session_scoped(ident
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
-    for _ in range(100):
-        if server.started:
-            break
-        time.sleep(0.01)
+    deadline = time.monotonic() + 5
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        await anyio.sleep(0.01)
     assert server.started
 
     async def names(session: ClientSession) -> dict[str, mcp_types.Tool]:
