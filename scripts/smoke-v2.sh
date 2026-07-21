@@ -11,6 +11,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$root/vault" "$root/data"
+# mktemp creates a 0700 directory owned by the host runner.  The image runs as
+# its unprivileged `cortex` user, so it must be able to traverse the bind mount.
+chmod 0755 "$root"
+# The host runner UID is unrelated to the image's unprivileged UID.  These are
+# disposable smoke-test mounts and must be writable by that container user.
+chmod 0777 "$root/vault" "$root/data"
 printf '# Smoke vault\n' >"$root/vault/Welcome.md"
 cat >"$root/cortex.yaml" <<'YAML'
 vault:
@@ -57,4 +63,3 @@ curl -fsS -X POST http://127.0.0.1:18765/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cortex-smoke","version":"1"}}}' \
   | grep -q '"result"'
 echo "Cortex v2 image smoke test passed"
-

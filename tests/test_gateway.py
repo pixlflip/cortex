@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import sys
 import threading
 import time
+import venv
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,17 @@ from cortex.gateway import (
     validate_outbound_url,
 )
 from cortex.users import IdentityService
+
+
+@pytest.fixture
+def stdio_executable(tmp_path: Path) -> Path:
+    """Make the MCP fixture use the interpreter that installed the test deps."""
+    source = Path(__file__).parent / "fixtures" / "stdio_mcp_server.py"
+    executable = tmp_path / "stdio-mcp-fixture"
+    lines = source.read_text().splitlines(keepends=True)
+    executable.write_text(f"#!{sys.executable}\n" + "".join(lines[1:]))
+    executable.chmod(0o755)
+    return executable
 
 
 @pytest.fixture
@@ -213,7 +227,7 @@ def test_cached_tools_are_hot_replaced_and_removed(identity):
     assert mcp._tool_manager.get_tool("calendar.create") is None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_governor_rechecks_calls_and_audits_shape_without_values(identity):
     cfg = CortexConfig()
     principal = identity.principal_for_username("alice")
@@ -239,7 +253,7 @@ async def test_governor_rechecks_calls_and_audits_shape_without_values(identity)
     assert secret not in json.dumps(denied)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_upstream_http_pool_is_lazy_reused_and_rotates_secrets(
     identity, monkeypatch
 ):
@@ -265,7 +279,7 @@ async def test_upstream_http_pool_is_lazy_reused_and_rotates_secrets(
     assert rotated.is_closed is True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_fake_streamable_http_upstream_discovery_and_call(identity):
     upstream = FastMCP("fake-upstream")
 
@@ -338,9 +352,9 @@ async def test_fake_streamable_http_upstream_discovery_and_call(identity):
 
 @pytest.mark.anyio
 async def test_persistent_stdio_discovery_call_environment_and_close(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, stdio_executable
 ):
-    fixture = Path(__file__).parent / "fixtures" / "stdio_mcp_server.py"
+    fixture = stdio_executable
     marker = tmp_path / "starts"
     monkeypatch.setenv("STDIO_MARKER_PARENT", str(marker))
     monkeypatch.setenv("UNRELATED_CORTEX_SECRET", "must-not-reach-child")
@@ -385,6 +399,46 @@ async def test_persistent_stdio_discovery_call_environment_and_close(
     assert marker.read_text().count("start:") == 1
     await runtime.aclose()
     assert marker.read_text().count("stop:") == 1
+
+
+@pytest.mark.anyio
+async def test_stdio_executes_allowlisted_venv_launcher_without_resolving_it(
+    tmp_path, monkeypatch
+):
+    environment = tmp_path / "dedicated"
+    venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
+    python = environment / "bin" / "python"
+    fixture = Path(__file__).parent / "fixtures" / "stdio_mcp_server.py"
+    marker = tmp_path / "venv-markers"
+    monkeypatch.setenv("STDIO_MARKER_PARENT", str(marker))
+    config = CortexConfig()
+    config.gateway = GatewayConfig(
+        allow_stdio_servers=True,
+        stdio_allowed_executables=[str(python)],
+        stdio_allowed_workdirs=[str(tmp_path)],
+        timeout_seconds=5,
+    )
+    identity = IdentityService(Database(tmp_path / "venv.sqlite"))
+    row = identity.mcp_servers.create(
+        "venvfixture",
+        transport="stdio-cmd",
+        command=str(python),
+        args=[str(fixture)],
+        cwd=str(tmp_path),
+        env_refs={"FIXTURE_MARKER": "STDIO_MARKER_PARENT"},
+        enabled=False,
+    )
+    runtime = GatewayRuntime(config, identity)
+    try:
+        await runtime.discover(row)
+        refreshed = identity.mcp_servers.get(row["id"])
+        result = await runtime.call(refreshed, "python_prefix", {})
+        assert result["content"][0]["text"] == str(environment)
+    finally:
+        await runtime.aclose()
+    pid = int(marker.read_text().split("start:", 1)[1].splitlines()[0])
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_stdio_repository_transport_invariants(tmp_path):
