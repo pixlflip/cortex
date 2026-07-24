@@ -17,7 +17,9 @@ from pydantic import AnyUrl
 
 from cortex.auth import AuthError, Authenticator
 from cortex.config import CortexConfig, Principal, VaultConfig
+from cortex.db import Database
 from cortex.oauth import CortexOAuthProvider
+from cortex.users import IdentityService
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 
@@ -117,3 +119,33 @@ def test_consent_rejects_bad_token(provider: CortexOAuthProvider):
     txn = url.split("txn=")[1]
     with pytest.raises(AuthError):
         provider.complete_consent(txn, "wrong-token")
+
+
+def test_oauth_user_delegation_preserves_scope_narrowing_and_revocation(tmp_path: Path):
+    db = Database(tmp_path / "cortex.sqlite")
+    identity = IdentityService(db)
+    identity.create_user("alice")
+    identity.create_group("readers", scopes=["Shared/**"])
+    identity.add_to_group("alice", "readers")
+    created = identity.mint_token(
+        "alice", "chatgpt", scopes=["Shared/Narrow/**"]
+    )
+    cfg = CortexConfig(vault=VaultConfig(path=tmp_path / "vault"))
+    delegated = CortexOAuthProvider(
+        Authenticator(cfg, user_service=identity), "https://cortex.example.com"
+    )
+    client = _client()
+    asyncio.run(delegated.register_client(client))
+    txn = asyncio.run(delegated.authorize(client, _params())).split("txn=")[1]
+    redirect = delegated.complete_consent(txn, created.token)
+    code = redirect.split("code=")[1].split("&")[0]
+    loaded = asyncio.run(delegated.load_authorization_code(client, code))
+    issued = asyncio.run(delegated.exchange_authorization_code(client, loaded))
+
+    principal, subject = delegated.resolve_delegated_principal(issued.access_token)
+    assert subject == "user:alice"
+    assert principal.name == "alice"
+    assert principal.scopes == ["Shared/Narrow/**"]
+
+    identity.revoke_token("alice", "chatgpt")
+    assert delegated.resolve_delegated_principal(issued.access_token) is None

@@ -192,6 +192,7 @@ class CortexServer:
         # IdentityService (cortex.users) over the SQLite identity DB, when it
         # exists — the store behind `user:` subjects. None for pure-v1 setups.
         self.identity = identity
+        self.oauth_provider = http.oauth_provider if http is not None else None
         self.vault_manager = (
             identity.vault_manager
             if identity is not None and identity.vault_manager is not None
@@ -316,12 +317,22 @@ class CortexServer:
                 if self.identity is not None
                 else None
             )
+            # OAuth access tokens are not themselves user API tokens. Resolve
+            # the source credential bound at consent through the provider so
+            # its scope narrowing/revocation/expiry remains live.
+            if resolved is None and self.oauth_provider is not None:
+                resolved = self.oauth_provider.resolve_delegated_principal(
+                    getattr(token, "token", "")
+                )
             principal = None
             if resolved is not None:
-                candidate, username = resolved
+                candidate, resolved_subject = resolved
                 # Defense in depth: the token must still belong to the
                 # subject it originally authenticated as.
-                if f"{USER_SUBJECT_PREFIX}{username}" == subject:
+                if (
+                    resolved_subject == subject
+                    or f"{USER_SUBJECT_PREFIX}{resolved_subject}" == subject
+                ):
                     principal = candidate
         elif subject.startswith(ADMIN_SUBJECT_PREFIX):
             principal = (
