@@ -1216,10 +1216,13 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     if config.auth.oauth_enabled:
         from .oauth import CortexOAuthProvider
 
-        provider = CortexOAuthProvider(authn, base)
+        provider = CortexOAuthProvider(
+            authn, base, config.vault.path.parent.parent / "oauth-clients.json"
+        )
+        resource_url = base.rstrip(chr(47)) + sc.path
         auth_settings = AuthSettings(
             issuer_url=base,
-            resource_server_url=base,
+            resource_server_url=resource_url,
             required_scopes=[],
             client_registration_options=ClientRegistrationOptions(enabled=True),
             revocation_options=RevocationOptions(enabled=True),

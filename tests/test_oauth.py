@@ -63,6 +63,26 @@ def test_register_and_get_client(provider: CortexOAuthProvider):
     assert asyncio.run(provider.get_client("nope")) is None
 
 
+def test_registered_client_survives_provider_restart(tmp_path: Path):
+    (tmp_path / "vault").mkdir()
+    cfg = CortexConfig(
+        vault=VaultConfig(path=tmp_path / "vault"),
+        principals=[Principal(name="web", scopes=["Public/**"], token="tok-web")],
+    )
+    store = tmp_path / "oauth-clients.json"
+    first = CortexOAuthProvider(
+        Authenticator(cfg), "https://cortex.example.com", store
+    )
+    asyncio.run(first.register_client(_client()))
+
+    restarted = CortexOAuthProvider(
+        Authenticator(cfg), "https://cortex.example.com", store
+    )
+    loaded = asyncio.run(restarted.get_client("client-1"))
+    assert loaded is not None and loaded.client_name == "Test App"
+    assert store.stat().st_mode & 0o777 == 0o600
+
+
 def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
     client = _client()
     asyncio.run(provider.register_client(client))

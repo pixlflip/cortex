@@ -23,8 +23,11 @@ restart (clients simply re-authorize). Persisting them is a future enhancement.
 from __future__ import annotations
 
 import html
+import json
+import os
 import secrets
 import time
+from pathlib import Path
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -73,10 +76,16 @@ principal is scoped to.</p>
 class CortexOAuthProvider:
     """Minimal OAuth 2.1 authorization server backed by Cortex principals."""
 
-    def __init__(self, authenticator: Authenticator, base_url: str):
+    def __init__(
+        self,
+        authenticator: Authenticator,
+        base_url: str,
+        client_store_path: Path | None = None,
+    ):
         self._auth = authenticator
         self.base = base_url.rstrip("/")
-        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._client_store_path = client_store_path
+        self._clients = self._load_clients()
         self._codes: dict[str, AuthorizationCode] = {}
         self._access: dict[str, AccessToken] = {}
         self._refresh: dict[str, RefreshToken] = {}
@@ -97,6 +106,43 @@ class CortexOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
+        self._persist_clients()
+
+    def _load_clients(self) -> dict[str, OAuthClientInformationFull]:
+        """Load DCR clients so reconnecting clients survive service restarts.
+
+        OAuth codes and tokens deliberately remain ephemeral, but remote MCP
+        clients such as ChatGPT retain their dynamically registered client ID
+        and will not repeat DCR after a server restart.
+        """
+        if self._client_store_path is None or not self._client_store_path.exists():
+            return {}
+        try:
+            raw = json.loads(self._client_store_path.read_text())
+            clients = {
+                item["client_id"]: OAuthClientInformationFull.model_validate(item)
+                for item in raw
+            }
+        except (OSError, ValueError, TypeError, KeyError):
+            # A corrupt cache must not prevent Cortex from starting. Existing
+            # clients can register again; operators retain the file for repair.
+            return {}
+        return clients
+
+    def _persist_clients(self) -> None:
+        if self._client_store_path is None:
+            return
+        self._client_store_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = [client.model_dump(mode="json") for client in self._clients.values()]
+        temp_path = self._client_store_path.with_suffix(
+            self._client_store_path.suffix + ".tmp"
+        )
+        try:
+            temp_path.write_text(json.dumps(encoded, separators=(",", ":")))
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self._client_store_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     # -- authorization code flow ------------------------------------------
 
