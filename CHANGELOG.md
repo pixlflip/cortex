@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added scoped `list_files` and chunked `get_file` MCP tools for binary vault
+  attachments, plus write-gated, atomic, git-audited `put_file` uploads with
+  overwrite protection, size limits, and optional SHA-256 verification.
+- Reject symlink components from vault operations so an in-vault symlink cannot
+  cross a principal's path scope.
+- Constrained Cortex to the compatible MCP 1.x SDK, declared its direct HTTPX
+  dependency, and restored fail-closed production dependency auditing with one
+  explicit exception for unused React Router server-component code.
+
 ## 0.2.0 — Cortex v2
 
 - Added local/LDAP users, groups, sessions, revocable user tokens, and the

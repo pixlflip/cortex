@@ -98,8 +98,10 @@ with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
 | `discover_scopes` | What can I (this principal) see? |
 | `status` | Freshness signal: git HEAD/commit time, last index refresh, visible note count |
 | `list_notes` | List visible note paths |
+| `list_files` | List visible vault files, including binary attachments |
 | `search` | Substring/regex search over visible notes |
 | `read_note` | Read a full note (scope-checked) |
+| `get_file` | Pull a scoped file in bounded, binary-safe base64 chunks |
 | `read_frontmatter` | Read a note's YAML frontmatter |
 | `read_section` | Read one section by heading |
 | `context_pack` | Compact, budgeted bundle for a query |
@@ -118,6 +120,7 @@ commit (always `git revert`-able):
 | Tool (gated by `writes.enabled`) | What it does |
 |---|---|
 | `write_note` | Create a note (or replace one, only with `overwrite=True`) |
+| `put_file` | Atomically upload a scoped binary attachment from base64 (8 MiB maximum) |
 | `patch_note` | Replace a single unique string in an existing note |
 | `append_note` | Append text to an existing note |
 | `update_frontmatter` | Merge a patch into a note's YAML frontmatter |
