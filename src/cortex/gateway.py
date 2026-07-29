@@ -42,6 +42,7 @@ _SERVER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _WRITE_TOOLS = {
+    "cortex.put_file",
     "cortex.write_note",
     "cortex.patch_note",
     "cortex.append_note",

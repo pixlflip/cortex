@@ -54,7 +54,7 @@ def test_token_verifier_maps_principal(vault: Path):
     cfg = _http_config(vault)
     v = CortexTokenVerifier(Authenticator(cfg))
     good = asyncio.run(v.verify_token("tok-web"))
-    assert good is not None and good.subject == "web"
+    assert good is not None and good.client_id == "web"
     assert asyncio.run(v.verify_token("bogus")) is None
     assert asyncio.run(v.verify_token("")) is None
 
@@ -79,7 +79,7 @@ def test_get_principal_resolves_from_token(monkeypatch, vault: Path):
     import cortex.server as server_mod
 
     # Simulate the bearer middleware having stashed the verified token.
-    monkeypatch.setattr(server_mod, "get_access_token", lambda: SimpleNamespace(subject="web"))
+    monkeypatch.setattr(server_mod, "get_access_token", lambda: SimpleNamespace(client_id="web"))
     p = srv._get_principal()
     assert p.name == "web" and p.scopes == ["Public/**"]
 
@@ -88,7 +88,7 @@ def test_get_principal_unknown_subject_raises(monkeypatch, vault: Path):
     srv = build_http_server(_http_config(vault))
     import cortex.server as server_mod
 
-    monkeypatch.setattr(server_mod, "get_access_token", lambda: SimpleNamespace(subject="ghost"))
+    monkeypatch.setattr(server_mod, "get_access_token", lambda: SimpleNamespace(client_id="ghost"))
     with pytest.raises(ValueError, match="unknown principal"):
         srv._get_principal()
 

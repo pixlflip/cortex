@@ -20,7 +20,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+import base64
+import binascii
+import hashlib
 import logging
+import mimetypes
+from pathlib import Path
 
 import anyio
 import yaml
@@ -50,14 +55,25 @@ from .gateway import (
     LazyMcpCatalog,
     ToolGovernor,
 )
-
-_LOG = logging.getLogger("cortex.janitor")
 from .llm import LLMError, build_provider
 from .scopes import filter_paths, path_allowed
 from .search_index import IndexHit, SearchIndex
 from .serialization import normalize_json
-from .vault import VaultError, VaultStore, _FRONTMATTER_RE, canonical_note_path
+from .vault import (
+    NOTE_SUFFIXES,
+    VaultError,
+    VaultStore,
+    _FRONTMATTER_RE,
+    canonical_asset_path,
+    canonical_note_path,
+)
 from .vaults import MAIN_VAULT_ID, VaultBundle, VaultManager
+
+
+_LOG = logging.getLogger("cortex.janitor")
+
+MAX_FILE_CHUNK_BYTES = 1024 * 1024
+MAX_FILE_WRITE_BYTES = 8 * 1024 * 1024
 
 
 def _canonical_note_path(path: str) -> str | None:
@@ -125,17 +141,17 @@ class CortexTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
-            principal, subject = self._auth.resolve_token(token)
+            _principal, subject = self._auth.resolve_token(token)
         except AuthError:
             return None
         return AccessToken(
             token=token,
-            client_id=principal.name,
+            # The SDK's AccessToken model has no separate subject field. Keep
+            # the namespaced Cortex identity in client_id so request-time
+            # resolution can distinguish config, admin-client, and DB-user
+            # identities without relying on ignored Pydantic extras.
+            client_id=subject,
             scopes=[],
-            # Namespaced for admin-store clients (client:<name>) so the
-            # per-call principal resolution consults the same store that
-            # authenticated the token (#9).
-            subject=subject,
             expires_at=None,
         )
 
@@ -283,8 +299,10 @@ class CortexServer:
         token = get_access_token()
         if token is None:
             raise ValueError("unauthenticated")
-        subject = token.subject or ""
-        # Resolve against exactly the store that authenticated the token —
+        subject = token.client_id or ""
+        # Cortex stores the namespaced authenticated identity in AccessToken's
+        # client_id because the supported MCP 1.x SDK model has no subject
+        # field. Resolve against exactly the store that authenticated the token —
         # never fall through from one to the other. An admin client or DB
         # user named like a config principal must not inherit that
         # principal's scopes, and vice versa (#9, generalized).
@@ -367,6 +385,23 @@ class CortexServer:
             # Same non-leaking wording as _require_visible: don't distinguish
             # "absent" from "not in scope".
             raise ValueError(f"not found or not in scope: {path}")
+        return norm
+
+    @staticmethod
+    def _require_visible_file(principal: Principal, path: str) -> str:
+        """Canonicalize an arbitrary vault file and enforce read scope."""
+        norm = canonical_asset_path(path)
+        if norm is None or not path_allowed(norm, principal.scopes):
+            raise ValueError(f"file not found or not in scope: {path}")
+        return norm
+
+    @staticmethod
+    def _require_writable_file(principal: Principal, path: str) -> str:
+        """Canonicalize an arbitrary vault file and enforce write scope."""
+        norm = canonical_asset_path(path)
+        scopes = principal.write_scopes or principal.scopes
+        if norm is None or not path_allowed(norm, scopes):
+            raise ValueError(f"file not found or not in scope: {path}")
         return norm
 
     def _status_payload(
@@ -622,6 +657,83 @@ class CortexServer:
             "commit": sha,
         }
 
+    @staticmethod
+    def _file_metadata(store: VaultStore, path: str, *, include_sha256: bool) -> dict:
+        try:
+            resolved = store._resolve(path)
+            if not resolved.is_file():
+                raise VaultError(f"file not found: {path}")
+            stat = resolved.stat()
+            digest = None
+            if include_sha256:
+                hasher = hashlib.sha256()
+                with resolved.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        hasher.update(block)
+                digest = hasher.hexdigest()
+        except (OSError, VaultError) as exc:
+            raise ValueError(f"file not found or not in scope: {path}") from exc
+        return {
+            "path": path,
+            "size": stat.st_size,
+            "media_type": mimetypes.guess_type(path)[0] or "application/octet-stream",
+            "sha256": digest,
+        }
+
+    def _do_put_file(
+        self,
+        principal: Principal,
+        path: str,
+        content_base64: str,
+        reason: str,
+        *,
+        overwrite: bool = False,
+        expected_sha256: str | None = None,
+        bundle: VaultBundle | None = None,
+    ) -> dict:
+        path = self._require_writable_file(principal, path)
+        if Path(path).suffix.lower() in NOTE_SUFFIXES:
+            raise ValueError("Markdown files must be written with write_note")
+        if len(content_base64) > ((MAX_FILE_WRITE_BYTES + 2) // 3) * 4:
+            raise ValueError(
+                f"file exceeds the {MAX_FILE_WRITE_BYTES}-byte put_file limit"
+            )
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("content_base64 must be valid RFC 4648 base64") from exc
+        if len(content) > MAX_FILE_WRITE_BYTES:
+            raise ValueError(
+                f"file exceeds the {MAX_FILE_WRITE_BYTES}-byte put_file limit"
+            )
+        digest = hashlib.sha256(content).hexdigest()
+        if expected_sha256 is not None and digest != expected_sha256.strip().lower():
+            raise ValueError("sha256 mismatch; file was not written")
+        store = bundle.store if bundle is not None else self.vault
+        try:
+            target = store._resolve(path)
+        except VaultError as exc:
+            raise ValueError(f"file not found or not in scope: {path}") from exc
+        if target.exists() and not target.is_file():
+            raise ValueError(f"destination is not a file: {path}")
+        existed = target.is_file()
+        if existed and not overwrite:
+            raise ValueError(f"file already exists (pass overwrite=True to replace): {path}")
+        try:
+            store.write_bytes(path, content)
+        except (OSError, VaultError) as exc:
+            raise ValueError(f"file could not be written: {path}") from exc
+        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
+        return {
+            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+            "path": path,
+            "created": not existed,
+            "size": len(content),
+            "media_type": mimetypes.guess_type(path)[0] or "application/octet-stream",
+            "sha256": digest,
+            "commit": sha,
+        }
+
     # -- tools -------------------------------------------------------------
 
     def _register(self) -> None:
@@ -679,6 +791,72 @@ class CortexServer:
             p = self._get_principal()
             bundle, scoped = self._select_vault(p, vault)
             return filter_paths(bundle.store.list_notes(), scoped.scopes)
+
+        @mcp.tool()
+        def list_files(limit: int = 200, vault: str | None = None) -> list[dict]:
+            """List visible vault files, including binary attachments.
+
+            Hidden files, symlinks, and out-of-scope paths are never returned.
+            Results contain path, byte size, and inferred media type but no file
+            content or digest. Use get_file to download a bounded base64 chunk.
+            """
+            p = self._get_principal()
+            bundle, scoped = self._select_vault(p, vault)
+            capped = max(1, min(limit, 500))
+            paths = filter_paths(bundle.store.list_files(), scoped.scopes)[:capped]
+            return [
+                {
+                    key: value
+                    for key, value in self._file_metadata(
+                        bundle.store, path, include_sha256=False
+                    ).items()
+                    if key != "sha256"
+                }
+                for path in paths
+            ]
+
+        @mcp.tool()
+        def get_file(
+            path: str,
+            offset: int = 0,
+            length: int = 262144,
+            include_sha256: bool = True,
+            vault: str | None = None,
+        ) -> dict:
+            """Download one visible vault file as a bounded base64 chunk.
+
+            ``offset`` is a zero-based byte offset and ``length`` is capped at
+            1 MiB, allowing large attachments to be pulled over repeated calls.
+            The response reports total size, returned range, EOF, media type,
+            and (by default) the SHA-256 of the complete file. Paths are
+            canonicalized, hidden/symlink paths are rejected, and read scopes
+            are enforced before any bytes are opened.
+            """
+            p = self._get_principal()
+            bundle, scoped = self._select_vault(p, vault)
+            path = self._require_visible_file(scoped, path)
+            if offset < 0:
+                raise ValueError("offset must be non-negative")
+            if length < 1:
+                raise ValueError("length must be at least 1")
+            capped = min(length, MAX_FILE_CHUNK_BYTES)
+            metadata = self._file_metadata(
+                bundle.store, path, include_sha256=include_sha256
+            )
+            try:
+                content = bundle.store.read_bytes(path, offset=offset, length=capped)
+            except VaultError as exc:
+                raise ValueError(f"file not found or not in scope: {path}") from exc
+            returned = len(content)
+            return {
+                "vault": bundle.vault_id,
+                **metadata,
+                "offset": offset,
+                "length": returned,
+                "next_offset": offset + returned,
+                "eof": offset + returned >= metadata["size"],
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
 
         @mcp.tool()
         def search(
@@ -827,6 +1005,37 @@ class CortexServer:
         # before the search index is refreshed. All real logic lives in the
         # `_do_*` methods above so it's unit-testable without MCP plumbing.
         if self.config.writes.enabled:
+
+            @mcp.tool()
+            def put_file(
+                path: str,
+                content_base64: str,
+                reason: str,
+                overwrite: bool = False,
+                expected_sha256: str | None = None,
+                vault: str | None = None,
+            ) -> dict:
+                """Upload one binary vault attachment from RFC 4648 base64.
+
+                The decoded file is limited to 8 MiB, written atomically, and
+                refuses an existing destination unless overwrite=True. If
+                expected_sha256 is supplied, a mismatch aborts before writing.
+                Hidden paths and symlinks are rejected, write scopes are
+                enforced, and success creates exactly one revertible git commit.
+                Markdown remains governed by write_note and is rejected here.
+                ``reason`` is required for the audit trail.
+                """
+                p = self._get_principal()
+                bundle, p = self._select_vault(p, vault, write=True)
+                return self._do_put_file(
+                    p,
+                    path,
+                    content_base64,
+                    reason,
+                    overwrite=overwrite,
+                    expected_sha256=expected_sha256,
+                    bundle=bundle,
+                )
 
             @mcp.tool()
             def write_note(

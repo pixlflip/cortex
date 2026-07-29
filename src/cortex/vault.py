@@ -122,8 +122,20 @@ class VaultStore:
     # -- path handling -----------------------------------------------------
 
     def _resolve(self, rel_path: str) -> Path:
-        """Resolve a vault-relative path, rejecting traversal outside the root."""
-        candidate = (self.root / rel_path).resolve()
+        """Resolve a vault-relative path, rejecting traversal and symlinks.
+
+        A symlink that stays inside the vault can still cross an authorization
+        boundary (for example ``Public/link -> Private/secret``). Scope checks
+        happen against the caller-supplied canonical path, so every symlink
+        component is rejected rather than resolved to a different scoped path.
+        """
+        unresolved = self.root / rel_path
+        current = self.root
+        for part in Path(rel_path).parts:
+            current = current / part
+            if current.is_symlink():
+                raise VaultError(f"symlink paths are not allowed: {rel_path!r}")
+        candidate = unresolved.resolve()
         try:
             candidate.relative_to(self.root)
         except ValueError as exc:
@@ -156,6 +168,24 @@ class VaultStore:
     def list_notes(self) -> list[str]:
         return list(self.iter_notes())
 
+    def iter_files(self) -> Iterator[str]:
+        """Yield every non-hidden regular file addressable through Cortex.
+
+        Unlike :meth:`iter_notes`, this includes binary Obsidian attachments.
+        Hidden files/directories and symlinks are excluded so listing obeys the
+        same address-space rules as ``canonical_asset_path`` and ``_resolve``.
+        """
+        for p in sorted(self.root.rglob("*")):
+            if p.is_symlink() or not p.is_file():
+                continue
+            rel = p.relative_to(self.root)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            yield rel.as_posix()
+
+    def list_files(self) -> list[str]:
+        return list(self.iter_files())
+
     # -- reading -----------------------------------------------------------
 
     def read_text(self, rel_path: str) -> str:
@@ -163,6 +193,19 @@ class VaultStore:
         if not path.is_file():
             raise VaultError(f"note not found: {rel_path}")
         return path.read_text(encoding="utf-8", errors="replace")
+
+    def read_bytes(
+        self, rel_path: str, *, offset: int = 0, length: int | None = None
+    ) -> bytes:
+        """Read a bounded byte range from one regular, non-symlink vault file."""
+        if offset < 0 or (length is not None and length < 0):
+            raise VaultError("offset and length must be non-negative")
+        path = self._resolve(rel_path)
+        if not path.is_file():
+            raise VaultError(f"file not found: {rel_path}")
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read() if length is None else handle.read(length)
 
     def read_note(self, rel_path: str) -> Note:
         text = self.read_text(rel_path)
@@ -255,6 +298,19 @@ class VaultStore:
         tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
         try:
             tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return path
+
+    def write_bytes(self, rel_path: str, content: bytes) -> Path:
+        """Atomically write arbitrary bytes to one vault-relative file."""
+        path = self._resolve(rel_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+        try:
+            tmp.write_bytes(content)
             os.replace(tmp, path)
         finally:
             if tmp.exists():

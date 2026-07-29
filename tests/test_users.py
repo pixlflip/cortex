@@ -516,13 +516,13 @@ def test_get_principal_resolves_user_subject(tmp_path: Path, monkeypatch):
             created.token
         )
     )
-    assert verified is not None and verified.subject == "user:bob"
+    assert verified is not None and verified.client_id == "user:bob"
 
     # _get_principal re-resolves the raw token against the user store.
     monkeypatch.setattr(
         server_mod,
         "get_access_token",
-        lambda: SimpleNamespace(subject="user:bob", token=created.token),
+        lambda: SimpleNamespace(client_id="user:bob", token=created.token),
     )
     p = srv._get_principal()
     assert p.name == "bob" and p.scopes == ["Public/**"]
@@ -549,13 +549,13 @@ def test_user_subject_never_falls_through_to_config_store(
     monkeypatch.setattr(
         server_mod,
         "get_access_token",
-        lambda: SimpleNamespace(subject="user:web", token="tok-web"),
+        lambda: SimpleNamespace(client_id="user:web", token="tok-web"),
     )
     with pytest.raises(ValueError, match="unknown principal"):
         srv._get_principal()
 
     monkeypatch.setattr(
-        server_mod, "get_access_token", lambda: SimpleNamespace(subject="web")
+        server_mod, "get_access_token", lambda: SimpleNamespace(client_id="web")
     )
     assert srv._get_principal().scopes == ["Public/**"]
 
@@ -576,7 +576,7 @@ def test_narrowed_token_scopes_apply_per_call(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         server_mod,
         "get_access_token",
-        lambda: SimpleNamespace(subject="user:bob", token=narrowed.token),
+        lambda: SimpleNamespace(client_id="user:bob", token=narrowed.token),
     )
     assert srv._get_principal().scopes == ["Public/**"]
 

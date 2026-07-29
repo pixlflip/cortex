@@ -363,9 +363,9 @@ def test_admin_client_subject_is_namespaced(tmp_path: Path, vault: Path):
     v = CortexTokenVerifier(Authenticator(cfg, admin_store=store))
 
     admin_at = asyncio.run(v.verify_token(token))
-    assert admin_at is not None and admin_at.subject == "client:bot"
+    assert admin_at is not None and admin_at.client_id == "client:bot"
     config_at = asyncio.run(v.verify_token("tok-alice"))
-    assert config_at is not None and config_at.subject == "alice"
+    assert config_at is not None and config_at.client_id == "alice"
 
 
 def test_admin_client_named_like_config_principal_cannot_inherit_its_scopes(
@@ -384,14 +384,14 @@ def test_admin_client_named_like_config_principal_cannot_inherit_its_scopes(
     store.create_client("alice", "public")
 
     monkeypatch.setattr(
-        server_mod, "get_access_token", lambda: SimpleNamespace(subject="client:alice")
+        server_mod, "get_access_token", lambda: SimpleNamespace(client_id="client:alice")
     )
     p = srv._get_principal()
     assert p.scopes == ["Public/**"]  # the admin role, NOT the config '**'
 
     # And the plain subject still resolves to the config principal only.
     monkeypatch.setattr(
-        server_mod, "get_access_token", lambda: SimpleNamespace(subject="alice")
+        server_mod, "get_access_token", lambda: SimpleNamespace(client_id="alice")
     )
     assert srv._get_principal().scopes == ["**"]
 
