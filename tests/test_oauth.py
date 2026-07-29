@@ -109,7 +109,7 @@ def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
 
     # the issued access token resolves to the principal
     at = asyncio.run(provider.load_access_token(tok.access_token))
-    assert at is not None and at.subject == "web"
+    assert at is not None and at.client_id == "client-1"
 
     # code is single-use
     assert asyncio.run(provider.load_authorization_code(client, code)) is None
@@ -119,7 +119,7 @@ def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
     assert rt is not None
     tok2 = asyncio.run(provider.exchange_refresh_token(client, rt, []))
     at2 = asyncio.run(provider.load_access_token(tok2.access_token))
-    assert at2.subject == "web"
+    assert at2.client_id == "client-1"
     # old refresh token is invalidated
     assert asyncio.run(provider.load_refresh_token(client, tok.refresh_token)) is None
 
@@ -128,7 +128,7 @@ def test_static_principal_token_still_resolves(provider: CortexOAuthProvider):
     # A configured bearer token (9a / programmatic clients) resolves via the
     # same access-token path, so enabling OAuth doesn't break them.
     at = asyncio.run(provider.load_access_token("tok-web"))
-    assert at is not None and at.subject == "web"
+    assert at is not None and at.client_id == "web"
     assert asyncio.run(provider.load_access_token("bogus")) is None
 
 

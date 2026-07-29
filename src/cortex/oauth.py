@@ -9,15 +9,15 @@ How a resource owner authenticates: the authorize step redirects the user's
 browser to a Cortex **consent page** where they paste their Cortex *principal
 token* (the same high-entropy token configured under `principals[].token_env`).
 That proves which principal they are; the issued OAuth access token is bound to
-that principal (``subject``), and every tool call enforces the principal's scopes
-exactly as on the stdio/bearer paths.
+that principal in a server-side delegation record, and every tool call enforces
+the principal's scopes exactly as on the stdio/bearer paths.
 
 Static config bearer tokens keep working: ``load_access_token`` resolves both
 OAuth-issued tokens and the configured principal tokens, so programmatic clients
 and the Anthropic API ``mcp_servers`` connector are unaffected.
 
-Storage is in-memory: issued tokens and registered clients do not survive a
-restart (clients simply re-authorize). Persisting them is a future enhancement.
+Issued tokens are in-memory. Dynamically registered client metadata can be
+persisted so reconnecting clients survive a service restart.
 """
 
 from __future__ import annotations
@@ -223,9 +223,7 @@ class CortexOAuthProvider:
             principal, subject = self._auth.resolve_token(token)
         except AuthError:
             return None
-        return AccessToken(
-            token=token, client_id=principal.name, scopes=[], subject=subject
-        )
+        return AccessToken(token=token, client_id=subject, scopes=[])
 
     async def revoke_token(self, token) -> None:
         raw = getattr(token, "token", "")
@@ -307,7 +305,6 @@ class CortexOAuthProvider:
             client_id=client_id,
             scopes=scopes,
             expires_at=_now() + _ACCESS_TTL,
-            subject=subject,
             resource=resource,
         )
         self._refresh[refresh] = RefreshToken(

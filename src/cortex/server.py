@@ -300,6 +300,17 @@ class CortexServer:
         token = get_access_token()
         if token is None:
             raise ValueError("unauthenticated")
+        # OAuth access tokens carry the registered OAuth application's ID in
+        # AccessToken.client_id. Resolve their Cortex principal from the
+        # server-side source credential binding before handling direct Cortex
+        # bearer tokens, whose client_id stores the namespaced Cortex subject.
+        if self.oauth_provider is not None:
+            delegated = self.oauth_provider.resolve_delegated_principal(
+                getattr(token, "token", "")
+            )
+            if delegated is not None:
+                principal, _resolved_subject = delegated
+                return principal
         subject = token.client_id or ""
         # Cortex stores the namespaced authenticated identity in AccessToken's
         # client_id because the supported MCP 1.x SDK model has no subject
@@ -317,13 +328,6 @@ class CortexServer:
                 if self.identity is not None
                 else None
             )
-            # OAuth access tokens are not themselves user API tokens. Resolve
-            # the source credential bound at consent through the provider so
-            # its scope narrowing/revocation/expiry remains live.
-            if resolved is None and self.oauth_provider is not None:
-                resolved = self.oauth_provider.resolve_delegated_principal(
-                    getattr(token, "token", "")
-                )
             principal = None
             if resolved is not None:
                 candidate, resolved_subject = resolved

@@ -107,7 +107,7 @@ def test_get_principal_resolves_oauth_delegated_user(monkeypatch, vault: Path):
     monkeypatch.setattr(
         server_mod,
         "get_access_token",
-        lambda: SimpleNamespace(subject="user:alice", token="oauth-access"),
+        lambda: SimpleNamespace(client_id="oauth-client-1", token="oauth-access"),
     )
     assert srv._get_principal() is expected
 
