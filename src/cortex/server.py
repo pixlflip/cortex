@@ -192,6 +192,7 @@ class CortexServer:
         # IdentityService (cortex.users) over the SQLite identity DB, when it
         # exists — the store behind `user:` subjects. None for pure-v1 setups.
         self.identity = identity
+        self.oauth_provider = http.oauth_provider if http is not None else None
         self.vault_manager = (
             identity.vault_manager
             if identity is not None and identity.vault_manager is not None
@@ -299,6 +300,17 @@ class CortexServer:
         token = get_access_token()
         if token is None:
             raise ValueError("unauthenticated")
+        # OAuth access tokens carry the registered OAuth application's ID in
+        # AccessToken.client_id. Resolve their Cortex principal from the
+        # server-side source credential binding before handling direct Cortex
+        # bearer tokens, whose client_id stores the namespaced Cortex subject.
+        if self.oauth_provider is not None:
+            delegated = self.oauth_provider.resolve_delegated_principal(
+                getattr(token, "token", "")
+            )
+            if delegated is not None:
+                principal, _resolved_subject = delegated
+                return principal
         subject = token.client_id or ""
         # Cortex stores the namespaced authenticated identity in AccessToken's
         # client_id because the supported MCP 1.x SDK model has no subject
@@ -318,10 +330,13 @@ class CortexServer:
             )
             principal = None
             if resolved is not None:
-                candidate, username = resolved
+                candidate, resolved_subject = resolved
                 # Defense in depth: the token must still belong to the
                 # subject it originally authenticated as.
-                if f"{USER_SUBJECT_PREFIX}{username}" == subject:
+                if (
+                    resolved_subject == subject
+                    or f"{USER_SUBJECT_PREFIX}{resolved_subject}" == subject
+                ):
                     principal = candidate
         elif subject.startswith(ADMIN_SUBJECT_PREFIX):
             principal = (
@@ -1205,10 +1220,13 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     if config.auth.oauth_enabled:
         from .oauth import CortexOAuthProvider
 
-        provider = CortexOAuthProvider(authn, base)
+        provider = CortexOAuthProvider(
+            authn, base, config.vault.path.parent.parent / "oauth-clients.json"
+        )
+        resource_url = base.rstrip(chr(47)) + sc.path
         auth_settings = AuthSettings(
             issuer_url=base,
-            resource_server_url=base,
+            resource_server_url=resource_url,
             required_scopes=[],
             client_registration_options=ClientRegistrationOptions(enabled=True),
             revocation_options=RevocationOptions(enabled=True),

@@ -9,22 +9,25 @@ How a resource owner authenticates: the authorize step redirects the user's
 browser to a Cortex **consent page** where they paste their Cortex *principal
 token* (the same high-entropy token configured under `principals[].token_env`).
 That proves which principal they are; the issued OAuth access token is bound to
-that principal (``subject``), and every tool call enforces the principal's scopes
-exactly as on the stdio/bearer paths.
+that principal in a server-side delegation record, and every tool call enforces
+the principal's scopes exactly as on the stdio/bearer paths.
 
 Static config bearer tokens keep working: ``load_access_token`` resolves both
 OAuth-issued tokens and the configured principal tokens, so programmatic clients
 and the Anthropic API ``mcp_servers`` connector are unaffected.
 
-Storage is in-memory: issued tokens and registered clients do not survive a
-restart (clients simply re-authorize). Persisting them is a future enhancement.
+Issued tokens are in-memory. Dynamically registered client metadata can be
+persisted so reconnecting clients survive a service restart.
 """
 
 from __future__ import annotations
 
 import html
+import json
+import os
 import secrets
 import time
+from pathlib import Path
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -73,13 +76,26 @@ principal is scoped to.</p>
 class CortexOAuthProvider:
     """Minimal OAuth 2.1 authorization server backed by Cortex principals."""
 
-    def __init__(self, authenticator: Authenticator, base_url: str):
+    def __init__(
+        self,
+        authenticator: Authenticator,
+        base_url: str,
+        client_store_path: Path | None = None,
+    ):
         self._auth = authenticator
         self.base = base_url.rstrip("/")
-        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._client_store_path = client_store_path
+        self._clients = self._load_clients()
         self._codes: dict[str, AuthorizationCode] = {}
         self._access: dict[str, AccessToken] = {}
         self._refresh: dict[str, RefreshToken] = {}
+        # OAuth tokens are delegated from the Cortex credential entered at
+        # consent. Keep that source credential server-side so user-token scope
+        # narrowing, revocation, expiry, and disablement can be re-evaluated on
+        # every MCP call. The raw credential is never sent to the OAuth client.
+        self._source_by_code: dict[str, str] = {}
+        self._source_by_access: dict[str, str] = {}
+        self._source_by_refresh: dict[str, str] = {}
         # Pending authorize transactions awaiting consent: txn -> (client, params)
         self._pending: dict[str, tuple[OAuthClientInformationFull, AuthorizationParams]] = {}
 
@@ -90,6 +106,43 @@ class CortexOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
+        self._persist_clients()
+
+    def _load_clients(self) -> dict[str, OAuthClientInformationFull]:
+        """Load DCR clients so reconnecting clients survive service restarts.
+
+        OAuth codes and tokens deliberately remain ephemeral, but remote MCP
+        clients such as ChatGPT retain their dynamically registered client ID
+        and will not repeat DCR after a server restart.
+        """
+        if self._client_store_path is None or not self._client_store_path.exists():
+            return {}
+        try:
+            raw = json.loads(self._client_store_path.read_text())
+            clients = {
+                item["client_id"]: OAuthClientInformationFull.model_validate(item)
+                for item in raw
+            }
+        except (OSError, ValueError, TypeError, KeyError):
+            # A corrupt cache must not prevent Cortex from starting. Existing
+            # clients can register again; operators retain the file for repair.
+            return {}
+        return clients
+
+    def _persist_clients(self) -> None:
+        if self._client_store_path is None:
+            return
+        self._client_store_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = [client.model_dump(mode="json") for client in self._clients.values()]
+        temp_path = self._client_store_path.with_suffix(
+            self._client_store_path.suffix + ".tmp"
+        )
+        try:
+            temp_path.write_text(json.dumps(encoded, separators=(",", ":")))
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self._client_store_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     # -- authorization code flow ------------------------------------------
 
@@ -110,6 +163,7 @@ class CortexOAuthProvider:
             return None
         if code.expires_at and code.expires_at < _now():
             self._codes.pop(authorization_code, None)
+            self._source_by_code.pop(authorization_code, None)
             return None
         return code
 
@@ -118,11 +172,13 @@ class CortexOAuthProvider:
     ) -> OAuthToken:
         # One-time use.
         self._codes.pop(authorization_code.code, None)
+        source_token = self._source_by_code.pop(authorization_code.code, None)
         return self._issue(
             client_id=client.client_id,
             scopes=authorization_code.scopes,
             subject=authorization_code.subject,
             resource=authorization_code.resource,
+            source_token=source_token,
         )
 
     # -- refresh ----------------------------------------------------------
@@ -143,11 +199,13 @@ class CortexOAuthProvider:
     ) -> OAuthToken:
         # Rotate: invalidate the presented refresh token.
         self._refresh.pop(refresh_token.token, None)
+        source_token = self._source_by_refresh.pop(refresh_token.token, None)
         return self._issue(
             client_id=client.client_id,
             scopes=scopes or refresh_token.scopes,
             subject=refresh_token.subject,
             resource=None,
+            source_token=source_token,
         )
 
     # -- token verification (OAuth tokens AND static principal tokens) ----
@@ -157,6 +215,7 @@ class CortexOAuthProvider:
         if at is not None:
             if at.expires_at and at.expires_at < _now():
                 self._access.pop(token, None)
+                self._source_by_access.pop(token, None)
                 return None
             return at
         # Fall back to a static principal token (9a / programmatic clients).
@@ -164,13 +223,29 @@ class CortexOAuthProvider:
             principal, subject = self._auth.resolve_token(token)
         except AuthError:
             return None
-        return AccessToken(
-            token=token, client_id=principal.name, scopes=[], subject=subject
-        )
+        return AccessToken(token=token, client_id=subject, scopes=[])
 
     async def revoke_token(self, token) -> None:
-        self._access.pop(getattr(token, "token", ""), None)
-        self._refresh.pop(getattr(token, "token", ""), None)
+        raw = getattr(token, "token", "")
+        self._access.pop(raw, None)
+        self._refresh.pop(raw, None)
+        self._source_by_access.pop(raw, None)
+        self._source_by_refresh.pop(raw, None)
+
+    def resolve_delegated_principal(self, access_token: str):
+        """Re-resolve the credential that authorized ``access_token``.
+
+        This preserves the source credential's live security semantics for
+        OAuth clients: scope narrowing is retained, and revoking/expiring the
+        source token or disabling its user immediately invalidates delegation.
+        """
+        source_token = self._source_by_access.get(access_token)
+        if source_token is None:
+            return None
+        try:
+            return self._auth.resolve_token(source_token)
+        except AuthError:
+            return None
 
     # -- consent page (custom routes) -------------------------------------
 
@@ -209,12 +284,19 @@ class CortexOAuthProvider:
             resource=params.resource,
             subject=subject,
         )
+        self._source_by_code[code] = token
         return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
 
     # -- internals --------------------------------------------------------
 
     def _issue(
-        self, *, client_id: str, scopes: list[str], subject: str | None, resource
+        self,
+        *,
+        client_id: str,
+        scopes: list[str],
+        subject: str | None,
+        resource,
+        source_token: str | None = None,
     ) -> OAuthToken:
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
@@ -223,12 +305,14 @@ class CortexOAuthProvider:
             client_id=client_id,
             scopes=scopes,
             expires_at=_now() + _ACCESS_TTL,
-            subject=subject,
             resource=resource,
         )
         self._refresh[refresh] = RefreshToken(
             token=refresh, client_id=client_id, scopes=scopes, subject=subject
         )
+        if source_token is not None:
+            self._source_by_access[access] = source_token
+            self._source_by_refresh[refresh] = source_token
         return OAuthToken(
             access_token=access,
             token_type="Bearer",

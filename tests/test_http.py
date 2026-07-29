@@ -93,6 +93,25 @@ def test_get_principal_unknown_subject_raises(monkeypatch, vault: Path):
         srv._get_principal()
 
 
+def test_get_principal_resolves_oauth_delegated_user(monkeypatch, vault: Path):
+    srv = build_http_server(_http_config(vault))
+    expected = Principal(name="alice", scopes=["Private/**"])
+    srv.identity = SimpleNamespace(resolve_api_token=lambda _token: None)
+    srv.oauth_provider = SimpleNamespace(
+        resolve_delegated_principal=lambda token: (
+            (expected, "user:alice") if token == "oauth-access" else None
+        )
+    )
+    import cortex.server as server_mod
+
+    monkeypatch.setattr(
+        server_mod,
+        "get_access_token",
+        lambda: SimpleNamespace(client_id="oauth-client-1", token="oauth-access"),
+    )
+    assert srv._get_principal() is expected
+
+
 # -- config validation -----------------------------------------------------
 
 def test_http_requires_token_bearing_principal(tmp_path: Path, monkeypatch):

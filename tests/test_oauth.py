@@ -17,7 +17,9 @@ from pydantic import AnyUrl
 
 from cortex.auth import AuthError, Authenticator
 from cortex.config import CortexConfig, Principal, VaultConfig
+from cortex.db import Database
 from cortex.oauth import CortexOAuthProvider
+from cortex.users import IdentityService
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 
@@ -61,6 +63,26 @@ def test_register_and_get_client(provider: CortexOAuthProvider):
     assert asyncio.run(provider.get_client("nope")) is None
 
 
+def test_registered_client_survives_provider_restart(tmp_path: Path):
+    (tmp_path / "vault").mkdir()
+    cfg = CortexConfig(
+        vault=VaultConfig(path=tmp_path / "vault"),
+        principals=[Principal(name="web", scopes=["Public/**"], token="tok-web")],
+    )
+    store = tmp_path / "oauth-clients.json"
+    first = CortexOAuthProvider(
+        Authenticator(cfg), "https://cortex.example.com", store
+    )
+    asyncio.run(first.register_client(_client()))
+
+    restarted = CortexOAuthProvider(
+        Authenticator(cfg), "https://cortex.example.com", store
+    )
+    loaded = asyncio.run(restarted.get_client("client-1"))
+    assert loaded is not None and loaded.client_name == "Test App"
+    assert store.stat().st_mode & 0o777 == 0o600
+
+
 def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
     client = _client()
     asyncio.run(provider.register_client(client))
@@ -87,7 +109,7 @@ def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
 
     # the issued access token resolves to the principal
     at = asyncio.run(provider.load_access_token(tok.access_token))
-    assert at is not None and at.subject == "web"
+    assert at is not None and at.client_id == "client-1"
 
     # code is single-use
     assert asyncio.run(provider.load_authorization_code(client, code)) is None
@@ -97,7 +119,7 @@ def test_full_authorize_consent_token_flow(provider: CortexOAuthProvider):
     assert rt is not None
     tok2 = asyncio.run(provider.exchange_refresh_token(client, rt, []))
     at2 = asyncio.run(provider.load_access_token(tok2.access_token))
-    assert at2.subject == "web"
+    assert at2.client_id == "client-1"
     # old refresh token is invalidated
     assert asyncio.run(provider.load_refresh_token(client, tok.refresh_token)) is None
 
@@ -106,7 +128,7 @@ def test_static_principal_token_still_resolves(provider: CortexOAuthProvider):
     # A configured bearer token (9a / programmatic clients) resolves via the
     # same access-token path, so enabling OAuth doesn't break them.
     at = asyncio.run(provider.load_access_token("tok-web"))
-    assert at is not None and at.subject == "web"
+    assert at is not None and at.client_id == "web"
     assert asyncio.run(provider.load_access_token("bogus")) is None
 
 
@@ -117,3 +139,33 @@ def test_consent_rejects_bad_token(provider: CortexOAuthProvider):
     txn = url.split("txn=")[1]
     with pytest.raises(AuthError):
         provider.complete_consent(txn, "wrong-token")
+
+
+def test_oauth_user_delegation_preserves_scope_narrowing_and_revocation(tmp_path: Path):
+    db = Database(tmp_path / "cortex.sqlite")
+    identity = IdentityService(db)
+    identity.create_user("alice")
+    identity.create_group("readers", scopes=["Shared/**"])
+    identity.add_to_group("alice", "readers")
+    created = identity.mint_token(
+        "alice", "chatgpt", scopes=["Shared/Narrow/**"]
+    )
+    cfg = CortexConfig(vault=VaultConfig(path=tmp_path / "vault"))
+    delegated = CortexOAuthProvider(
+        Authenticator(cfg, user_service=identity), "https://cortex.example.com"
+    )
+    client = _client()
+    asyncio.run(delegated.register_client(client))
+    txn = asyncio.run(delegated.authorize(client, _params())).split("txn=")[1]
+    redirect = delegated.complete_consent(txn, created.token)
+    code = redirect.split("code=")[1].split("&")[0]
+    loaded = asyncio.run(delegated.load_authorization_code(client, code))
+    issued = asyncio.run(delegated.exchange_authorization_code(client, loaded))
+
+    principal, subject = delegated.resolve_delegated_principal(issued.access_token)
+    assert subject == "user:alice"
+    assert principal.name == "alice"
+    assert principal.scopes == ["Shared/Narrow/**"]
+
+    identity.revoke_token("alice", "chatgpt")
+    assert delegated.resolve_delegated_principal(issued.access_token) is None
