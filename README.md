@@ -105,6 +105,11 @@ with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
 | `context_pack` | Compact, budgeted bundle for a query |
 | `semantic_search` | Fuzzy "comb & synthesize" — the only tool that uses an LLM |
 
+The proposed path to genuinely local concept retrieval (hybrid FTS5 plus
+on-machine embeddings, with optional local synthesis) is documented in
+[`docs/local-semantic-search.md`](docs/local-semantic-search.md). It is a design,
+not yet part of the shipped configuration surface.
+
 With `writes.enabled: true` in `cortex.yaml` (default **false** — otherwise
 these tools are not registered at all), the mutating tools appear. Each one
 requires a `reason`, is write-scope-checked, and lands as exactly one git
