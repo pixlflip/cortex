@@ -148,21 +148,28 @@ const adminNav = [
 ] as const
 
 function Shell() {
-  const auth = useAuth(); const navigate = useNavigate(); const [mobile, setMobile] = useState(false)
+  const auth = useAuth(); const navigate = useNavigate(); const location = useLocation(); const [mobile, setMobile] = useState(false)
   const [theme, setTheme] = useState(() => localStorage.getItem('cortex-theme') || 'dark')
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('cortex-theme', theme) }, [theme])
-  useEffect(() => { const shortcut = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); navigate('/vault'); setTimeout(() => window.dispatchEvent(new Event('cortex-focus-search')), 0) } }; window.addEventListener('keydown', shortcut); return () => window.removeEventListener('keydown', shortcut) }, [navigate])
+  useEffect(() => { setMobile(false) }, [location.pathname, location.search])
+  useEffect(() => {
+    document.body.classList.toggle('nav-open', mobile)
+    return () => document.body.classList.remove('nav-open')
+  }, [mobile])
+  useEffect(() => { const shortcut = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); navigate('/vault'); setTimeout(() => window.dispatchEvent(new Event('cortex-focus-search')), 0) } if (event.key === 'Escape') setMobile(false) }; window.addEventListener('keydown', shortcut); return () => window.removeEventListener('keydown', shortcut) }, [navigate])
+  const navLink = (to: string, Icon: any, label: string) => <NavLink key={to} to={to} className={({ isActive }) => isActive ? 'active' : ''}><Icon /><span>{label}</span></NavLink>
   return <div className="app-shell">
-    <aside className={`sidebar ${mobile ? 'open' : ''}`}>
+    {mobile && <button className="nav-scrim" aria-label="Close navigation" onClick={() => setMobile(false)} />}
+    <aside id="primary-navigation" className={`sidebar ${mobile ? 'open' : ''}`} aria-label="Primary navigation">
       <Link className="brand-lockup compact" to="/vault"><div className="brand-mark"><Network /></div><span>CORTEX</span></Link>
-      <nav><p className="nav-label">WORKSPACE</p>{primaryNav.map(([to, Icon, label]) => <NavLink key={to} to={to} className={({ isActive }) => isActive ? 'active' : ''}><Icon />{label}</NavLink>)}
-        {auth.user?.is_admin && <><p className="nav-label">ADMINISTRATION</p>{adminNav.map(([to, Icon, label]) => <NavLink key={to} to={to} className={({ isActive }) => isActive ? 'active' : ''}><Icon />{label}</NavLink>)}</>}
+      <nav><p className="nav-label">WORKSPACE</p>{primaryNav.map(([to, Icon, label]) => navLink(to, Icon, label))}
+        {auth.user?.is_admin && <><p className="nav-label">ADMINISTRATION</p>{adminNav.map(([to, Icon, label]) => navLink(to, Icon, label))}</>}
       </nav>
-      <div className="sidebar-foot"><button className="icon-button" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun /> : <Moon />}</button>
+      <div className="sidebar-foot"><button className="icon-button" aria-label={`Use ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Use ${theme === 'dark' ? 'light' : 'dark'} theme`} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun /> : <Moon />}</button>
         <div className="avatar">{(auth.user?.display_name || auth.user?.username || '?')[0].toUpperCase()}</div><div><strong>{auth.user?.display_name || auth.user?.username}</strong><small>{auth.user?.is_admin ? 'Administrator' : auth.user?.auth_source === 'ldap' ? 'Directory user' : 'Member'}</small></div>
-        <button className="icon-button" title="Log out" onClick={() => void auth.logout()}><LogOut /></button></div>
+        <button className="icon-button" aria-label="Log out" title="Log out" onClick={() => void auth.logout()}><LogOut /></button></div>
     </aside>
-    <main className="workspace"><header className="mobile-bar"><button onClick={() => setMobile(!mobile)}><Menu /></button><span>CORTEX</span></header>
+    <main className="workspace"><header className="mobile-bar"><button aria-controls="primary-navigation" aria-expanded={mobile} aria-label="Open navigation" onClick={() => setMobile(!mobile)}><Menu /></button><Link to="/vault"><span>CORTEX</span></Link><button className="mobile-theme" aria-label={`Use ${theme === 'dark' ? 'light' : 'dark'} theme`} onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun /> : <Moon />}</button></header>
       <Routes>
         <Route path="/vault/*" element={<VaultPage />} /><Route path="/tokens" element={<TokensPage />} /><Route path="/mcp" element={<McpPage />} />
         <Route path="/admin/:section" element={auth.user?.is_admin ? <AdminPage /> : <Navigate to="/vault" />} />
@@ -229,9 +236,9 @@ function VaultPage() {
   if (vaults.loading) return <Loading />
   if (vaults.error) return <ErrorState message={vaults.error} retry={vaults.reload} />
   return <div className="vault-page">
-    <PageHeader eyebrow="OBSIDIAN MEMORY" title="Vault" description="Browse the knowledge your identity is allowed to see." actions={<select value={selectedVault} onChange={e => setParams({ vault: e.target.value })}>{vaults.data?.vaults.map(v => <option key={v.id} value={v.id}>{v.id}{v.relation === 'owner' ? ' · mine' : ''}</option>)}</select>} />
+    <PageHeader eyebrow="MEMORY WORKSPACE" title="Your vault" description="Search, browse, and verify the knowledge available to this identity." actions={<label className="vault-picker"><span>Vault</span><select value={selectedVault} onChange={e => setParams({ vault: e.target.value })}>{vaults.data?.vaults.map(v => <option key={v.id} value={v.id}>{v.id}{v.relation === 'owner' ? ' · mine' : ''}</option>)}</select></label>} />
     <div className="vault-layout">
-      <aside className="vault-tree panel"><div className="search-box"><Search /> <input ref={searchInput} placeholder="Search this vault…" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setSelectedResult(Math.min(results.length - 1, selectedResult + 1)) } if (event.key === 'ArrowUp') { event.preventDefault(); setSelectedResult(Math.max(0, selectedResult - 1)) } if (event.key === 'Enter' && results[selectedResult]) { open(results[selectedResult].path); setQuery('') } }} /><kbd>⌘K</kbd></div><div className="search-filters"><input placeholder="Folder filter" value={folderFilter} onChange={event => setFolderFilter(event.target.value)} /><input placeholder="Tag filter" value={tagFilter} onChange={event => setTagFilter(event.target.value)} /></div>
+      <aside className="vault-tree panel"><div className="search-box"><Search aria-hidden="true" /> <input ref={searchInput} aria-label="Search this vault" placeholder="Search notes…" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setSelectedResult(Math.min(results.length - 1, selectedResult + 1)) } if (event.key === 'ArrowUp') { event.preventDefault(); setSelectedResult(Math.max(0, selectedResult - 1)) } if (event.key === 'Enter' && results[selectedResult]) { open(results[selectedResult].path); setQuery('') } if (event.key === 'Escape') setQuery('') }} />{query ? <button className="search-clear" aria-label="Clear search" onClick={() => setQuery('')}>×</button> : <kbd>⌘K</kbd>}</div><div className="search-filters"><label><span>Folder</span><input placeholder="Any folder" value={folderFilter} onChange={event => setFolderFilter(event.target.value)} /></label><label><span>Tag</span><input placeholder="Any tag" value={tagFilter} onChange={event => setTagFilter(event.target.value)} /></label></div>
         {query && <div className="search-popover">{searching && <small>Searching…</small>}{results.map((result, index) => <button className={index === selectedResult ? 'selected' : ''} key={`${result.path}-${result.line}`} onMouseEnter={() => setSelectedResult(index)} onClick={() => { open(result.path); setQuery('') }}><strong>{result.path}</strong><span><HighlightedSnippet text={result.snippet} query={query} /></span></button>)}{!searching && !results.length && <small>No visible matches.</small>}</div>}
         <div className="tree-heading"><span>FILES</span><small>{vaults.data?.vaults.find(v => v.id === selectedVault)?.note_count || 0} notes</small></div>
         <div className="tree-scroll">{tree.loading ? <Loading /> : tree.data && <TreeBranch node={tree.data.tree} active={notePath || undefined} onOpen={open} />}</div>
