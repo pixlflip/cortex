@@ -69,7 +69,7 @@ def _tool_names(srv: CortexServer) -> set[str]:
 
 
 MUTATING_TOOLS = {
-    "write_note", "patch_note", "append_note", "update_frontmatter", "delete_note", "move_note",
+    "put_file", "write_note", "patch_note", "append_note", "update_frontmatter", "delete_note", "move_note",
 }
 
 
