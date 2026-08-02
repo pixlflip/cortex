@@ -7,6 +7,14 @@ import sys
 import time
 from mcp.server.fastmcp import FastMCP
 
+if os.environ.get("FIXTURE_STARTUP_FAILURE") == "permission":
+    print(
+        "PermissionError: [Errno 13] Permission denied: "
+        "'/private/config.json' token=must-not-persist",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
 marker = os.environ.get("FIXTURE_MARKER")
 if marker:
     with open(marker, "a", encoding="utf-8") as stream:

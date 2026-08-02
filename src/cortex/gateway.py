@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -85,6 +86,25 @@ def validate_header_name(name: str) -> str:
 def _safe_upstream_text(value: str, limit: int = 4000) -> str:
     """Length-cap and strip control characters from untrusted metadata."""
     return "".join(ch for ch in value if ch in "\n\t" or ord(ch) >= 32)[:limit]
+
+
+def _stdio_failure_category(stderr: str) -> str | None:
+    """Classify child startup stderr without retaining untrusted text.
+
+    Stdio MCP stderr can contain credentials, paths, or terminal control
+    sequences.  Keep it out of logs and persistence while still distinguishing
+    common operator-fixable startup failures from an opaque transport close.
+    """
+    lowered = stderr.lower()
+    if "permissionerror" in lowered or "permission denied" in lowered:
+        return "permission denied"
+    if "modulenotfounderror" in lowered or "no module named" in lowered:
+        return "dependency missing"
+    if "filenotfounderror" in lowered or "no such file or directory" in lowered:
+        return "file not found"
+    if "configurationerror" in lowered or "configerror" in lowered:
+        return "configuration error"
+    return None
 
 
 def validate_outbound_url(url: str, config: CortexConfig) -> str:
@@ -578,10 +598,13 @@ class GatewayRuntime:
         ), fingerprint
 
     async def _stdio_worker(self, parameters, queue, ready):
-        try:
-            # Discard child stderr: it can contain credentials or hostile
-            # control sequences and must never enter logs, SQLite, or APIs.
-            with open(os.devnull, "w", encoding="utf-8") as errlog:
+        # Child stderr can contain credentials or hostile control sequences.
+        # Capture it only in a bounded private spool so startup failures can be
+        # classified; never persist or return the raw text.
+        with tempfile.SpooledTemporaryFile(
+            max_size=64 * 1024, mode="w+", encoding="utf-8"
+        ) as errlog:
+            try:
                 async with stdio_client(parameters, errlog=errlog) as (read, write):
                     async with ClientSession(
                         read,
@@ -602,13 +625,23 @@ class GatewayRuntime:
                             except BaseException as exc:
                                 if not future.done():
                                     future.set_exception(exc)
-        except BaseException as exc:
-            if not ready.done():
-                ready.set_exception(exc)
-            while not queue.empty():
-                request = queue.get_nowait()
-                if request is not None and not request[1].done():
-                    request[1].set_exception(exc)
+            except BaseException as exc:
+                errlog.seek(0)
+                category = _stdio_failure_category(errlog.read())
+                failure = (
+                    GatewayError(
+                        "local MCP server failed to start or respond "
+                        f"({category})"
+                    )
+                    if category
+                    else exc
+                )
+                if not ready.done():
+                    ready.set_exception(failure)
+                while not queue.empty():
+                    request = queue.get_nowait()
+                    if request is not None and not request[1].done():
+                        request[1].set_exception(failure)
 
     async def _stdio_entry(self, row: dict) -> StdioPoolEntry:
         parameters, fingerprint = self._stdio_parameters(row)
@@ -739,11 +772,17 @@ class GatewayRuntime:
                 # worker (for example, list_tools itself failed).  Never leave
                 # that child pooled behind a failed discovery.
                 await self.close_registration(row["id"])
-            message = (
-                "local MCP server failed to start or respond"
-                if row["transport"] == "stdio-cmd"
-                else str(exc)[:500] or type(exc).__name__
-            )
+            if row["transport"] == "stdio-cmd":
+                message = (
+                    str(exc)
+                    if isinstance(exc, GatewayError)
+                    and str(exc).startswith(
+                        "local MCP server failed to start or respond"
+                    )
+                    else "local MCP server failed to start or respond"
+                )
+            else:
+                message = str(exc)[:500] or type(exc).__name__
             failed = self.identity.mcp_servers.set_inventory(
                 row["id"], [], error=message
             )
