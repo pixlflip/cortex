@@ -692,6 +692,42 @@ async def test_persistent_stdio_discovery_call_environment_and_close(
 
 
 @pytest.mark.anyio
+async def test_stdio_startup_failure_records_only_safe_category(
+    tmp_path, monkeypatch, stdio_executable
+):
+    monkeypatch.setenv("STDIO_FAILURE_PARENT", "permission")
+    config = CortexConfig()
+    config.gateway = GatewayConfig(
+        allow_stdio_servers=True,
+        stdio_allowed_executables=[str(stdio_executable)],
+        stdio_allowed_workdirs=[str(tmp_path)],
+        timeout_seconds=5,
+    )
+    identity = IdentityService(Database(tmp_path / "stdio-failure.sqlite"))
+    row = identity.mcp_servers.create(
+        "brokenfixture",
+        transport="stdio-cmd",
+        command=str(stdio_executable),
+        cwd=str(tmp_path),
+        env_refs={"FIXTURE_STARTUP_FAILURE": "STDIO_FAILURE_PARENT"},
+    )
+    runtime = GatewayRuntime(config, identity)
+    try:
+        with pytest.raises(GatewayError, match="permission denied"):
+            await runtime.discover(row)
+    finally:
+        await runtime.aclose()
+
+    refreshed = identity.mcp_servers.get(row["id"])
+    assert refreshed["enabled"] == 0
+    assert refreshed["last_error"] == (
+        "local MCP server failed to start or respond (permission denied)"
+    )
+    assert "must-not-persist" not in refreshed["last_error"]
+    assert "/private/config.json" not in refreshed["last_error"]
+
+
+@pytest.mark.anyio
 async def test_stdio_executes_allowlisted_venv_launcher_without_resolving_it(
     tmp_path, monkeypatch
 ):
