@@ -80,6 +80,13 @@ def test_managed_metadata_cannot_be_forged_or_removed(service):
     assert srv.vault.read_frontmatter('Public/old.md')['memory_state']=='current'
 
 
+def test_disputed_search_includes_explicit_warning(service):
+    srv,p=service
+    tool(srv,'set_memory_state',path='Public/old.md',memory_state='disputed',reason='review',expected_sha256=sha(srv,'Public/old.md'))
+    hit=next(x for x in tool(srv,'search',query='Beacon') if x['path']=='Public/old.md')
+    assert hit['memory_state']=='disputed' and hit['warnings']
+
+
 def test_supersession_body_history_schema_and_scope(service):
     srv,p=service
     before={path:parse_memory_bytes(srv.vault._resolve(path).read_bytes())[1] for path in ('Public/old.md','Public/new.md')}
@@ -92,7 +99,7 @@ def test_supersession_body_history_schema_and_scope(service):
     assert all(x['path'].startswith('Public/') for x in found)
     assert found[0]['memory_state']=='current'
     history=tool(srv,'search',query='Beacon',include_historical=True)
-    assert any(x['path']=='Public/old.md' and x['memory_state']=='superseded' for x in history)
+    assert any(x['path']=='Public/old.md' and x['memory_state']=='superseded' and x['warnings'] for x in history)
     regex=tool(srv,'search',query='Beacon',regex=True)
     assert regex[0]['memory_state']=='current'
     pack=tool(srv,'context_pack',query='Beacon')

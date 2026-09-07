@@ -77,7 +77,12 @@ def inspect_memory(frontmatter: dict) -> dict:
     value = frontmatter['memory_state']
     if not isinstance(value, str) or value not in STATES:
         return {'state': 'unreviewed', 'warnings': ['invalid memory_state']}
-    return {'state': value, 'warnings': []}
+    warnings = []
+    if value == 'disputed':
+        warnings.append('disputed memory: review before relying on its claims')
+    elif value == 'superseded':
+        warnings.append('historical memory: superseded by a replacement')
+    return {'state': value, 'warnings': warnings}
 
 
 def inspect_memory_bytes(raw: bytes) -> dict:

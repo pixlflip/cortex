@@ -1249,7 +1249,11 @@ class CortexServer:
             def supersede_note(old_path: str, replacement_path: str, reason: str,
                                old_sha256: str, replacement_sha256: str,
                                vault: str | None = None) -> dict:
-                """Atomically mark old note superseded and replacement current."""
+                """Supersede an old note with an already-current replacement.
+
+                Requires both full-file hashes. Preserves body bytes and commits
+                both metadata changes together; not a crash-atomic transaction.
+                """
                 p = self._get_principal()
                 bundle, p = self._select_vault(p, vault, write=True)
                 return self._do_supersede_note(p, old_path, replacement_path, reason,

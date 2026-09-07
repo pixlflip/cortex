@@ -30,8 +30,8 @@ YAML formatting may change. Malformed YAML must be repaired before mutation;
 - `set_memory_state(path, memory_state, reason, expected_sha256)` changes metadata
   only. The hash is the SHA-256 of the complete raw file, obtainable using
   `get_file`. A stale hash fails without changing the note.
-- `supersede_note(old_path, replacement_path, reason, expected_old_sha256,
-  expected_replacement_sha256)` marks the old note `superseded`, points it at the
+- `supersede_note(old_path, replacement_path, reason, old_sha256,
+  replacement_sha256)` marks the old note `superseded`, points it at the
   replacement, and adds the reverse link. The replacement must already be
   `current`. Both records must be visible and writable in the selected vault.
 - `superseded` cannot be assigned through ordinary writes. Superseded records
@@ -40,10 +40,11 @@ YAML formatting may change. Malformed YAML must be repaired before mutation;
 - All mutations through this server instance coordinate by vault with a
   filesystem lock on POSIX. Lifecycle writes reject unrelated staged changes,
   commit the affected files together, and roll back ordinary pre-commit failures.
-  An index failure after a successful commit returns `indexed: false`; it does
+  An index failure after a successful commit returns `index_status: pending`; it does
   not falsely report that the committed edit was undone.
 
-These are not distributed transactions. External filesystem editors do not
+Note-write operations require an initialized Git audit repository with auditing
+enabled. These are not distributed transactions. External filesystem editors do not
 participate in the lock. Two-file supersession is not atomic to an external
 reader between writes, and abrupt process/power loss is not a crash journal.
 Use backups and inspect Git state after abnormal termination.
