@@ -18,6 +18,7 @@ import pytest
 
 from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, WritesConfig
 from cortex.server import CortexServer
+from cortex.memory_lifecycle import parse_memory_bytes
 from cortex.vault import VaultError
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -132,7 +133,8 @@ def test_write_note_via_real_mcp_tool_call(vault: Path):
     payload = json.loads(result[0].text)
     assert payload["created"] is True
     assert payload["commit"]
-    assert srv.vault.read_text("Public/via_tool.md") == "# Via tool\n\nhi\n"
+    assert parse_memory_bytes(srv.vault._resolve("Public/via_tool.md").read_bytes())[1] == b"# Via tool\n\nhi\n"
+    assert srv.vault.read_frontmatter("Public/via_tool.md")["memory_state"] == "unreviewed"
 
 
 # -- create / overwrite -------------------------------------------------------
@@ -142,7 +144,8 @@ def test_create_note(vault: Path):
     p = srv.config.principal("p")
     res = srv._do_write_note(p, "Public/new.md", "# New\n\nhello\n", "create new note")
     assert res["created"] is True
-    assert srv.vault.read_text("Public/new.md") == "# New\n\nhello\n"
+    assert parse_memory_bytes(srv.vault._resolve("Public/new.md").read_bytes())[1] == b"# New\n\nhello\n"
+    assert srv.vault.read_frontmatter("Public/new.md")["memory_state"] == "unreviewed"
 
 
 def test_write_note_refuses_overwrite_by_default(vault: Path):
@@ -188,7 +191,8 @@ def test_patch_note_ambiguous(vault: Path):
     with pytest.raises(ValueError, match="ambiguous: 3 matches"):
         srv._do_patch_note(p, "Public/amb.md", "dup", "x", "patch")
     # Refused: content unchanged.
-    assert srv.vault.read_text("Public/amb.md") == "dup dup dup\n"
+    assert parse_memory_bytes(srv.vault._resolve("Public/amb.md").read_bytes())[1] == b"dup dup dup\n"
+    assert srv.vault.read_frontmatter("Public/amb.md")["memory_state"] == "unreviewed"
 
 
 def test_patch_note_requires_existing_note(vault: Path):
@@ -329,7 +333,8 @@ def test_move_note_refuses_to_clobber_by_default(vault: Path):
         srv._do_move_note(p, "Public/open.md", "Public/target.md", "should refuse")
     # Both files untouched.
     assert srv.vault.exists("Public/open.md")
-    assert srv.vault.read_text("Public/target.md") == "existing target\n"
+    assert parse_memory_bytes(srv.vault._resolve("Public/target.md").read_bytes())[1] == b"existing target\n"
+    assert srv.vault.read_frontmatter("Public/target.md")["memory_state"] == "unreviewed"
 
 
 def test_move_note_overwrite_true_replaces_destination(vault: Path):
@@ -557,15 +562,16 @@ def test_write_note_rejects_non_mapping_frontmatter(vault: Path):
         srv._do_write_note(p, "Public/bad.md", "---\n- a\n- b\n---\nbody", "list frontmatter")
 
 
-def test_write_note_validate_frontmatter_false_skips_check(vault: Path):
+def test_legacy_validation_flag_cannot_bypass_lifecycle_validation(vault: Path):
     srv = _server(vault)
     p = srv.config.principal("p")
-    # Would fail validation, but validate_frontmatter=False opts out.
-    res = srv._do_write_note(
-        p, "Public/bad.md", "---\n: : bad\n---\nbody", "skip validation",
-        validate_frontmatter=False,
-    )
-    assert res["created"] is True
+    # Lifecycle validation is mandatory even through the legacy opt-out flag.
+    with pytest.raises(ValueError, match="frontmatter"):
+        srv._do_write_note(
+            p, "Public/bad.md", "---\n: : bad\n---\nbody", "skip validation",
+            validate_frontmatter=False,
+        )
+    assert not srv.vault.exists("Public/bad.md")
 
 
 def test_write_note_valid_frontmatter_accepted(vault: Path):
@@ -575,7 +581,8 @@ def test_write_note_valid_frontmatter_accepted(vault: Path):
         p, "Public/good.md", "---\ntitle: Good\n---\n# Good\n\nbody\n", "valid fm"
     )
     assert res["created"] is True
-    assert srv.vault.read_note("Public/good.md").frontmatter == {"title": "Good"}
+    assert srv.vault.read_note("Public/good.md").frontmatter["title"] == "Good"
+    assert srv.vault.read_frontmatter("Public/good.md")["memory_state"] == "unreviewed"
 
 
 # -- path-traversal safety --------------------------------------------------------

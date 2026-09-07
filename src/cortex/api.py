@@ -72,6 +72,8 @@ from .gateway import (
 from .ldap import DirectoryService, LdapError
 from .scopes import filter_paths, path_allowed
 from .serialization import normalize_json
+from .memory_lifecycle import inspect_memory_bytes
+from .recall import recall_hits
 from .sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from .users import AuthzError, IdentityError, IdentityService
 from .vault import VaultError, canonical_asset_path, canonical_note_path
@@ -970,6 +972,7 @@ class ApiV1:
                 "markdown": note.body,
                 "raw": note.raw,
                 "frontmatter": normalize_json(note.frontmatter),
+                "memory": inspect_memory_bytes(content),
                 "etag": etag,
                 "modified_at": int(file_path.stat().st_mtime),
             },
@@ -983,8 +986,11 @@ class ApiV1:
         if not query:
             return JSONResponse({"results": []})
         limit = self._query_int(request, "limit", 50, minimum=1, maximum=200)
-        bundle.index.ensure_fresh()
-        hits = bundle.index.search(query, limit=max(limit * 5, 500))
+        historical = request.query_params.get("include_historical", "false").lower()
+        if historical not in ("true", "false"):
+            raise ApiError(400, "invalid_request", "include_historical must be true or false")
+        hits = recall_hits(bundle.store, bundle.index, query, scoped.scopes,
+                           include_historical=historical == "true")
         folder = request.query_params.get("folder")
         tag = request.query_params.get("tag")
         results: list[dict] = []
@@ -1010,11 +1016,11 @@ class ApiV1:
                     "snippet": hit.snippet,
                     "score": hit.score,
                     "headings": hit.headings,
+                    "memory_state": hit.memory_state,
+                    "memory_warnings": hit.warnings or [],
                 }
             )
-            if len(results) >= limit:
-                break
-        return JSONResponse({"results": results})
+        return JSONResponse({"results": results[:limit]})
 
     async def vault_asset(self, request: Request) -> Response:
         ident = self._require_identity(request)
@@ -1490,6 +1496,8 @@ class ApiV1:
                 "patch_note",
                 "append_note",
                 "update_frontmatter",
+                "set_memory_state",
+                "supersede_note",
                 "delete_note",
                 "move_note",
             ]

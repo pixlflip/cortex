@@ -48,6 +48,8 @@ _WRITE_TOOLS = {
     "cortex.patch_note",
     "cortex.append_note",
     "cortex.update_frontmatter",
+    "cortex.set_memory_state",
+    "cortex.supersede_note",
     "cortex.delete_note",
     "cortex.move_note",
 }

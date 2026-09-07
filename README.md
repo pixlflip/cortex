@@ -124,10 +124,24 @@ commit (always `git revert`-able):
 | `patch_note` | Replace a single unique string in an existing note |
 | `append_note` | Append text to an existing note |
 | `update_frontmatter` | Merge a patch into a note's YAML frontmatter |
+| `set_memory_state` | Change lifecycle YAML with a reason and expected file hash |
+| `supersede_note` | Link an old record to a current replacement, preserving both bodies |
 | `delete_note` | Delete one note file (committed, so still recoverable) |
 | `move_note` | Move/rename a note when both paths are writable |
 
 ---
+
+## Memory lifecycle
+
+Notes use a fixed `memory_state`: `unreviewed`, `draft`, `current`,
+`superseded`, or `disputed`. Missing metadata means unreviewed, not verified.
+Normal recall prefers current records and excludes superseded ones; historical
+recall is an explicit option. State-only operations preserve note-body bytes.
+The deterministic janitor reports metadata issues without modifying notes;
+optional bounded LLM suggestions remain advisory.
+
+See [`docs/memory-lifecycle.md`](docs/memory-lifecycle.md) for tool contracts,
+authorization, preservation guarantees, and first-iteration limitations.
 
 ## Configuration
 

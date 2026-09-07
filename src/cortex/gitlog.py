@@ -38,7 +38,7 @@ def _run(args: list[str], cwd: Path, env_extra: dict[str, str] | None = None) ->
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
-        ["git", *args],
+        ["git", "--literal-pathspecs", *args],
         cwd=str(cwd),
         capture_output=True,
         text=True,

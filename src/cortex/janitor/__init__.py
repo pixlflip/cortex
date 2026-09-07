@@ -25,6 +25,7 @@ from ..vaults import VaultManager
 
 _WIKILINK = re.compile(r"!?(?:\[\[)([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
 _FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+_LIFECYCLE_STATES = frozenset(("unreviewed", "draft", "current", "superseded", "disputed"))
 
 # These are hard boundaries, not configuration defaults.  Operator-provided
 # allow rules cannot override them.  The identity DB and configuration normally
@@ -100,6 +101,7 @@ def inspect_vault(vault_id: str, store, boundary: JanitorBoundary) -> JanitorRep
     visible = {p.casefold(): p for p in notes}
     visible.update({p.removesuffix(".md").casefold(): p for p in notes})
     findings: list[JanitorFinding] = []
+    metadata: dict[str, dict] = {}
     scanned = skipped = 0
     for path in notes:
         if not boundary.allows(path):
@@ -108,6 +110,7 @@ def inspect_vault(vault_id: str, store, boundary: JanitorBoundary) -> JanitorRep
         scanned += 1
         raw = store.read_text(path)
         match = _FRONTMATTER.match(raw)
+        frontmatter = {} if match is None and not raw.startswith("---") else None
         if raw.startswith("---") and match is None:
             findings.append(JanitorFinding(path, "frontmatter", "unclosed frontmatter block"))
         elif match is not None:
@@ -115,8 +118,14 @@ def inspect_vault(vault_id: str, store, boundary: JanitorBoundary) -> JanitorRep
                 value = yaml.safe_load(match.group(1))
                 if value is not None and not isinstance(value, dict):
                     findings.append(JanitorFinding(path, "frontmatter", "frontmatter must be a mapping"))
+                elif value is None:
+                    frontmatter = {}
+                else:
+                    frontmatter = value
             except yaml.YAMLError:
                 findings.append(JanitorFinding(path, "frontmatter", "invalid YAML frontmatter"))
+        if frontmatter is not None:
+            metadata[path] = frontmatter
         parent = PurePosixPath(path).parent
         for target in _WIKILINK.findall(raw):
             target = target.strip().replace("\\", "/")
@@ -125,7 +134,74 @@ def inspect_vault(vault_id: str, store, boundary: JanitorBoundary) -> JanitorRep
             candidates |= {relative.casefold(), relative.removesuffix(".md").casefold()}
             if not any(candidate in visible for candidate in candidates):
                 findings.append(JanitorFinding(path, "broken_link", target[:200]))
+    _inspect_lifecycle(metadata, visible, findings)
     return JanitorReport(vault_id, scanned, skipped, tuple(findings))
+
+
+def _note_target(value: object, visible: dict[str, str]) -> str | None:
+    """Resolve only a scalar, vault-local note reference; never a filesystem path."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip().replace("\\", "/")
+    try:
+        candidate = _normalise_path(candidate)
+    except ValueError:
+        return None
+    return visible.get(candidate.casefold()) or visible.get(candidate.removesuffix(".md").casefold())
+
+
+def _inspect_lifecycle(metadata: dict[str, dict], visible: dict[str, str], findings: list[JanitorFinding]) -> None:
+    """Report lifecycle metadata defects. This function is intentionally read-only."""
+    replacement_by_path: dict[str, str | None] = {}
+    for path, data in metadata.items():
+        state = data.get("memory_state")
+        # A missing state is not inferred from anything else (mtime/project status).
+        if "memory_state" not in data:
+            findings.append(JanitorFinding(path, "lifecycle", "missing memory_state (unreviewed; state not inferred)"))
+        elif not isinstance(state, str) or state not in _LIFECYCLE_STATES:
+            findings.append(JanitorFinding(path, "lifecycle", "invalid memory_state; allowed: unreviewed,draft,current,superseded,disputed"))
+        if isinstance(state, str) and state == "disputed":
+            findings.append(JanitorFinding(path, "lifecycle", "disputed memory requires review"))
+        if isinstance(state, str) and state == "superseded":
+            target = _note_target(data.get("memory_superseded_by"), visible)
+            replacement_by_path[path] = target
+            if target is None:
+                findings.append(JanitorFinding(path, "lifecycle", "superseded note requires valid memory_superseded_by"))
+            elif target == path:
+                findings.append(JanitorFinding(path, "lifecycle", "memory_superseded_by self-reference"))
+        elif "memory_superseded_by" in data:
+            replacement_by_path[path] = _note_target(data.get("memory_superseded_by"), visible)
+
+    # Replacement notes carry a list of the paths they supersede.
+    backlinks: dict[str, list[str]] = {path: [] for path in metadata}
+    for replacement, data in metadata.items():
+        refs = data.get("memory_supersedes", [])
+        if isinstance(refs, str):
+            refs = [refs]
+        if not isinstance(refs, list):
+            refs = []
+        for ref in refs:
+            target = _note_target(ref, visible)
+            if target is not None:
+                backlinks.setdefault(target, []).append(replacement)
+    for old, replacement in replacement_by_path.items():
+        if replacement is None or replacement == old:
+            continue
+        refs = backlinks.get(old, [])
+        if replacement not in refs:
+            findings.append(JanitorFinding(old, "lifecycle", f"replacement backlink missing or inconsistent: {replacement}"))
+    # Detect replacement chains/cycles, including cycles which do not begin at a
+    # valid superseded note. A bounded walk keeps malformed metadata harmless.
+    for start in replacement_by_path:
+        seen: list[str] = []
+        current = start
+        while current in replacement_by_path and replacement_by_path[current] is not None:
+            if current in seen:
+                cycle = " -> ".join(seen[seen.index(current):] + [current])
+                findings.append(JanitorFinding(start, "lifecycle", f"replacement cycle: {cycle}"))
+                break
+            seen.append(current)
+            current = replacement_by_path[current]  # type: ignore[assignment]
 
 
 def run_janitor_all(config: CortexConfig, db: Database) -> list[tuple[str, JanitorReport | Exception]]:

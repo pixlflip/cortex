@@ -25,6 +25,7 @@ import binascii
 import hashlib
 import logging
 import mimetypes
+import re
 from pathlib import Path
 
 import anyio
@@ -56,7 +57,12 @@ from .gateway import (
     ToolGovernor,
 )
 from .llm import LLMError, build_provider
+from .memory_lifecycle import (
+    STATES, MANAGED, MemoryState, serialized_write, inspect_memory, inspect_memory_bytes, memory_patch, parse_memory_bytes,
+    update_metadata_bytes, validate_memory_state,
+)
 from .scopes import filter_paths, path_allowed
+from .recall import recall_hits
 from .search_index import IndexHit, SearchIndex
 from .serialization import normalize_json
 from .vault import (
@@ -478,6 +484,7 @@ class CortexServer:
         max_notes: int,
         budget_chars: int,
         bundle: VaultBundle | None = None,
+        include_historical: bool = False,
     ) -> tuple[list[str], str]:
         """Deterministically gather the top *visible* chunks for a query into a
         compact, budgeted context string. Shared by context_pack and
@@ -494,10 +501,7 @@ class CortexServer:
         counted toward max_notes nor surfaced."""
         index = bundle.index if bundle is not None else self.index
         store = bundle.store if bundle is not None else self.vault
-        index.ensure_fresh()
-        over_fetch = max(max(1, max_notes) * 20, 500)
-        hits = index.search(query, limit=over_fetch)
-        scoped = [h for h in hits if path_allowed(h.path, principal.scopes)]
+        scoped = recall_hits(store, index, query, principal.scopes, include_historical=include_historical)
 
         # Dedup to the single best (top-ranked) chunk per note, preserving rank
         # order, then cap to max_notes distinct notes.
@@ -516,7 +520,10 @@ class CortexServer:
         for rel in order:
             hit: IndexHit = best_per_note[rel]
             breadcrumb = f" — {hit.headings}" if hit.headings else ""
-            header = f"\n## {rel}{breadcrumb}\n"
+            header = f"\n## {rel}{breadcrumb} [memory_state={hit.memory_state}]"
+            if hit.warnings:
+                header += " [warnings=" + ",".join(hit.warnings) + "]"
+            header += f" [vault={bundle.vault_id if bundle else MAIN_VAULT_ID}; line={hit.line}]\n"
             remaining = budget_chars - used - len(header)
             if remaining <= 0:
                 break
@@ -544,17 +551,99 @@ class CortexServer:
     # performs exactly one VaultStore mutation, commits it (actor + reason)
     # via GitAudit, and refreshes the search index.
 
-    def _do_write_note(
-        self,
-        principal: Principal,
-        path: str,
-        content: str,
-        reason: str,
-        *,
-        overwrite: bool = False,
-        validate_frontmatter: bool = True,
-        bundle: VaultBundle | None = None,
-    ) -> dict:
+    def _note_bytes(self, store, path):
+        try:
+            return store._resolve(path).read_bytes()
+        except (VaultError, OSError) as exc:
+            raise ValueError(f"not found or not in scope: {path}") from exc
+
+    def _save_note_updates(self, principal, updates, originals, reason, bundle=None):
+        """Roll back recoverable write/commit failures; index outcome is explicit.
+
+        Reject a pre-existing staged change rather than include another actor's
+        work. A process/power loss still requires ordinary Git/operator recovery.
+        """
+        import subprocess
+        store = bundle.store if bundle is not None else self.vault
+        git = bundle.git if bundle is not None else self.git
+        index = bundle.index if bundle is not None else self.index
+        if not git.config.enabled or not git.is_repo():
+            raise ValueError("an initialized Git audit repository is required")
+        staged = subprocess.run(['git', 'diff', '--cached', '--name-only'], cwd=store.root,
+                                capture_output=True, check=True).stdout
+        if staged.strip():
+            raise ValueError("vault has staged changes; finish or unstage them before writing")
+        head = git.head()
+        try:
+            for path, content in updates.items():
+                store.write_bytes(path, content)
+            actor = (f"user:{principal.name} via mcp" if bundle is not None and bundle.vault_id == principal.name
+                     else f"principal:{principal.name} via mcp")
+            commit = git.commit(actor=actor, reason=reason,
+                                paths=list(updates))
+        except Exception:
+            # Do not undo an already-committed operation if a post-commit reader failed.
+            if git.head() != head:
+                raise ValueError("audit HEAD changed; inspect operation before retrying")
+            for path, raw in originals.items():
+                if raw is None:
+                    target = store._resolve(path)
+                    if target.exists():
+                        target.unlink()
+                else:
+                    store.write_bytes(path, raw)
+            command = (['git', '--literal-pathspecs', 'reset', '-q', 'HEAD', '--', *updates] if head else
+                       ['git', '--literal-pathspecs', 'rm', '--cached', '--ignore-unmatch', '--', *updates])
+            subprocess.run(command, cwd=store.root, capture_output=True, check=True)
+            raise
+        indexed = True
+        try:
+            index.ensure_fresh()
+        except Exception:
+            indexed = False
+            _LOG.warning("memory index refresh pending after audited write")
+        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+                "commit": commit, "saved": True, "audited": True,
+                "index_status": "ready" if indexed else "pending"}
+
+    @staticmethod
+    def _check_hash(raw, expected):
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("expected SHA-256 must be 64 lowercase hexadecimal characters")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError("expected_sha256 mismatch; note was not changed")
+
+    @staticmethod
+    def _ordinary_metadata(raw, original, principal, reason, state=None):
+        """Validate every write route and reserve relationship fields for lifecycle tools."""
+        fm, _ = parse_memory_bytes(raw)
+        old = parse_memory_bytes(original)[0] if original is not None else {}
+        if 'memory_state' in fm:
+            validate_memory_state(fm['memory_state'])
+        for key in MANAGED - {'memory_state'}:
+            if key in fm and fm[key] != old.get(key):
+                raise ValueError("managed lifecycle metadata requires a lifecycle operation")
+        if state is not None:
+            validate_memory_state(state)
+            if 'memory_state' in fm and fm['memory_state'] != state and original is None:
+                raise ValueError("memory_state argument conflicts with YAML")
+        requested = state if state is not None else fm.get('memory_state', old.get('memory_state', 'unreviewed'))
+        validate_memory_state(requested)
+        previous = old.get('memory_state', 'unreviewed')
+        if requested == 'superseded' and previous != 'superseded':
+            raise ValueError("superseded may only be set by supersede_note")
+        if old.get('memory_superseded_by') and requested != previous:
+            raise ValueError("superseded records cannot be reactivated without resolving their replacement")
+        patch = {k: v for k, v in old.items() if k in MANAGED}
+        if original is None or requested != previous or state is not None:
+            patch.update(memory_patch(requested, actor=principal.name, reason=reason))
+        # Legacy existing content retains absent metadata until explicitly classified.
+        return update_metadata_bytes(raw, patch) if patch else raw
+
+    @serialized_write
+    def _do_write_note(self, principal: Principal, path: str, content: str, reason: str,
+                       *, overwrite: bool = False, validate_frontmatter: bool = True,
+                       memory_state: MemoryState | None = None, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
         store = bundle.store if bundle is not None else self.vault
         if validate_frontmatter:
@@ -562,64 +651,139 @@ class CortexServer:
         exists = store.exists(path)
         if exists and not overwrite:
             raise ValueError(f"note already exists (pass overwrite=True to replace): {path}")
-        store.write_text(path, content)
-        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "created": not exists, "commit": sha}
+        original = self._note_bytes(store, path) if exists else None
+        updated = self._ordinary_metadata(content.encode('utf-8'), original, principal, reason, memory_state)
+        receipt = self._save_note_updates(principal, {path: updated}, {path: original}, reason, bundle)
+        return {**receipt, 'path': path, 'created': not exists,
+                'sha256': hashlib.sha256(updated).hexdigest()}
 
-    def _do_patch_note(
-        self, principal: Principal, path: str, old_string: str, new_string: str, reason: str,
-        bundle: VaultBundle | None = None,
-    ) -> dict:
+    @serialized_write
+    def _do_patch_note(self, principal: Principal, path: str, old_string: str,
+                       new_string: str, reason: str, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
         store = bundle.store if bundle is not None else self.vault
-        try:
-            text = store.read_text(path)
-        except VaultError as exc:
-            raise ValueError(f"not found or not in scope: {path}") from exc
+        original = self._note_bytes(store, path)
+        text = original.decode('utf-8')
         count = text.count(old_string)
         if count == 0:
             raise ValueError(f"not found in {path}: {old_string!r}")
-        if count > 1:
+        if count != 1:
             raise ValueError(f"ambiguous: {count} matches in {path}")
-        new_text = text.replace(old_string, new_string, 1)
-        store.write_text(path, new_text)
-        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "commit": sha}
+        raw = text.replace(old_string, new_string, 1).encode('utf-8')
+        old_fm, _ = parse_memory_bytes(original)
+        new_fm, _ = parse_memory_bytes(raw)
+        if any(old_fm.get(k) != new_fm.get(k) for k in MANAGED):
+            raise ValueError('lifecycle metadata changes require set_memory_state or supersede_note')
+        updated = self._ordinary_metadata(raw, original, principal, reason)
+        return {**self._save_note_updates(principal, {path:updated}, {path:original}, reason, bundle), 'path':path}
 
-    def _do_append_note(
-        self, principal: Principal, path: str, text: str, reason: str, *, separator: str = "\n\n",
-        bundle: VaultBundle | None = None,
-    ) -> dict:
+    @serialized_write
+    def _do_append_note(self, principal: Principal, path: str, text: str, reason: str,
+                        *, separator: str = '\n\n', bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
-        try:
-            (bundle.store if bundle is not None else self.vault).append(path, text, separator=separator)
-        except VaultError as exc:
-            raise ValueError(f"not found or not in scope: {path}") from exc
-        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "commit": sha}
+        store = bundle.store if bundle is not None else self.vault
+        original = self._note_bytes(store, path)
+        raw = original + separator.encode('utf-8') + text.encode('utf-8')
+        updated = self._ordinary_metadata(raw, original, principal, reason)
+        return {**self._save_note_updates(principal, {path:updated}, {path:original}, reason, bundle), 'path':path}
 
-    def _do_update_frontmatter(
-        self, principal: Principal, path: str, patch: dict, reason: str,
-        bundle: VaultBundle | None = None,
-    ) -> dict:
+    @serialized_write
+    def _do_update_frontmatter(self, principal: Principal, path: str, patch: dict,
+                               reason: str, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
         store = bundle.store if bundle is not None else self.vault
         if not isinstance(patch, dict):
-            raise ValueError("patch must be a mapping")
-        try:
-            note = store.read_note(path)
-        except VaultError as exc:
-            raise ValueError(f"not found or not in scope: {path}") from exc
-        note.frontmatter.update(patch)
-        store.write_text(path, note.raw)
-        sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {
-            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
-            "path": path,
-            "frontmatter": normalize_json(note.frontmatter),
-            "commit": sha,
-        }
+            raise ValueError('patch must be a mapping')
+        original = self._note_bytes(store, path)
+        if set(patch) & (MANAGED - {'memory_state'}):
+            raise ValueError('managed lifecycle metadata requires a lifecycle operation')
+        raw = update_metadata_bytes(original, patch)
+        updated = self._ordinary_metadata(raw, original, principal, reason, patch.get('memory_state'))
+        receipt = self._save_note_updates(principal, {path:updated}, {path:original}, reason, bundle)
+        return {**receipt, 'path':path, 'frontmatter':normalize_json(parse_memory_bytes(updated)[0])}
 
+    @serialized_write
+    def _do_set_memory_state(self, principal: Principal, path: str, state: MemoryState,
+                             reason: str, expected_sha256: str, bundle: VaultBundle | None = None) -> dict:
+        path = self._require_writable(principal, path)
+        store = bundle.store if bundle is not None else self.vault
+        patch = memory_patch(state, actor=principal.name, reason=reason)
+        if state == 'superseded':
+            raise ValueError('superseded may only be set by supersede_note')
+        original = self._note_bytes(store, path)
+        self._check_hash(original, expected_sha256)
+        fm, _ = parse_memory_bytes(original)
+        if fm.get('memory_superseded_by'):
+            raise ValueError('superseded record has a replacement; cannot reactivate independently')
+        updated = update_metadata_bytes(original, patch)
+        receipt = self._save_note_updates(principal, {path:updated}, {path:original}, reason, bundle)
+        return {**receipt, 'path':path, 'state':state, 'sha256':hashlib.sha256(updated).hexdigest()}
+
+    @serialized_write
+    def _do_supersede_note(self, principal: Principal, old_path: str, replacement_path: str,
+                           reason: str, old_sha256: str, replacement_sha256: str,
+                           bundle: VaultBundle | None = None) -> dict:
+        old_path = self._require_writable(principal, old_path)
+        replacement_path = self._require_writable(principal, replacement_path)
+        # Lifecycle relationships must not reveal a note the caller cannot read.
+        self._require_visible(principal, old_path)
+        self._require_visible(principal, replacement_path)
+        if old_path == replacement_path:
+            raise ValueError('a note cannot supersede itself')
+        store = bundle.store if bundle is not None else self.vault
+        old_raw = self._note_bytes(store, old_path)
+        replacement_raw = self._note_bytes(store, replacement_path)
+        self._check_hash(old_raw, old_sha256)
+        self._check_hash(replacement_raw, replacement_sha256)
+        old_fm, _ = parse_memory_bytes(old_raw)
+        replacement_fm, _ = parse_memory_bytes(replacement_raw)
+        if old_fm.get('memory_superseded_by'):
+            raise ValueError('old note already has a replacement')
+        # A replacement with its own successor would create inconsistent current
+        # guidance; reject rather than silently reactivating historical records.
+        if replacement_fm.get('memory_superseded_by') or replacement_fm.get('memory_state') == 'superseded':
+            raise ValueError('replacement is itself superseded; possible cycle')
+        # Validate the old record's ancestry with DFS colors. Shared ancestors
+        # are legal; a back-edge or replacement-as-ancestor is not.
+        pending, visiting, complete = [(old_path, False)], set(), set()
+        while pending:
+            current, exiting = pending.pop()
+            if exiting:
+                visiting.remove(current)
+                complete.add(current)
+                continue
+            if current in complete:
+                continue
+            if current in visiting:
+                raise ValueError('supersession cycle detected')
+            self._require_visible(principal, current)
+            data, _ = parse_memory_bytes(self._note_bytes(store, current))
+            parents = data.get('memory_supersedes', [])
+            if not isinstance(parents, list) or any(not isinstance(x, str) for x in parents):
+                raise ValueError('invalid supersession metadata')
+            visiting.add(current)
+            pending.append((current, True))
+            for parent in reversed(parents):
+                parent = self._require_visible(principal, parent)
+                if parent == replacement_path or parent in visiting:
+                    raise ValueError('supersession cycle detected')
+                pending.append((parent, False))
+            if len(complete) + len(visiting) + len(pending) > 1000:
+                raise ValueError('supersession graph exceeds bounded validation')
+        links = replacement_fm.get('memory_supersedes', [])
+        if not isinstance(links, list) or any(not isinstance(x,str) for x in links):
+            raise ValueError('invalid replacement backlinks')
+        if old_path in links:
+            raise ValueError('replacement already links to old note')
+        updates = {
+            old_path: update_metadata_bytes(old_raw, {**memory_patch('superseded', actor=principal.name, reason=reason), 'memory_superseded_by':replacement_path}),
+            replacement_path: update_metadata_bytes(replacement_raw, {**memory_patch('current', actor=principal.name, reason=reason), 'memory_supersedes':[*links, old_path]}),
+        }
+        receipt = self._save_note_updates(principal, updates, {old_path:old_raw,replacement_path:replacement_raw}, reason, bundle)
+        return {**receipt, 'old_path':old_path, 'replacement_path':replacement_path,
+                'sha256':{p:hashlib.sha256(raw).hexdigest() for p,raw in updates.items()}}
+
+    @serialized_write
     def _do_delete_note(
         self, principal: Principal, path: str, reason: str,
         bundle: VaultBundle | None = None,
@@ -632,6 +796,7 @@ class CortexServer:
         sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "deleted": True, "commit": sha}
 
+    @serialized_write
     def _do_move_note(
         self,
         principal: Principal,
@@ -650,7 +815,7 @@ class CortexServer:
         store = bundle.store if bundle is not None else self.vault
         try:
             store.move_note(src, dest, overwrite=overwrite)
-        except VaultError as exc:
+        except (VaultError, OSError) as exc:
             # "note already exists"/"destination is a directory" describe dest,
             # which the caller can already write, so surfacing them leaks
             # nothing; a missing/absent source is reported the same non-leaking
@@ -695,6 +860,7 @@ class CortexServer:
             "sha256": digest,
         }
 
+    @serialized_write
     def _do_put_file(
         self,
         principal: Principal,
@@ -878,6 +1044,7 @@ class CortexServer:
             query: str,
             regex: bool = False,
             limit: int = 50,
+            include_historical: bool = False,
             vault: str | None = None,
         ) -> list[dict]:
             """Search visible notes. By default, ranked keyword/natural-language
@@ -889,24 +1056,13 @@ class CortexServer:
             p = self._get_principal()
             bundle, p = self._select_vault(p, vault)
             capped = max(1, min(limit, 200))
-            if regex:
-                hits = bundle.store.search(query, regex=True, limit=capped)
-                scoped = [h for h in hits if path_allowed(h.path, p.scopes)]
-                return [asdict(h) for h in scoped[:capped]]
-            # Over-fetch ranked candidates *before* scope-filtering so an
-            # out-of-scope note is never counted toward the requested limit —
-            # only truncate to `limit` after filtering. The over-fetch floor is
-            # intentionally NOT scaled down for small `limit`: a principal with
-            # a narrow scope inside a large vault can have dozens of
-            # higher-ranked out-of-scope hits ahead of their first visible one,
-            # so a small limit must not shrink the candidate pool.
-            bundle.index.ensure_fresh()
-            over_fetch = max(capped * 5, 500)
-            hits = bundle.index.search(query, limit=over_fetch)
-            scoped = [h for h in hits if path_allowed(h.path, p.scopes)][:capped]
+            hits = recall_hits(bundle.store, bundle.index, query, p.scopes,
+                               include_historical=include_historical, regex=regex)
             return [
-                {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score}
-                for h in scoped
+                {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score,
+                 "memory_state": h.memory_state, "warnings": h.warnings or [],
+                 "state_changed_at": h.state_changed_at}
+                for h in hits[:capped]
             ]
 
         @mcp.tool()
@@ -955,20 +1111,21 @@ class CortexServer:
             query: str,
             max_notes: int = 5,
             budget_chars: int = 6000,
+            include_historical: bool = False,
             vault: str | None = None,
         ) -> str:
             """Assemble a compact, token-budgeted context bundle for a query from
             the highest-matching visible notes. Deterministic; no model spend."""
             p = self._get_principal()
             bundle, p = self._select_vault(p, vault)
-            used, ctx = self._gather_context(p, query, max_notes, budget_chars, bundle)
+            used, ctx = self._gather_context(p, query, max_notes, budget_chars, bundle, include_historical)
             if not used:
                 return f"# Context pack for: {query}\n\n_No visible notes matched this query._\n"
             return f"# Context pack for: {query}\n{ctx}"
 
         @mcp.tool()
         def semantic_search(
-            question: str, max_notes: int = 8, vault: str | None = None
+            question: str, max_notes: int = 8, vault: str | None = None, include_historical: bool = False
         ) -> str:
             """Fuzzy 'comb the vault and synthesize' search. This is the only tool
             that spends model tokens: it retrieves the most relevant *visible*
@@ -984,7 +1141,8 @@ class CortexServer:
                     "deterministic retrieval, or configure a provider."
                 )
             used, ctx = self._gather_context(
-                p, question, max_notes=max_notes, budget_chars=12000, bundle=bundle
+                p, question, max_notes=max_notes, budget_chars=12000, bundle=bundle,
+                include_historical=include_historical
             )
             if not used:
                 return (
@@ -1059,6 +1217,7 @@ class CortexServer:
                 reason: str,
                 overwrite: bool = False,
                 validate_frontmatter: bool = True,
+                memory_state: MemoryState | None = None,
                 vault: str | None = None,
             ) -> dict:
                 """Create a new note, or replace an existing one if
@@ -1073,8 +1232,28 @@ class CortexServer:
                 return self._do_write_note(
                     p, path, content, reason,
                     overwrite=overwrite, validate_frontmatter=validate_frontmatter,
+                    memory_state=memory_state,
                     bundle=bundle,
                 )
+
+            @mcp.tool()
+            def set_memory_state(path: str, memory_state: MemoryState, reason: str,
+                                 expected_sha256: str, vault: str | None = None) -> dict:
+                """Change lifecycle YAML only; expected_sha256 is mandatory."""
+                p = self._get_principal()
+                bundle, p = self._select_vault(p, vault, write=True)
+                return self._do_set_memory_state(p, path, memory_state, reason,
+                                                 expected_sha256, bundle)
+
+            @mcp.tool()
+            def supersede_note(old_path: str, replacement_path: str, reason: str,
+                               old_sha256: str, replacement_sha256: str,
+                               vault: str | None = None) -> dict:
+                """Atomically mark old note superseded and replacement current."""
+                p = self._get_principal()
+                bundle, p = self._select_vault(p, vault, write=True)
+                return self._do_supersede_note(p, old_path, replacement_path, reason,
+                                               old_sha256, replacement_sha256, bundle)
 
             @mcp.tool()
             def patch_note(
