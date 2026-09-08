@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from cortex.memory_lifecycle import STATES, inspect_memory, update_metadata_bytes
-from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, WritesConfig
+from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
 from cortex.server import CortexServer
 
 
@@ -23,10 +23,10 @@ def test_interfaces_and_byte_preservation():
 
 
 def test_server_lifecycle_hash_and_supersede(tmp_path: Path):
-    root = tmp_path / "v"; root.mkdir()
+    root = tmp_path / "vaults" / "p"; root.mkdir(parents=True)
     (root / "old.md").write_bytes(b"# old\r\nold body")
     (root / "new.md").write_bytes(b"# new\r\nnew body")
-    cfg = CortexConfig(vault=VaultConfig(path=root), index=IndexConfig(enabled=False),
+    cfg = CortexConfig(vault=VaultConfig(), vaults=VaultsConfig(root=root.parent, index_dir=tmp_path/'indexes'), index=IndexConfig(enabled=False),
                        principals=[Principal(name="p", scopes=["**"])],
                        writes=WritesConfig(enabled=True))
     srv = CortexServer(cfg, principal=cfg.principal("p")); srv.git.ensure_repo(); srv.git.commit("boot", "boot")

@@ -73,7 +73,7 @@ from .vault import (
     canonical_asset_path,
     canonical_note_path,
 )
-from .vaults import MAIN_VAULT_ID, VaultBundle, VaultManager
+from .vaults import VaultBundle, VaultManager
 
 
 _LOG = logging.getLogger("cortex.janitor")
@@ -206,10 +206,6 @@ class CortexServer:
         )
         if identity is not None:
             identity.vault_manager = self.vault_manager
-        main = self.vault_manager.get(MAIN_VAULT_ID)
-        self.vault = main.store
-        self.index = main.index
-        self.git = main.git
         self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
         self.gateway_runtime = GatewayRuntime(config, identity) if identity is not None else None
         # The /api/v1 route group (cortex.api.ApiV1); attached by
@@ -230,6 +226,26 @@ class CortexServer:
             self.gateway_runtime.register_discovery_tools(self.mcp, catalog)
             self.gateway_runtime.register_cached_tools(self.mcp)
             self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
+
+    @property
+    def _local_bundle(self):
+        # Helpers without an explicit bundle are for authenticated stdio only.
+        # HTTP requests must always carry their request-selected account bundle.
+        if self.principal is None:
+            raise VaultAccessError("an explicit account vault is required")
+        return self.vault_access.select(self.principal)[0]
+
+    @property
+    def vault(self):
+        return self._local_bundle.store
+
+    @property
+    def index(self):
+        return self._local_bundle.index
+
+    @property
+    def git(self):
+        return self._local_bundle.git
 
     def _build_mcp(self, http: HttpServe | None) -> GovernedFastMCP:
         @asynccontextmanager
@@ -523,7 +539,7 @@ class CortexServer:
             header = f"\n## {rel}{breadcrumb} [memory_state={hit.memory_state}]"
             if hit.warnings:
                 header += " [warnings=" + ",".join(hit.warnings) + "]"
-            header += f" [vault={bundle.vault_id if bundle else MAIN_VAULT_ID}; line={hit.line}]\n"
+            header += f" [vault={bundle.vault_id if bundle else self._local_bundle.vault_id}; line={hit.line}]\n"
             remaining = budget_chars - used - len(header)
             if remaining <= 0:
                 break
@@ -602,7 +618,7 @@ class CortexServer:
         except Exception:
             indexed = False
             _LOG.warning("memory index refresh pending after audited write")
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+        return {"vault": bundle.vault_id if bundle else self._local_bundle.vault_id,
                 "commit": commit, "saved": True, "audited": True,
                 "index_status": "ready" if indexed else "pending"}
 
@@ -630,6 +646,9 @@ class CortexServer:
         requested = state if state is not None else fm.get('memory_state', old.get('memory_state', 'unreviewed'))
         validate_memory_state(requested)
         previous = old.get('memory_state', 'unreviewed')
+        if (original is not None and previous == 'current' and state is None
+                and parse_memory_bytes(raw)[1] != parse_memory_bytes(original)[1]):
+            requested = 'unreviewed'
         if requested == 'superseded' and previous != 'superseded':
             raise ValueError("superseded may only be set by supersede_note")
         if old.get('memory_superseded_by') and requested != previous:
@@ -794,7 +813,7 @@ class CortexServer:
         except VaultError as exc:
             raise ValueError(f"not found or not in scope: {path}") from exc
         sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
-        return {"vault": bundle.vault_id if bundle else MAIN_VAULT_ID, "path": path, "deleted": True, "commit": sha}
+        return {"vault": bundle.vault_id if bundle else self._local_bundle.vault_id, "path": path, "deleted": True, "commit": sha}
 
     @serialized_write
     def _do_move_note(
@@ -830,7 +849,7 @@ class CortexServer:
             principal, reason, src, dest, bundle=bundle
         )
         return {
-            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+            "vault": bundle.vault_id if bundle else self._local_bundle.vault_id,
             "src": src,
             "dest": dest,
             "moved": True,
@@ -906,7 +925,7 @@ class CortexServer:
             raise ValueError(f"file could not be written: {path}") from exc
         sha = self._commit_and_reindex(principal, reason, path, bundle=bundle)
         return {
-            "vault": bundle.vault_id if bundle else MAIN_VAULT_ID,
+            "vault": bundle.vault_id if bundle else self._local_bundle.vault_id,
             "path": path,
             "created": not existed,
             "size": len(content),
@@ -1404,7 +1423,7 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         from .oauth import CortexOAuthProvider
 
         provider = CortexOAuthProvider(
-            authn, base, config.vault.path.parent.parent / "oauth-clients.json"
+            authn, base, config.database.path.parent / "oauth-clients.json"
         )
         resource_url = base.rstrip(chr(47)) + sc.path
         auth_settings = AuthSettings(

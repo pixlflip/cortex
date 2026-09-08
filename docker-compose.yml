@@ -1,7 +1,7 @@
 # Cortex via Docker Compose — the primary one-command spin-up.
 #
 #   1. cp cortex.example.yaml cortex.yaml   # edit to taste
-#   2. put your notes in ./vault            # or point vault.path elsewhere
+#   2. import notes into ./data/vaults/<owning-account>
 #   3. docker compose run --rm cortex check
 #   4. docker compose run --rm cortex init  # create the git audit baseline
 #
@@ -21,7 +21,6 @@ services:
       # CORTEX_TOKEN_LOCAL: ${CORTEX_TOKEN_LOCAL}
       # CORTEX_LLM_API_KEY: ${CORTEX_LLM_API_KEY}
     volumes:
-      - ./vault:/data/vault
       - ./data:/data/data
       - ./cortex.yaml:/data/cortex.yaml:ro
     # stdin_open/tty let stdio MCP clients attach (docker compose run -it).

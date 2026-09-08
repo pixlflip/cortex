@@ -60,6 +60,7 @@ class GitConfig:
 
 @dataclass
 class VaultConfig:
+    # Deprecated migration input. Never registered or served as a live vault.
     path: Path = Path("./vault")
     git: GitConfig = field(default_factory=GitConfig)
 
@@ -76,17 +77,15 @@ class SyncConfig:
 class VaultsConfig:
     """Per-user (multi-)vault registry settings (v2 design §5, B1).
 
-    Public-safe: paths only, no secrets. Entirely optional — when the
-    ``vaults:`` block is absent this whole dataclass takes its defaults and a
-    pure-v1 single-vault deployment behaves exactly as before, because nothing
-    provisions or iterates per-user vaults until a user is actually created.
+    Public-safe: paths only, no secrets. Only named account directories are
+    registered. Legacy vault.path is migration input, never a live default.
 
     * ``root`` — where per-user vault directories live (``root/<username>/``),
       each its own Obsidian vault + git repo.
     * ``index_dir`` — where the per-user search-index SQLite caches live
       (``index_dir/<username>.index.sqlite``). Kept OUTSIDE the vaults so an
-      index is never committed or synced. The main/shared vault keeps using
-      ``index.path`` for backward compatibility.
+      index is never committed or synced. Legacy index.path is not used for
+      live account indexes.
     * ``template_dir`` — optional skeleton copied into a freshly provisioned
       vault (welcome note, folder structure). Unset ⇒ a single welcome note.
     * ``archive_dir`` — where ``cortex vault archive`` MOVES a vault to
@@ -94,8 +93,7 @@ class VaultsConfig:
       archiving preserves the git history rather than destroying it.
     * ``auto_provision`` — provision a user's vault automatically on user
       creation. When false, run ``cortex vault provision <user>`` explicitly.
-    * ``sync`` — the default sync adapter inherited by every per-user vault
-      (the main vault keeps using the top-level ``sync:`` block).
+    * ``sync`` — the default sync adapter inherited by account vaults.
     * ``sync_overrides`` — optional username-to-sync mappings for vaults that
       do not use the per-user default.
     """

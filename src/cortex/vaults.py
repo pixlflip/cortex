@@ -1,36 +1,10 @@
-"""Vault registry & provisioning — the multi-vault storage layer (B1).
+"""Account-owned vault storage, Git audit and search indexes.
 
-Cortex v2 gives **every user their own vault directory with its own git repo**
-(design §5), alongside the existing main/shared vault (``vault.path``). This
-module owns them all through :class:`VaultManager`: a registry that, for any
-vault, hands back the ``(VaultStore, GitAudit, SearchIndex)`` triple the rest
-of the system operates through, and that provisions / archives the per-user
-vaults over their lifecycle.
-
-Scope discipline (B1): this is the **storage layer only**. There is no
-request-time routing, no scope/authorization enforcement, no container/macro
-view — those are B2, which builds on the lookup API here. What B2 asks of this
-module is exactly one thing: *"give me the store/audit/index for vault X"*
-(:meth:`VaultManager.get`).
-
-On-disk layout (design §5)::
-
-    <vaults.root>/<username>/          # one Obsidian vault per user
-        .git/                          # one git repo per vault (its audit trail)
-        ...notes (.md)
-    <vaults.index_dir>/<username>.index.sqlite   # rebuildable per-vault index
-
-The **main/shared vault is unchanged**: it keeps ``vault.path`` for its
-directory, ``vault.git`` for its repo config, and ``index.path`` for its
-search index — so a pure-v1 deployment (no ``vaults:`` block, no users) behaves
-exactly as before, because nothing here provisions or iterates a per-user vault
-until a user is actually created.
-
-Filesystem safety: a username becomes a directory name, so it is validated
-against the same strict charset A4 enforces for usernames (mirrored in
-:data:`_VAULT_ID_RE`) and the resolved path is re-checked to sit inside the
-vaults root — traversal (``..``), separators, and absolute paths can never
-escape it.
+Every live vault is a named account directory under vaults.root. Legacy
+vault.path is migration input only, never an implicit shared store. Old
+clients requesting the retired global id fail closed instead of seeing
+another account's notes. Storage lookup does not itself authorize a caller;
+VaultAccessResolver enforces ownership and explicit administrator selection.
 """
 
 from __future__ import annotations
@@ -46,11 +20,7 @@ from .gitlog import GitAudit
 from .search_index import SearchIndex
 from .vault import VaultStore
 
-#: Reserved id of the main/shared vault. Not a legal username (usernames must
-#: start with an alphanumeric and ``main`` is fine as a name, but the manager
-#: keys the main vault under this constant and refuses to provision a user
-#: vault under it), so config principals / shared-vault grants target it via
-#: this id and it can never collide with a per-user directory keyed by username.
+# Retired identifier: kept only to reject old clients and migrations safely.
 MAIN_VAULT_ID = "main"
 
 # Mirrors cortex.users._USERNAME_RE (the A4 charset): leading alphanumeric,
@@ -77,7 +47,7 @@ def sanitize_vault_id(username: str) -> str:
     candidate = (username or "").strip()
     if candidate == MAIN_VAULT_ID:
         raise VaultManagerError(
-            f"{MAIN_VAULT_ID!r} is the reserved id of the main/shared vault"
+            f"{MAIN_VAULT_ID!r} is a retired global vault id; select an account"
         )
     if not _VAULT_ID_RE.match(candidate):
         raise VaultManagerError(
@@ -104,7 +74,6 @@ class VaultBundle:
     store: VaultStore
     git: GitAudit
     index: SearchIndex
-    is_main: bool
 
 
 @dataclass
@@ -130,14 +99,7 @@ class RepairResult:
 
 
 class VaultManager:
-    """Owns the registry of vaults (main + per-user) and their lifecycle.
-
-    Construction is cheap and creates nothing on disk — a pure-v1 deployment
-    that never provisions a user never grows a ``data/vaults`` tree. Vaults are
-    **derived from disk** (the filesystem is the source of truth, per design
-    §4): the registry is the main vault plus every provisioned directory under
-    ``vaults.root``.
-    """
+    """Registry of account directories; no global vault is registered."""
 
     def __init__(self, config: CortexConfig):
         self.config = config
@@ -158,13 +120,12 @@ class VaultManager:
     # -- path resolution ------------------------------------------------------
 
     def root_for(self, vault_id: str) -> Path:
-        """The on-disk directory of a vault. ``MAIN_VAULT_ID`` → the existing
-        ``vault.path``; a username → ``vaults.root/<username>`` (validated and
-        confirmed to sit inside the root)."""
-        if vault_id == MAIN_VAULT_ID:
-            return Path(self.config.vault.path)
+        """Validated account directory, contained in vaults.root."""
         safe = sanitize_vault_id(vault_id)
-        root = (self.root / safe).resolve()
+        candidate = self.root / safe
+        if candidate.is_symlink():
+            raise VaultManagerError("account vault cannot be a symlink")
+        root = candidate.resolve()
         # Belt-and-suspenders: even a charset-valid id must resolve inside the
         # vaults root (guards against symlink/edge shenanigans in `self.root`).
         try:
@@ -176,12 +137,7 @@ class VaultManager:
         return root
 
     def index_path_for(self, vault_id: str) -> Path:
-        """Where a vault's search-index SQLite cache lives. The main vault
-        keeps ``index.path`` (v1 backward compatibility); a user vault gets
-        ``index_dir/<username>.index.sqlite`` — outside every vault so it is
-        never committed or synced."""
-        if vault_id == MAIN_VAULT_ID:
-            return Path(self.config.index.path)
+        """Per-account rebuildable index, outside note storage."""
         safe = sanitize_vault_id(vault_id)
         return self.index_dir / f"{safe}.index.sqlite"
 
@@ -189,8 +145,6 @@ class VaultManager:
 
     def exists(self, vault_id: str) -> bool:
         """Whether a vault directory is present on disk."""
-        if vault_id == MAIN_VAULT_ID:
-            return Path(self.config.vault.path).is_dir()
         try:
             return self.root_for(vault_id).is_dir()
         except VaultManagerError:
@@ -204,16 +158,15 @@ class VaultManager:
             return []
         ids: list[str] = []
         for child in sorted(root.iterdir()):
-            if not child.is_dir() or child.name.startswith("."):
+            if child.is_symlink() or not child.is_dir() or child.name.startswith(".") or child.name == MAIN_VAULT_ID:
                 continue
             if _VAULT_ID_RE.match(child.name):
                 ids.append(child.name)
         return ids
 
     def vault_ids(self) -> list[str]:
-        """All registered vaults: the main/shared vault first, then every
-        provisioned per-user vault."""
-        return [MAIN_VAULT_ID, *self.user_vault_ids()]
+        """All provisioned account directories; never a global store."""
+        return self.user_vault_ids()
 
     # -- the B2 lookup surface ------------------------------------------------
 
@@ -223,7 +176,7 @@ class VaultManager:
 
         Raises :class:`VaultManagerError` if the vault directory does not
         exist (a user vault must be provisioned first)."""
-        key = MAIN_VAULT_ID if vault_id == MAIN_VAULT_ID else sanitize_vault_id(vault_id)
+        key = sanitize_vault_id(vault_id)
         cached = self._bundles.get(key)
         if cached is not None:
             return cached
@@ -247,7 +200,6 @@ class VaultManager:
             store=store,
             git=git,
             index=index,
-            is_main=(key == MAIN_VAULT_ID),
         )
         self._bundles[key] = bundle
         return bundle
@@ -262,12 +214,7 @@ class VaultManager:
         return self.get(vault_id).index
 
     def sync_config_for(self, vault_id: str) -> SyncConfig:
-        """The sync adapter a vault uses: the main vault keeps the top-level
-        ``sync:`` block; a user vault uses its named
-        ``vaults.sync_overrides`` entry when present and otherwise inherits
-        ``vaults.sync``."""
-        if vault_id == MAIN_VAULT_ID:
-            return self.config.sync
+        """Account-specific sync override, otherwise the per-account default."""
         safe = sanitize_vault_id(vault_id)
         if safe in self.vaults_cfg.sync_overrides:
             return self.vaults_cfg.sync_overrides[safe]
@@ -414,8 +361,6 @@ class VaultManager:
     def _teardown_index(self, vault_id: str) -> None:
         """Close and delete a vault's rebuildable index cache (main vault's
         index is left alone — it is never archived/deleted here)."""
-        if vault_id == MAIN_VAULT_ID:
-            return
         cached = self._bundles.get(vault_id)
         if cached is not None:
             cached.index.close()

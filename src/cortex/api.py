@@ -77,7 +77,7 @@ from .recall import recall_hits
 from .sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from .users import AuthzError, IdentityError, IdentityService
 from .vault import VaultError, canonical_asset_path, canonical_note_path
-from .vaults import MAIN_VAULT_ID, VaultManagerError, attach_vault_manager
+from .vaults import VaultManagerError, attach_vault_manager
 
 API_PREFIX = "/api/v1"
 
@@ -918,7 +918,9 @@ class ApiV1:
                     ).adapter,
                 }
             )
-        return JSONResponse({"vaults": items})
+        return JSONResponse({"vaults": items, "default_vault": next(
+            (item["id"] for item in items if item["id"] == principal.name), None
+        )})
 
     async def vault_tree(self, request: Request) -> Response:
         ident = self._require_identity(request)

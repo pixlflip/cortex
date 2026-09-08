@@ -26,7 +26,11 @@ YAML formatting may change. Malformed YAML must be repaired before mutation;
 
 - `write_note(..., memory_state=...)` and
   `update_frontmatter(..., {"memory_state": ...})` accept valid ordinary states.
-  Overwriting a note without an explicit state change preserves its lifecycle.
+  A body edit to a `current` note without explicit reaffirmation downgrades it
+  to `unreviewed` and records the reason. Identical-body writes and YAML-only
+  edits preserve the state. Other states remain unchanged unless explicitly set.
+  This applies to Cortex write, append, patch, and Markdown upload routes;
+  external filesystem/Obsidian edits are not intercepted by this write guard.
 - `set_memory_state(path, memory_state, reason, expected_sha256)` changes metadata
   only. The hash is the SHA-256 of the complete raw file, obtainable using
   `get_file`. A stale hash fails without changing the note.

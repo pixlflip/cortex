@@ -46,22 +46,20 @@ from cortex.vaults import (
 
 @pytest.fixture
 def main_vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
-    root.mkdir()
-    (root / "Main.md").write_text("# main\n\nshared content\n", encoding="utf-8")
+    root = tmp_path / "vaults" / "alice"
     return root
 
 
 def _cfg(main_vault: Path, tmp_path: Path, **vaults_kw) -> CortexConfig:
     data = tmp_path / "data"
     vaults = VaultsConfig(
-        root=vaults_kw.pop("root", data / "vaults"),
+        root=vaults_kw.pop("root", main_vault.parent),
         index_dir=vaults_kw.pop("index_dir", data / "indexes"),
         archive_dir=vaults_kw.pop("archive_dir", data / "archive"),
         **vaults_kw,
     )
     return CortexConfig(
-        vault=VaultConfig(path=main_vault, git=GitConfig()),
+        vault=VaultConfig(git=GitConfig()),
         vaults=vaults,
         index=IndexConfig(enabled=True, path=tmp_path / "cortex.index.sqlite"),
         database=DatabaseConfig(path=data / "cortex.sqlite"),
@@ -184,25 +182,21 @@ def test_provision_rejects_traversal(manager: VaultManager):
 
 # -- registry / lookup -------------------------------------------------------
 
-def test_main_vault_resolves_under_manager(manager: VaultManager, main_vault: Path):
-    assert manager.exists(MAIN_VAULT_ID)
-    bundle = manager.get(MAIN_VAULT_ID)
-    assert bundle.is_main
-    assert bundle.root == main_vault.resolve()
-    assert "Main.md" in bundle.store.list_notes()
+def test_account_vault_resolves_under_manager(manager: VaultManager, main_vault: Path):
+    manager.provision("alice")
+    bundle = manager.get("alice")
+    assert bundle.root == manager.root_for("alice")
 
 
-def test_main_vault_keeps_v1_index_path(manager: VaultManager, tmp_path: Path):
-    # Backward compatibility: the main vault's index stays at index.path,
-    # while user vaults get data/indexes/<user>.index.sqlite.
-    assert manager.index_path_for(MAIN_VAULT_ID) == tmp_path / "cortex.index.sqlite"
+def test_account_vault_uses_account_index_path(manager: VaultManager, tmp_path: Path):
     assert manager.index_path_for("alice").name == "alice.index.sqlite"
+    assert manager.index_path_for("bob").name == "bob.index.sqlite"
 
 
-def test_vault_ids_lists_main_then_users(manager: VaultManager):
+def test_vault_ids_lists_provisioned_accounts(manager: VaultManager):
     manager.provision("alice")
     manager.provision("bob")
-    assert manager.vault_ids() == [MAIN_VAULT_ID, "alice", "bob"]
+    assert manager.vault_ids() == ["alice", "bob"]
 
 
 def test_get_unprovisioned_user_vault_raises(manager: VaultManager):
@@ -220,9 +214,8 @@ def test_get_caches_bundle(manager: VaultManager):
 def test_archive_moves_not_destroys(manager: VaultManager):
     manager.provision("alice")
     root = manager.root_for("alice")
-    dest = manager.archive("alice", timestamp="20260101T000000Z")
-
-    assert not root.exists()  # moved out of the live registry
+    (root / "Main.md").write_text("# main\n", encoding="utf-8")
+    dest = manager.archive("alice", timestamp="20260101T000000Z")  # moved out of the live registry
     assert dest.is_dir()
     assert (dest / "Welcome.md").is_file()
     assert (dest / ".git").is_dir()  # git history preserved
@@ -300,7 +293,7 @@ def test_run_sync_all_covers_every_vault(main_vault: Path, tmp_path: Path):
 
     results = run_sync_all(cfg)
     ids = [vid for vid, _ in results]
-    assert ids == [MAIN_VAULT_ID, "alice", "bob"]
+    assert ids == ["alice", "bob"]
     for _vid, summary in results:
         assert not isinstance(summary, Exception)
         assert summary["remote"] == "skipped"
@@ -320,13 +313,12 @@ def test_run_sync_all_isolates_a_failing_vault(main_vault: Path, tmp_path: Path)
     # it raises, and the others must still complete.
     import shutil
 
-    broken_git = tmp_path / "data" / "vaults" / "broken" / ".git"
+    broken_git = main_vault.parent / "broken" / ".git"
     shutil.rmtree(broken_git)
     broken_git.write_text("gitdir: nowhere-corrupt\n", encoding="utf-8")
 
     results = dict(run_sync_all(cfg))
     assert isinstance(results["broken"], Exception)
-    assert not isinstance(results[MAIN_VAULT_ID], Exception)
     assert not isinstance(results["good"], Exception)
 
 
@@ -335,8 +327,6 @@ def test_cmd_index_iterates_all_vaults(main_vault: Path, tmp_path: Path, capsys)
 
     cfg_path = tmp_path / "cortex.yaml"
     cfg_path.write_text(
-        "vault:\n"
-        f"  path: {main_vault}\n"
         "vaults:\n"
         f"  root: {tmp_path / 'data' / 'vaults'}\n"
         f"  index_dir: {tmp_path / 'data' / 'indexes'}\n"
@@ -351,8 +341,8 @@ def test_cmd_index_iterates_all_vaults(main_vault: Path, tmp_path: Path, capsys)
     rc = cli_main(["-c", str(cfg_path), "index"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "vault 'main'" in out
     assert "vault 'alice'" in out
+    assert "vault 'bob'" not in out
 
 
 # -- pure-v1 backward compatibility ------------------------------------------

@@ -35,11 +35,11 @@ def _dist_path() -> Path | None:
 def register_web_app(mcp, config, vault_manager) -> None:
     async def health(_: Request) -> Response:
         checks = {
-            "main_vault": vault_manager.exists("main"),
+            "account_storage": vault_manager.root.is_dir(),
             "database": config.database.path.exists(),
             "spa": _dist_path() is not None,
         }
-        ready = checks["main_vault"] and checks["database"]
+        ready = checks["account_storage"] and checks["database"]
         return JSONResponse(
             {"status": "ok" if ready else "degraded", "version": __version__, "checks": checks},
             status_code=200 if ready else 503,

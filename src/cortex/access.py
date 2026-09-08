@@ -7,11 +7,10 @@ of those stores a caller may address before any path-level scope check runs.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from .config import CortexConfig, Principal
-from .vaults import MAIN_VAULT_ID, VaultBundle, VaultManager, VaultManagerError
+from .vaults import VaultBundle, VaultManager, VaultManagerError
 
 
 class VaultAccessError(Exception):
@@ -36,14 +35,10 @@ class VaultGrant:
 
 
 class VaultAccessResolver:
-    """Resolve container and macro views for one request.
+    """Resolve account-owned memory. No global/shared-vault fallback.
 
-    * SQLite users own exactly one private vault.  Admin users get the macro
-      view across every registered vault.
-    * Group ``scopes_json`` grants read access into ``main``; migration 2's
-      ``write_scopes_json`` independently grants mutations there.
-    * Config principals and legacy admin clients remain main-vault identities
-      for backward compatibility.
+    Group tool policies remain independent of memory ownership. Legacy group
+    path grants do not confer access to any account's vault.
     """
 
     def __init__(
@@ -64,80 +59,27 @@ class VaultAccessResolver:
     def grants(self, principal: Principal) -> list[VaultGrant]:
         user = self._user(principal)
         if user is None:
-            return [
-                VaultGrant(
-                    MAIN_VAULT_ID,
-                    tuple(principal.scopes),
-                    tuple(principal.write_scopes or principal.scopes),
-                    "principal",
-                )
-            ]
-
+            # Config-only local identities have exactly their named account.
+            # On an identity-backed server, a missing DB account is not a user.
+            if self.identity is not None or not self.manager.exists(principal.name):
+                return []
+            return [VaultGrant(principal.name, tuple(principal.scopes),
+                               tuple(principal.write_scopes or principal.scopes), "owner")]
         if user["disabled"]:
             return []
         token_scopes = principal.token_scopes
+        scopes = tuple(token_scopes) if token_scopes is not None else ("**",)
+        if not scopes:
+            return []
+        ids = [user["username"]]
         if user["is_admin"]:
-            scopes = tuple(token_scopes) if token_scopes is not None else ("**",)
-            return [
-                VaultGrant(vault_id, scopes, scopes, "admin")
-                for vault_id in self.manager.vault_ids()
-                if scopes
-            ]
-
-        grants: list[VaultGrant] = []
-        if self.manager.exists(user["username"]):
-            owner_scopes = (
-                tuple(token_scopes) if token_scopes is not None else ("**",)
-            )
-            if owner_scopes:
-                grants.append(
-                    VaultGrant(
-                        user["username"], owner_scopes, owner_scopes, "owner"
-                    )
-                )
-
-        read_scopes: list[str] = []
-        write_scopes: list[str] = []
-        for group in self.identity.groups.groups_for_user(user["id"]):
-            raw_read = group.get("scopes_json")
-            for scope in json.loads(raw_read or "[]"):
-                if scope not in read_scopes:
-                    read_scopes.append(scope)
-            raw_write = group.get("write_scopes_json") if isinstance(group, dict) else None
-            # NULL preserves the v1 behavior: writable scope falls back to
-            # readable scope. An explicit [] means deliberately read-only.
-            for scope in json.loads(raw_write if raw_write is not None else (raw_read or "[]")):
-                if scope not in write_scopes:
-                    write_scopes.append(scope)
-        if token_scopes is not None:
-            # ``principal.scopes`` is the already-contained intersection of
-            # token constraints with shared read grants. Write grants must be
-            # narrowed independently with the same containment rule.
-            read_scopes = list(principal.scopes)
-
-            def within(candidate: str, grant: str) -> bool:
-                if grant == "**" or candidate == grant:
-                    return True
-                if grant.endswith("/**"):
-                    prefix = grant[:-3].rstrip("/")
-                    return candidate == prefix or candidate.startswith(prefix + "/")
-                return False
-
-            write_scopes = [
-                candidate
-                for candidate in token_scopes
-                if any(within(candidate, grant) for grant in write_scopes)
-            ]
-        if read_scopes or write_scopes:
-            grants.append(
-                VaultGrant(
-                    MAIN_VAULT_ID,
-                    tuple(read_scopes),
-                    tuple(write_scopes),
-                    "group",
-                )
-            )
-        return grants
+            # Cross-account access remains explicit and admin-only. Unowned
+            # directories are not grants, even if left behind by old versions.
+            ids += [u["username"] for u in self.identity.list_users()
+                    if u["username"] != user["username"]]
+        return [VaultGrant(v, scopes, scopes,
+                           "owner" if v == user["username"] else "admin")
+                for v in ids if self.manager.exists(v)]
 
     def visible_vaults(self, principal: Principal) -> list[str]:
         return [g.vault_id for g in self.grants(principal)]
@@ -153,15 +95,8 @@ class VaultAccessResolver:
         if requested_vault:
             grant = next((g for g in grants if g.vault_id == requested_vault), None)
         else:
-            user = self._user(principal)
-            preferred = (
-                user["username"]
-                if user is not None and not user["is_admin"]
-                else MAIN_VAULT_ID
-            )
-            grant = next((g for g in grants if g.vault_id == preferred), None)
-            if grant is None:
-                grant = grants[0] if grants else None
+            # Never default to a different account, even for administrators.
+            grant = next((g for g in grants if g.vault_id == principal.name), None)
         if grant is None or (write and not grant.write_scopes):
             raise VaultAccessError("vault not found or not in scope")
         try:

@@ -16,12 +16,14 @@ import pytest
 
 from cortex.cli import run_sync
 from cortex.config import (
+    AuthConfig,
     CortexConfig,
     GitConfig,
     IndexConfig,
     Principal,
     SyncConfig,
     VaultConfig,
+    VaultsConfig,
 )
 from cortex.gitlog import GitAudit
 from cortex.server import CortexServer
@@ -31,7 +33,7 @@ from cortex.server import CortexServer
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
+    root = tmp_path / "vaults" / "p"
     (root / "Public").mkdir(parents=True)
     (root / "Private").mkdir()
     (root / "Public" / "open.md").write_text(
@@ -46,9 +48,10 @@ def vault(tmp_path: Path) -> Path:
 
 def _cfg(vault: Path, tmp_path: Path, *, adapter: str = "none") -> CortexConfig:
     return CortexConfig(
-        vault=VaultConfig(path=vault, git=GitConfig()),
-        sync=SyncConfig(adapter=adapter),
+        vault=VaultConfig(git=GitConfig()),
+        vaults=VaultsConfig(root=vault.parent, index_dir=tmp_path / "indexes", sync=SyncConfig(adapter=adapter)),
         index=IndexConfig(enabled=True, path=tmp_path / "index.sqlite"),
+        auth=AuthConfig(local_principal="p"),
         principals=[Principal(name="p", scopes=["**"])],
     )
 
@@ -60,7 +63,7 @@ def test_run_sync_commits_pending_change(vault: Path, tmp_path: Path):
     write tool) gets snapshotted into the git audit trail by run_sync, under
     the cortex-sync actor."""
     cfg = _cfg(vault, tmp_path)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
     git.commit("cortex-bootstrap", "initial vault snapshot")
 
@@ -80,7 +83,7 @@ def test_run_sync_clean_is_a_noop(vault: Path, tmp_path: Path):
     """Running sync again with nothing changed produces no commit and raises
     nothing — the clean no-op case."""
     cfg = _cfg(vault, tmp_path)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
     git.commit("cortex-bootstrap", "initial vault snapshot")
 
@@ -94,7 +97,7 @@ def test_run_sync_clean_is_a_noop(vault: Path, tmp_path: Path):
 
 def test_run_sync_refreshes_index(vault: Path, tmp_path: Path):
     cfg = _cfg(vault, tmp_path)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
     git.commit("cortex-bootstrap", "initial vault snapshot")
 
@@ -107,7 +110,7 @@ def test_run_sync_refreshes_index(vault: Path, tmp_path: Path):
 def test_run_sync_index_disabled_reports_none(vault: Path, tmp_path: Path):
     cfg = _cfg(vault, tmp_path)
     cfg.index = IndexConfig(enabled=False)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
 
     summary = run_sync(cfg)
@@ -116,7 +119,7 @@ def test_run_sync_index_disabled_reports_none(vault: Path, tmp_path: Path):
 
 def test_run_sync_adapter_none_skips_remote(vault: Path, tmp_path: Path):
     cfg = _cfg(vault, tmp_path, adapter="none")
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
 
     summary = run_sync(cfg)
@@ -131,7 +134,7 @@ def test_run_sync_adapter_git_no_remote_records_error_not_fatal(vault: Path, tmp
     must be recorded, not raised, and the local snapshot + reindex must still
     have happened (the durable half of the job)."""
     cfg = _cfg(vault, tmp_path, adapter="git")
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
     git.commit("cortex-bootstrap", "initial vault snapshot")
 
@@ -155,7 +158,7 @@ def test_run_sync_adapter_git_pulls_and_pushes_real_remote(vault: Path, tmp_path
     subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
 
     cfg = _cfg(vault, tmp_path, adapter="git")
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
     git.commit("cortex-bootstrap", "initial vault snapshot")
     branch = subprocess.run(
@@ -185,7 +188,7 @@ def test_run_sync_adapter_git_pulls_and_pushes_real_remote(vault: Path, tmp_path
 @pytest.mark.parametrize("adapter", ["nextcloud", "s3"])
 def test_run_sync_unimplemented_adapters_are_local_only(vault: Path, tmp_path: Path, adapter: str):
     cfg = _cfg(vault, tmp_path, adapter=adapter)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
+    git = GitAudit(vault, cfg.vault.git)
     git.ensure_repo()
 
     summary = run_sync(cfg)  # must not raise
@@ -220,7 +223,8 @@ def test_head_time_none_when_not_a_repo(tmp_path: Path):
 
 def _status_server(vault: Path, tmp_path: Path, *, scopes: list[str] = ("**",)) -> CortexServer:
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault, git=GitConfig()),
+        vault=VaultConfig(git=GitConfig()),
+        vaults=VaultsConfig(root=vault.parent, index_dir=tmp_path / "indexes"),
         index=IndexConfig(enabled=True, path=tmp_path / "index.sqlite"),
         principals=[Principal(name="p", scopes=list(scopes))],
     )

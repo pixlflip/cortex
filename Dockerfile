@@ -5,7 +5,7 @@
 #
 #   docker build -t cortex .
 #   docker run --rm -it \
-#     -v "$PWD/vault:/data/vault" \
+#     -v "$PWD/data:/data/data" \
 #     -v "$PWD/cortex.yaml:/data/cortex.yaml:ro" \
 #     -e CORTEX_CONFIG=/data/cortex.yaml \
 #     cortex check
@@ -39,7 +39,7 @@ RUN if [ -n "$EXTRAS" ]; then pip install --no-cache-dir ".[$EXTRAS]"; fi
 
 # Non-root runtime user owning the data dir.
 RUN useradd --system --create-home --home-dir /data cortex \
-    && mkdir -p /data/vault /data/data/vaults /data/data/indexes /data/data/archive \
+    && mkdir -p /data/data/vaults /data/data/indexes /data/data/archive \
     && chown -R cortex:cortex /data
 USER cortex
 WORKDIR /data

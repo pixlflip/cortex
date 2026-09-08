@@ -52,34 +52,12 @@ def _load(args: argparse.Namespace):
 
 def cmd_check(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    store = VaultStore(cfg.vault.path)
-    print(f"cortex {__version__}")
-    print(f"  vault:        {cfg.vault.path} ({len(store.list_notes())} notes)")
-    print(f"  git audit:    {'on' if cfg.vault.git.enabled else 'off'}")
-    print(f"  sync adapter: {cfg.sync.adapter}")
-    print(f"  transport:    {cfg.server.transport}")
-    print(f"  admin UI:     {'enabled' if cfg.admin.enabled else 'off'}"
-          f" ({cfg.admin.path})" if cfg.admin.enabled else "")
-    if cfg.index.enabled:
-        idx = SearchIndex(
-            store, cfg.index.path, chunk_chars=cfg.index.chunk_chars, overlap=cfg.index.overlap
-        )
-        idx.ensure_fresh()
-        stats = idx.stats()
-        backend = "fts5+bm25" if idx.fts_available else "substring-fallback (FTS5 unavailable)"
-        print(
-            f"  search index: enabled ({cfg.index.path}) [{backend}] "
-            f"— {stats['note_count']} notes, {stats['chunk_count']} chunks, "
-            f"last indexed {stats['last_indexed'] or 'never'}"
-        )
-        idx.close()
-    else:
-        print("  search index: disabled (falling back to substring search)")
-    print(f"  llm provider: {cfg.llm.provider or 'none'} ({cfg.llm.model or '-'})")
-    print(f"  janitor:      {'enabled' if cfg.janitor.enabled else 'dark'}"
-          f"{' (dry-run)' if cfg.janitor.enabled and cfg.janitor.dry_run else ''}")
-    print(f"  principals:   {', '.join(p.name for p in cfg.principals) or '(none)'}")
-    print(f"  local principal: {cfg.auth.local_principal or '(none — stdio denied)'}")
+    from .vaults import VaultManager
+    manager = VaultManager(cfg)
+    print(f"cortex {__version__}: account-owned storage at {manager.root}")
+    for vault_id in manager.vault_ids():
+        print(f"  account: {vault_id}")
+    print("  legacy vault.path is migration input only; never served")
     return 0
 
 
@@ -149,27 +127,19 @@ def run_sync(cfg: CortexConfig) -> dict:
     raised — the local snapshot + reindex already succeeded and that's the
     durable, important half of the job.
     """
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
-    index = None
-    if cfg.index.enabled:
-        index = SearchIndex(
-            VaultStore(cfg.vault.path),
-            cfg.index.path,
-            chunk_chars=cfg.index.chunk_chars,
-            overlap=cfg.index.overlap,
-        )
+    from .vaults import VaultManager, VaultManagerError
+    if not cfg.auth.local_principal:
+        raise VaultManagerError("an account identity is required for sync")
+    manager = VaultManager(cfg)
     try:
-        return _sync_core(
-            git,
-            index,
-            git_enabled=cfg.vault.git.enabled,
-            index_enabled=cfg.index.enabled,
-            adapter=cfg.sync.adapter,
-            options=cfg.sync.options or {},
-        )
+        bundle = manager.get(cfg.auth.local_principal)
+        sync = manager.sync_config_for(bundle.vault_id)
+        return _sync_core(bundle.git, bundle.index,
+                          git_enabled=cfg.vault.git.enabled,
+                          index_enabled=cfg.index.enabled,
+                          adapter=sync.adapter, options=sync.options or {})
     finally:
-        if index is not None:
-            index.close()
+        manager.close()
 
 
 def _sync_core(
@@ -364,18 +334,6 @@ def _bootstrap_identity(cfg: CortexConfig) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
-    if cfg.vault.git.enabled:
-        created = git.ensure_repo()
-        sha = git.commit("cortex-bootstrap", "initial vault snapshot")
-        if created:
-            print(f"initialized git repo at {cfg.vault.path}")
-        if sha:
-            print(f"bootstrap snapshot committed: {sha[:10]}")
-        else:
-            print("nothing to commit (vault already snapshotted / empty)")
-    else:
-        print("git audit is disabled in config; skipping vault repo init.")
     return _bootstrap_identity(cfg)
 
 
@@ -409,7 +367,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     finally:
         manager.close()
     print(f"database: {cfg.database.path} (schema {db.schema_version()})")
-    print(f"main vault adopted: {cfg.vault.path}")
+    print("Legacy vault content is not adopted automatically; migrate it to its owning account explicitly.")
     print(
         "legacy admin import: "
         + ("applied" if report.changed else "already complete / nothing to import")
@@ -668,7 +626,7 @@ def cmd_vault(args: argparse.Namespace) -> int:
             for vault_id in ids:
                 root = manager.root_for(vault_id)
                 present = "provisioned" if manager.exists(vault_id) else "MISSING"
-                tag = " (main/shared)" if vault_id == "main" else ""
+                tag = " (account)"
                 print(f"{vault_id}{tag}  {root}  [{present}]")
             return 0
         if action == "provision":
@@ -776,8 +734,12 @@ def cmd_ldap(args: argparse.Namespace) -> int:
 
 def cmd_log(args: argparse.Namespace) -> int:
     cfg = _load(args)
-    git = GitAudit(cfg.vault.path, cfg.vault.git)
-    commits = git.log(limit=args.limit)
+    from .vaults import VaultManager
+    manager = VaultManager(cfg)
+    try:
+        commits = manager.git_for(cfg.auth.local_principal or "").log(limit=args.limit)
+    finally:
+        manager.close()
     if not commits:
         print("no audit history yet (run 'cortex init').")
         return 0
@@ -794,7 +756,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         server = build_stdio_server(cfg)
         print(
-            f"cortex serving vault '{cfg.vault.path}' over stdio "
+            f"cortex serving account-owned memory over stdio "
             f"as principal '{server.principal.name}'",
             file=sys.stderr,
         )
@@ -807,7 +769,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     base = sc.public_url or f"http://{sc.host}:{sc.port}"
     server = build_http_server(cfg)
     print(
-        f"cortex serving vault '{cfg.vault.path}' over streamable-http at "
+        f"cortex serving account-owned memory over streamable-http at "
         f"{sc.host}:{sc.port}{sc.path} (public: {base}{sc.path}); "
         f"{len([p for p in cfg.principals if p.token])} bearer principal(s). "
         "Terminate TLS at a reverse proxy in front of this.",

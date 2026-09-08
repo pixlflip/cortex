@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig
+from cortex.config import (
+    AuthConfig,
+    CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
+)
 from cortex.search_index import SearchIndex, chunk_note, sanitize_fts_query
 from cortex.server import CortexServer
 from cortex.vault import VaultStore
@@ -21,7 +24,7 @@ from cortex.vault import VaultStore
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
+    root = tmp_path / "vaults" / "scoped"
     (root / "Welcome").mkdir(parents=True)
     (root / "Public").mkdir()
     (root / "Private").mkdir()
@@ -254,7 +257,9 @@ def test_search_never_raises_on_pathological_query(index: SearchIndex):
 
 def _scoped_server(vault: Path, tmp_path: Path, scopes: list[str]) -> CortexServer:
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault),
+        vault=VaultConfig(),
+        vaults=VaultsConfig(root=vault.parent, index_dir=tmp_path / "indexes"),
+        auth=AuthConfig(local_principal="scoped"),
         index=IndexConfig(path=tmp_path / "server.sqlite"),
         principals=[Principal(name="scoped", scopes=scopes)],
     )

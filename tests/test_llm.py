@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from cortex.config import CortexConfig, IndexConfig, LLMConfig, Principal, VaultConfig
+from cortex.config import CortexConfig, IndexConfig, LLMConfig, Principal, VaultConfig, VaultsConfig
 from cortex.llm import LLMError, LLMResult, build_provider
 from cortex.server import CortexServer
 
@@ -115,7 +115,7 @@ class StubProvider:
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
+    root = tmp_path / "vaults" / "p"
     (root / "Welcome").mkdir(parents=True)
     (root / "Public").mkdir()
     (root / "Welcome" / "hello.md").write_text(
@@ -129,7 +129,8 @@ def vault(tmp_path: Path) -> Path:
 
 def _server(vault: Path, scopes: list[str]) -> CortexServer:
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault),
+        vault=VaultConfig(),
+        vaults=VaultsConfig(root=vault.parent, index_dir=vault.parent.parent / "indexes"),
         # Keep the search index's SQLite file inside the tmp_path sandbox —
         # otherwise its dataclass default resolves against the test runner's
         # CWD instead of a throwaway directory.

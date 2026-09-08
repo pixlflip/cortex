@@ -8,15 +8,15 @@
 # local-only vault, git audit on, LLM disabled (deterministic tools only).
 
 vault:
-  # Path to your Obsidian vault (relative paths resolve against this file's dir).
-  path: ./vault
+  # Git defaults apply to each account. Legacy vault.path is not served.
   git:
     enabled: true              # git audit trail + rollback
     actor_name: cortex
     actor_email: cortex@localhost
 
-# One private Obsidian vault per user. The existing vault.path above remains
-# the main/shared vault; groups grant scoped access into it.
+# One vault per account. No global/shared vault exists.
+# For standalone stdio, run `cortex vault provision local` before serving.
+# HTTP users are provisioned through account creation (local or LDAP).
 vaults:
   root: ./data/vaults
   index_dir: ./data/indexes
@@ -30,12 +30,6 @@ vaults:
   #   alice:
   #     adapter: s3
   #     options: { bucket: alice-notes, prefix: cortex/ }
-
-sync:
-  adapter: none                # none (default) | git | nextcloud | s3
-  # Examples for when you opt in:
-  # adapter: git
-  # options: { remote: origin, branch: main }
 
 # Identities that may connect. Each maps a credential to one principal and a set
 # of scopes (globs over vault-relative paths). A non-matching path is invisible.

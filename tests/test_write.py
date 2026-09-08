@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, WritesConfig
+from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
 from cortex.server import CortexServer
 from cortex.memory_lifecycle import parse_memory_bytes
 from cortex.vault import VaultError
@@ -27,7 +27,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
+    root = tmp_path / "vaults" / "p"
     (root / "Public").mkdir(parents=True)
     (root / "Private").mkdir()
     (root / "Public" / "open.md").write_text(
@@ -48,7 +48,8 @@ def _server(
     writes_enabled: bool = True,
 ) -> CortexServer:
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault),
+        vault=VaultConfig(),
+        vaults=VaultsConfig(root=vault.parent, index_dir=vault.parent.parent / "indexes"),
         index=IndexConfig(enabled=False),
         principals=[
             Principal(
@@ -80,7 +81,8 @@ def test_writes_disabled_by_default(vault: Path):
     """writes.enabled defaults to False, and a server built from defaults
     registers no mutating tools."""
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault),
+        vault=VaultConfig(),
+        vaults=VaultsConfig(root=vault.parent, index_dir=vault.parent.parent / "indexes"),
         index=IndexConfig(enabled=False),
         principals=[Principal(name="p", scopes=["**"])],
     )

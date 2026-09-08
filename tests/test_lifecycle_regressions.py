@@ -5,15 +5,15 @@ import json
 import subprocess
 from pathlib import Path
 import pytest
-from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, WritesConfig
+from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
 from cortex.server import CortexServer
 from cortex.memory_lifecycle import parse_memory_bytes, update_metadata_bytes, inspect_memory_bytes
 
 @pytest.fixture
 def service(tmp_path):
-    root = tmp_path/'vault'; root.mkdir()
+    root = tmp_path/'vaults'/'tester'; root.mkdir(parents=True)
     p = Principal(name='tester', scopes=['Public/**'], write_scopes=['Public/**'])
-    cfg = CortexConfig(vault=VaultConfig(path=root), index=IndexConfig(path=tmp_path/'idx.sqlite'),
+    cfg = CortexConfig(vault=VaultConfig(), vaults=VaultsConfig(root=root.parent, index_dir=tmp_path/'indexes'), index=IndexConfig(path=tmp_path/'idx.sqlite'),
         principals=[p], writes=WritesConfig(enabled=True))
     srv = CortexServer(cfg, principal=p)
     srv.git.ensure_repo()
@@ -77,7 +77,7 @@ def test_managed_metadata_cannot_be_forged_or_removed(service):
     with pytest.raises(ValueError): srv._do_update_frontmatter(p,'Public/old.md',{'memory_superseded_by':'Private/hidden.md'},'bad')
     assert sha(srv,'Public/old.md')==before
     srv._do_write_note(p,'Public/old.md','# Beacon\nnew body\n','normal content edit',overwrite=True)
-    assert srv.vault.read_frontmatter('Public/old.md')['memory_state']=='current'
+    assert srv.vault.read_frontmatter('Public/old.md')['memory_state']=='unreviewed'
 
 
 def test_disputed_search_includes_explicit_warning(service):

@@ -11,13 +11,13 @@ from pathlib import Path
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, WritesConfig
+from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
 from cortex.server import CortexServer
 
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    root = tmp_path / "vault"
+    root = tmp_path / "vaults" / "p"
     (root / "Public" / "attachments").mkdir(parents=True)
     (root / "Private").mkdir()
     (root / "Public" / "note.md").write_text("# Public\n", encoding="utf-8")
@@ -36,7 +36,8 @@ def server(
     writes: bool = False,
 ) -> CortexServer:
     cfg = CortexConfig(
-        vault=VaultConfig(path=vault),
+        vault=VaultConfig(),
+        vaults=VaultsConfig(root=vault.parent, index_dir=vault.parent.parent / "indexes"),
         index=IndexConfig(enabled=False),
         principals=[
             Principal(

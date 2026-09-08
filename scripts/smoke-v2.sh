@@ -15,14 +15,13 @@ trap cleanup EXIT
 docker volume create "$volume" >/dev/null
 cat >"$root/cortex.yaml" <<'YAML'
 vault:
-  path: /data/vault
   git: { enabled: true, actor_name: cortex, actor_email: cortex@localhost }
 vaults:
   root: /data/data/vaults
   index_dir: /data/data/indexes
   archive_dir: /data/data/archive
 database: { path: /data/data/cortex.sqlite }
-index: { path: /data/data/main.index.sqlite }
+index: { enabled: true }
 principals: []
 auth: { enabled: true, oauth_enabled: false }
 admin: { enabled: true, path: /data/data/cortex.admin.json }
@@ -40,8 +39,6 @@ YAML
 # ownership. A host bind mount is owned by the runner and modern Git correctly
 # rejects it as a different owner's worktree inside the unprivileged container.
 mounts=(-v "$volume:/data" -v "$root/cortex.yaml:/data/cortex.yaml:ro")
-docker run --rm -v "$volume:/data" --entrypoint sh "$image" \
-  -c "printf '# Smoke vault\\n' > /data/vault/Welcome.md"
 run=(docker run --rm "${mounts[@]}" "$image")
 "${run[@]}" init >/dev/null
 "${run[@]}" user add smoke --password smoke-password >/dev/null

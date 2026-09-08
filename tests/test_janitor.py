@@ -17,10 +17,8 @@ def test_boundary_is_deny_first_and_cannot_allow_protected_material():
 
 
 def _config(tmp_path: Path) -> CortexConfig:
-    main = tmp_path / "main"
-    main.mkdir()
     return CortexConfig(
-        vault=VaultConfig(path=main),
+        vault=VaultConfig(),
         vaults=VaultsConfig(root=tmp_path / "vaults", index_dir=tmp_path / "indexes"),
         index=IndexConfig(path=tmp_path / "main-index.sqlite"),
         database=DatabaseConfig(path=tmp_path / "cortex.db"),
@@ -33,17 +31,17 @@ def test_macro_janitor_reports_each_vault_and_rollup(tmp_path: Path):
     manager = VaultManager(config)
     manager.provision("alice")
     manager.close()
-    (config.vault.path / "Start.md").write_text("[[Missing]]\n", encoding="utf-8")
+    (config.vaults.root / "alice" / "Start.md").write_text("[[Missing]]\n", encoding="utf-8")
     (config.vaults.root / "alice" / "Good.md").write_text("# Fine\n", encoding="utf-8")
     db = Database(config.database.path)
 
     results = run_janitor_all(config, db)
 
-    assert [vault for vault, _ in results] == ["main", "alice"]
+    assert [vault for vault, _ in results] == ["alice"]
     assert all(isinstance(report, JanitorReport) for _, report in results)
     with db.connection() as conn:
         rows = conn.execute("SELECT vault, details_json FROM janitor_reports ORDER BY id").fetchall()
-    assert [row["vault"] for row in rows] == ["main", "alice", "*"]
+    assert [row["vault"] for row in rows] == ["alice", "*"]
     assert "Missing" in rows[0]["details_json"]
 
 
@@ -56,14 +54,13 @@ def test_macro_janitor_isolates_a_failing_vault(tmp_path: Path, monkeypatch):
     original = VaultManager.store_for
 
     def failing(self, vault_id):
-        if vault_id == "main":
+        if vault_id == "alice":
             raise OSError("broken vault")
         return original(self, vault_id)
 
     monkeypatch.setattr(VaultManager, "store_for", failing)
     results = dict(run_janitor_all(config, db))
-    assert isinstance(results["main"], OSError)
-    assert isinstance(results["alice"], JanitorReport)
+    assert isinstance(results["alice"], OSError)
     with db.connection() as conn:
         rollup = conn.execute("SELECT details_json FROM janitor_reports WHERE vault='*'").fetchone()
-    assert '"failed_vaults": ["main"]' in rollup["details_json"]
+    assert '"failed_vaults": ["alice"]' in rollup["details_json"]

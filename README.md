@@ -10,8 +10,9 @@ through a secure [Model Context Protocol](https://modelcontextprotocol.io)
 
 - **Obsidian-native** — the source of truth is a normal Obsidian vault: Markdown
   notes, YAML frontmatter, folders, links, and your editor of choice.
-- **Multi-user** — local or LDAP users get private vaults; groups grant
-  independent read/write slices of a shared vault; admins get a macro view.
+- **Account-owned** — every vault belongs to a named account. There is no global
+  vault. Requests default to the authenticated account, including administrators;
+  cross-account administration requires explicit selection.
 - **Scoped** — each token sees only its allowed vaults, note paths, and MCP
   tools. Out-of-scope resources are *invisible*, not just unreadable.
 - **Audited** — every change is a git commit tagged with *actor* and *reason*.
@@ -27,7 +28,12 @@ Anyone can spin one up — locally, in Docker, or on a homelab — and keep thei
 memory *theirs*: a fully working Obsidian vault for humans, a governed memory
 API for agents.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
+**Breaking storage correction:** legacy `vault.path` is no longer served or
+synced. Read [account-vault migration](docs/account-vaults.md) before upgrading
+an existing installation. No automatic merging or deletion is performed.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the broader design; the account-vault
+contract supersedes its historical shared-vault sections.
 
 ---
 
@@ -38,7 +44,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design.
 ```bash
 git clone https://github.com/pixlflip/cortex.git && cd cortex
 cp cortex.example.yaml cortex.yaml          # edit to taste
-# put your Obsidian vault in ./vault (or point vault.path at one)
+# import existing notes into the owning account under ./data/vaults/<username>
 docker compose run --rm cortex check        # validate setup
 docker compose run --rm cortex init         # DB + admin + git baselines
 docker compose up -d                        # SPA + API + MCP on :8765
@@ -151,7 +157,7 @@ runs locally with no API key and the LLM disabled (deterministic tools only).
 
 Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 
-- `vault.path` — your Obsidian vault folder.
+- `vaults.root` — account-owned directories (`<root>/<username>`).
 - `vaults` — private-vault root, index directory, templates, archives, sync.
 - `principals` — static identities, their `scopes` (path globs), and `token_env`.
 - `database.path` — SQLite identity, session, gateway, and telemetry state.
@@ -163,7 +169,7 @@ Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
   Sonnet) is the recommended way to enable `semantic_search`.
 - `janitor` — off by default; report-only before any write mode.
 
-Run one bounded report pass across the main and every user vault with
+Run one bounded report pass across account vaults with
 `cortex janitor --force` (or omit `--force` when `janitor.enabled` is true).
 Reports are stored in SQLite for the admin vault panel; the current worker
 never modifies vault content.
@@ -174,9 +180,9 @@ never modifies vault content.
 
 - Local accounts, LDAP/Active Directory login and sync, groups, sessions,
   CSRF-protected same-origin API, and individually revocable user tokens.
-- One git-audited private vault per user, the existing main/shared vault,
-  group scope grants, admin macro view, lifecycle repair/archive operations,
-  and token-level path narrowing.
+- One git-audited vault per account, explicit cross-account administration,
+  lifecycle repair/archive operations, and token-level path narrowing.
+  There is no general or shared default vault.
 - A responsive React admin panel and read-oriented Obsidian-compatible vault
   viewer with full-text search, tags, backlinks, embeds, properties, ETags,
   and safe Markdown rendering.

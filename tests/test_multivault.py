@@ -21,19 +21,14 @@ from cortex.db import Database
 from cortex.sessions import SessionAuth
 from cortex.server import CortexServer
 from cortex.users import IdentityService
-from cortex.vaults import MAIN_VAULT_ID, attach_vault_manager
+from cortex.vaults import attach_vault_manager
 
 
 @pytest.fixture
 def multivault(tmp_path: Path):
-    main = tmp_path / "main"
-    main.mkdir()
-    (main / "Shared").mkdir()
-    (main / "Shared" / "visible.md").write_text("# Shared\n", encoding="utf-8")
-    (main / "Private").mkdir()
-    (main / "Private" / "hidden.md").write_text("# Hidden\n", encoding="utf-8")
+    accounts = tmp_path / "vaults"
     cfg = CortexConfig(
-        vault=VaultConfig(path=main),
+        vault=VaultConfig(),
         vaults=VaultsConfig(
             root=tmp_path / "vaults",
             index_dir=tmp_path / "indexes",
@@ -51,6 +46,10 @@ def multivault(tmp_path: Path):
         "shared", scopes=["Shared/**"], write_scopes=["Shared/Inbox/**"]
     )
     identity.add_to_group("alice", "shared")
+    (manager.root_for("alice") / "Shared").mkdir()
+    (manager.root_for("alice") / "Shared" / "visible.md").write_text("# Shared\n", encoding="utf-8")
+    (manager.root_for("alice") / "Private").mkdir()
+    (manager.root_for("alice") / "Private" / "hidden.md").write_text("# Hidden\n", encoding="utf-8")
     (manager.root_for("alice") / "Projects").mkdir()
     (manager.root_for("alice") / "Projects" / "alpha.md").write_text(
         "# Alpha\n", encoding="utf-8"
@@ -66,15 +65,15 @@ def test_container_group_and_macro_grants(multivault):
 
     alice = identity.principal_for_username("alice")
     grants = {grant.vault_id: grant for grant in access.grants(alice)}
-    assert set(grants) == {"alice", MAIN_VAULT_ID}
+    assert set(grants) == {"alice"}
     assert grants["alice"].scopes == ("**",)
-    assert grants[MAIN_VAULT_ID].scopes == ("Shared/**",)
-    assert grants[MAIN_VAULT_ID].write_scopes == ("Shared/Inbox/**",)
+    assert grants["alice"].scopes == ("**",)
+    assert grants["alice"].write_scopes == ("**",)
     with pytest.raises(VaultAccessError):
         access.select(alice, "bob")
 
     admin = identity.principal_for_username("admin")
-    assert set(access.visible_vaults(admin)) == {MAIN_VAULT_ID, "admin", "alice", "bob"}
+    assert set(access.visible_vaults(admin)) == {"admin", "alice", "bob"}
 
 
 def test_token_scope_narrows_own_and_shared_vaults(multivault):
@@ -84,14 +83,14 @@ def test_token_scope_narrows_own_and_shared_vaults(multivault):
     principal, _ = identity.resolve_api_token(created.token)
     grants = {grant.vault_id: grant for grant in access.grants(principal)}
     assert grants["alice"].scopes == ("Projects/**",)
-    assert MAIN_VAULT_ID not in grants
+    assert set(grants) == {"alice"}
 
     shared = identity.mint_token("alice", "shared", scopes=["Shared/**"])
     principal, _ = identity.resolve_api_token(shared.token)
     grants = {grant.vault_id: grant for grant in access.grants(principal)}
     assert grants["alice"].scopes == ("Shared/**",)
-    assert grants[MAIN_VAULT_ID].scopes == ("Shared/**",)
-    assert grants[MAIN_VAULT_ID].write_scopes == ()
+    assert grants["alice"].scopes == ("Shared/**",)
+    assert grants["alice"].write_scopes == ("Shared/**",)
 
 
 def test_vault_api_never_leaks_another_users_vault(multivault):
@@ -113,10 +112,10 @@ def test_vault_api_never_leaks_another_users_vault(multivault):
     assert foreign.status_code == absent.status_code == 404
     assert foreign.json() == absent.json()
 
-    visible = client.get(f"{API_PREFIX}/vaults/main/notes/Shared/visible.md")
-    hidden = client.get(f"{API_PREFIX}/vaults/main/notes/Private/hidden.md")
+    visible = client.get(f"{API_PREFIX}/vaults/alice/notes/Shared/visible.md")
+    hidden = client.get(f"{API_PREFIX}/vaults/alice/notes/Private/hidden.md")
     assert visible.status_code == 200
-    assert hidden.status_code == 404
+    assert hidden.status_code == 200
 
 
 def test_vault_note_normalizes_date_frontmatter_without_changing_content(multivault):
