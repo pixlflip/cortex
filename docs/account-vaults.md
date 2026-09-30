@@ -15,7 +15,7 @@ The retired `main` identifier is rejected, never redirected to an account.
   group tool policies are independent and remain available.
 - Config-only standalone identities address only their named account directory.
   An identity-backed server requires a matching actual account.
-- The web API returns `default_vault`; the viewer does not pick the first vault.
+- The JSON API returns `default_vault`; no first-available-account fallback exists.
 - Service startup and readiness do not read or depend on `vault.path`.
 
 ## Upgrade existing installations

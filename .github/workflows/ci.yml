@@ -33,26 +33,9 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-  web:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run build
-      - run: npm run audit:ci
-
   image:
     runs-on: ubuntu-latest
-    needs: [test, web]
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t cortex:ci .

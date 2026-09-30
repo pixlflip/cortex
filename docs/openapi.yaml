@@ -1,6 +1,6 @@
 # Cortex /api/v1 — hand-written OpenAPI contract (A6/B3/D4).
 #
-# Authoritative description of the JSON REST surface the SPA (C1+) and any
+# Authoritative description of the headless JSON REST surface that
 # scripting client build against. Kept accurate to src/cortex/api.py by hand;
 # later API issues (B3 vault-content, D gateway) extend this file.
 openapi: 3.1.0
@@ -35,7 +35,7 @@ info:
     `{"error": {"code": "...", "message": "..."}}`.
 servers:
   - url: /api/v1
-    description: Same-origin — the SPA is served by Cortex itself.
+    description: Cortex headless JSON API.
 
 security:
   - cookieAuth: []

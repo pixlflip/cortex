@@ -47,7 +47,7 @@ cp cortex.example.yaml cortex.yaml          # edit to taste
 # import existing notes into the owning account under ./data/vaults/<username>
 docker compose run --rm cortex check        # validate setup
 docker compose run --rm cortex init         # DB + admin + git baselines
-docker compose up -d                        # SPA + API + MCP on :8765
+docker compose up -d                        # headless API + MCP on :8765
 ```
 
 Run `cortex sync` any time (or on a schedule — see
@@ -70,15 +70,15 @@ cortex serve                                # stdio or HTTP, per cortex.yaml
 Full host/service setup (service user, systemd) is in
 [`docs/bare-metal.md`](docs/bare-metal.md).
 
-Open the same-origin web app at the server root (for example
-`http://127.0.0.1:8765/`). The first-run admin password is printed by
-`cortex init`. The panel manages people, groups, vault health, tokens, LDAP,
-upstream MCP servers, tool permissions, and both audit streams.
+Cortex is headless: there is no web app, vault viewer, or admin dashboard.
+Manage accounts and tokens with the CLI or authenticated JSON API. Readiness is
+available at `/healthz`; `/` and former UI paths return 404. OAuth consent is
+retained only for MCP client authorization.
 
 ### Connect an AI once
 
-Create a per-user token in the web app, then give the AI Cortex as its only
-MCP endpoint:
+Create a per-user token with `cortex token mint <username> <client-name>`,
+then configure the AI client with Cortex as its memory MCP endpoint:
 
 ```json
 {
@@ -171,7 +171,7 @@ Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 
 Run one bounded report pass across account vaults with
 `cortex janitor --force` (or omit `--force` when `janitor.enabled` is true).
-Reports are stored in SQLite for the admin vault panel; the current worker
+Reports are stored in SQLite and available through the authenticated API; the current worker
 never modifies vault content.
 
 ---
@@ -183,9 +183,8 @@ never modifies vault content.
 - One git-audited vault per account, explicit cross-account administration,
   lifecycle repair/archive operations, and token-level path narrowing.
   There is no general or shared default vault.
-- A responsive React admin panel and read-oriented Obsidian-compatible vault
-  viewer with full-text search, tags, backlinks, embeds, properties, ETags,
-  and safe Markdown rendering.
+- Headless JSON API and MCP access, with scope-checked notes and attachments.
+  The React UI, static assets, and legacy browser admin have been removed.
 - Governed upstream MCP aggregation with per-user/group glob permissions,
   deny-wins behavior, discovery/call parity, SSRF defenses, bounded calls,
   circuit breaking, hot tool refresh, and argument-shape-only telemetry.
@@ -204,7 +203,6 @@ Start with [`docs/multi-user.md`](docs/multi-user.md),
 ```bash
 pip install -e ".[dev]"
 pytest
-cd web && npm ci && npm run lint && npm run build
 ```
 
 ## License

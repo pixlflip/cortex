@@ -71,8 +71,9 @@ systemctl status cortex
 
 The unit runs `cortex serve`. Over **stdio** this is for local MCP clients that
 spawn the process; for a long-running background service use **http** transport.
-The same server exposes the SPA at `/`, JSON API at `/api/v1`, MCP at the
-configured path, and readiness at `/healthz`.
+The headless server exposes JSON API at `/api/v1`, MCP at the configured
+path, and readiness at `/healthz`. The root and former UI routes return 404.
+Use `cortex user`, `cortex token`, and `cortex vault` for administration.
 
 ## Periodic sync & audit
 

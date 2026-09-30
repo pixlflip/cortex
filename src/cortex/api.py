@@ -1,6 +1,6 @@
 """JSON REST API foundation — the ``/api/v1`` surface (A6, #40).
 
-This is the API the React SPA (C1+) consumes, mounted as a route group on the
+This headless management API is mounted as a route group on the
 same Starlette app that serves MCP and the legacy admin UI. This phase is
 **auth + user/group/token management only** — vault-content endpoints are B3,
 MCP-gateway endpoints are D. The conventions established here are reused by

@@ -1,5 +1,8 @@
 # Cortex v2 focused security review
 
+> Historical v2 design/review: the product UI and legacy browser admin were
+> removed in the headless release. See README and multi-user.md for current operation.
+
 Review scope: multi-user identity, per-user/shared vault routing, the same-origin
 SPA/API, and governed upstream MCP passthrough. This is a design/code review,
 not a third-party penetration test.

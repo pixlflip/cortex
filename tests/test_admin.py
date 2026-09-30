@@ -1,4 +1,4 @@
-"""Admin UI/store tests: generated admin account, roles, clients, and auth."""
+"""Legacy admin store tests: generated account, roles, clients, and auth."""
 
 from __future__ import annotations
 

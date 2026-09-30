@@ -159,43 +159,12 @@ def test_write_tools_cannot_target_hidden_paths(vault: Path):
 
 # -- #7 / #19: admin auth + cookie hardening -------------------------------------
 
-def _fake_request(path: str = "/admin", cookie: str | None = None):
-    from starlette.requests import Request
-
-    headers = []
-    if cookie is not None:
-        headers.append((b"cookie", f"cortex_admin={cookie}".encode()))
-    scope = {
-        "type": "http",
-        "method": "GET",
-        "path": path,
-        "headers": headers,
-        "query_string": b"",
-        "scheme": "http",
-        "server": ("testserver", 80),
-    }
-    return Request(scope)
-
-
 def test_uninitialized_store_has_no_cookie_secret(tmp_path: Path):
     from cortex.admin import AdminNotInitializedError, AdminStore
 
     store = AdminStore(tmp_path / "cortex.admin.json")
     with pytest.raises(AdminNotInitializedError):
         store.cookie_secret()
-
-
-def test_admin_ui_refuses_until_initialized(tmp_path: Path):
-    from cortex.admin import AdminStore, AdminUI
-
-    store = AdminStore(tmp_path / "cortex.admin.json")
-    ui = AdminUI(store, "http://127.0.0.1:8765")
-    resp = asyncio.run(ui.handle(_fake_request()))
-    assert resp.status_code == 503
-
-    store.ensure_initialized()
-    resp = asyncio.run(ui.handle(_fake_request()))
-    assert resp.status_code == 200  # login page now served
 
 
 def test_cookie_secret_is_random_not_password_hash(tmp_path: Path):
@@ -227,37 +196,6 @@ def test_cookie_secret_migrated_for_legacy_state(tmp_path: Path):
     secret = store.cookie_secret()
     assert secret and secret != data["admin"]["password_hash"]
     assert store.load()["admin"]["cookie_secret"] == secret  # persisted
-
-
-def test_admin_cookie_expires_and_rejects_tampering(tmp_path: Path, monkeypatch):
-    import cortex.admin as admin_mod
-    from cortex.admin import AdminStore, AdminUI, COOKIE_TTL
-
-    store = AdminStore(tmp_path / "cortex.admin.json")
-    store.ensure_initialized()
-    ui = AdminUI(store, "http://127.0.0.1:8765")
-
-    cookie = ui._sign("admin")
-    assert ui._is_logged_in(_fake_request(cookie=cookie))
-
-    # No cookie / garbage / legacy deterministic format: rejected.
-    assert not ui._is_logged_in(_fake_request())
-    assert not ui._is_logged_in(_fake_request(cookie="admin.deadbeef"))
-    legacy_sig = __import__("hmac").new(
-        store.load()["admin"]["password_hash"].encode(), b"admin", __import__("hashlib").sha256
-    ).hexdigest()
-    assert not ui._is_logged_in(_fake_request(cookie=f"admin.{legacy_sig}"))
-
-    # Tampered payload (extended expiry) fails signature verification.
-    payload, sig = cookie.rsplit(".", 1)
-    value, issued, exp = payload.split(".")
-    forged = f"{value}.{issued}.{int(exp) + 9999}.{sig}"
-    assert not ui._is_logged_in(_fake_request(cookie=forged))
-
-    # Past its expiry the same genuine cookie stops working.
-    real_now = admin_mod._now
-    monkeypatch.setattr(admin_mod, "_now", lambda: real_now() + COOKIE_TTL + 1)
-    assert not ui._is_logged_in(_fake_request(cookie=cookie))
 
 
 # -- #14: PBKDF2-per-client token lookup DoS --------------------------------------

@@ -64,7 +64,7 @@ auth:
 admin:
   enabled: true
   # v1 compatibility/import source. `cortex migrate` imports this file into
-  # SQLite; the v2 same-origin SPA then manages users, vaults, and the gateway.
+  # SQLite; manage users, vaults, and integrations with CLI or authenticated API.
   path: ./cortex.admin.json
 
 database:

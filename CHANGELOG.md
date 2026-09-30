@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Remove the React/Vite interface, packaged static assets, SPA fallback, and
+  legacy HTML admin dashboard. Cortex is now headless; old UI paths return 404.
+- Remove the Node frontend build from Docker and CI. Retain JSON API, MCP,
+  CLI, OAuth consent, and readiness without a frontend requirement.
+
 - Added scoped `list_files` and chunked `get_file` MCP tools for binary vault
   attachments, plus write-gated, atomic, git-audited `put_file` uploads with
   overwrite protection, size limits, and optional SHA-256 verification.

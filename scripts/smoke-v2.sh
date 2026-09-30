@@ -53,6 +53,10 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 curl -fsS http://127.0.0.1:18765/healthz | grep -q '"status":"ok"'
+for path in / /admin /assets/index.js /.env; do
+  status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18765${path}")"
+  test "$status" = 404
+done
 curl -fsS http://127.0.0.1:18765/api/v1/auth/me \
   -H "Authorization: Bearer $token" | grep -q '"username":"smoke"'
 curl -fsS -X POST http://127.0.0.1:18765/mcp \
