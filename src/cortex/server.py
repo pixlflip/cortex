@@ -37,7 +37,6 @@ from mcp.server.auth.settings import (
     ClientRegistrationOptions,
     RevocationOptions,
 )
-from mcp.server.lowlevel.server import request_ctx
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .admin import AdminStore
@@ -50,12 +49,7 @@ from .auth import (
 )
 from .config import CortexConfig, Principal
 from .gitlog import GitAudit
-from .gateway import (
-    GatewayRuntime,
-    GovernedFastMCP,
-    LazyMcpCatalog,
-    ToolGovernor,
-)
+from .memory_policy import GovernedFastMCP, ToolGovernor
 from .llm import LLMError, build_provider
 from .memory_lifecycle import (
     STATES, MANAGED, MemoryState, serialized_write, inspect_memory, inspect_memory_bytes, memory_patch, parse_memory_bytes,
@@ -207,7 +201,7 @@ class CortexServer:
         if identity is not None:
             identity.vault_manager = self.vault_manager
         self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
-        self.gateway_runtime = GatewayRuntime(config, identity) if identity is not None else None
+
         # The /api/v1 route group (cortex.api.ApiV1); attached by
         # build_http_server when the identity DB exists, else None.
         self.api = None
@@ -215,17 +209,8 @@ class CortexServer:
         self.provider = build_provider(config.llm)
         self.mcp = self._build_mcp(http)
         self._register()
-        if self.gateway_runtime is not None and config.gateway.enabled:
-            catalog = LazyMcpCatalog(
-                config,
-                identity,
-                self._get_principal,
-                self._get_mcp_client_key,
-            )
-            self.mcp.lazy_catalog = catalog
-            self.gateway_runtime.register_discovery_tools(self.mcp, catalog)
-            self.gateway_runtime.register_cached_tools(self.mcp)
-            self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
+        # Memory authorization is unconditional, never tied to a broker switch.
+        self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
 
     @property
     def _local_bundle(self):
@@ -270,8 +255,6 @@ class CortexServer:
                     yield {}
                 finally:
                     tasks.cancel_scope.cancel()
-                    if self.gateway_runtime is not None:
-                        await self.gateway_runtime.aclose()
 
         if http is None:
             return GovernedFastMCP("cortex", lifespan=lifespan)
@@ -299,13 +282,6 @@ class CortexServer:
         return mcp
 
     # -- principal resolution ---------------------------------------------
-
-    def _get_mcp_client_key(self) -> object:
-        """Return the current MCP transport session as the load-state key."""
-        try:
-            return request_ctx.get().session
-        except LookupError as exc:
-            raise ValueError("MCP client session is unavailable") from exc
 
     def _get_principal(self) -> Principal:
         """The principal for the current call: the bound one (stdio) or the one
@@ -1445,11 +1421,7 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         from .api import build_api
         from .health import register_health
 
-        server.api = build_api(
-            config,
-            identity,
-            gateway_runtime=server.gateway_runtime,
-        )
+        server.api = build_api(config, identity)
         server.api.register(server.mcp)
         register_health(server.mcp, config, server.vault_manager)
     return server

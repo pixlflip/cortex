@@ -12,15 +12,27 @@ designed so that **anyone can spin one up** — locally with Docker, on a server
 or on a homelab — and point their AI tools at their own memory without handing
 the whole vault to every caller.
 
-This document is the canonical design. It is intentionally
-infrastructure-agnostic: no IP addresses, no hostnames, no secrets. Everything
-environment-specific is a config value with a sane default.
+## Current service contract
 
-> **v2 (multi-user expansion):** the canonical design for users, groups,
-> per-user vaults, the web app, and the MCP gateway lives in
-> [`docs/v2-design.md`](docs/v2-design.md). It extends — never replaces —
-> everything below; where the two disagree, the v2 document wins for v2 work.
-> See also §7.
+Cortex is headless and vault-only: a dedicated memory MCP, authenticated JSON
+memory/account API, CLI, readiness at `/healthz`, and optional OAuth consent.
+It has no product UI, upstream MCP registration/proxy, connection workers or
+dynamic session catalogs. Tools are governed unconditionally by memory-only
+deny-wins policy; unknown/non-Cortex tool IDs fail closed. Authentication,
+account ownership and path scopes remain separate guards.
+
+The current contracts are [account vaults](docs/account-vaults.md),
+[memory policy](docs/memory-policy.md), and [multi-user operation](docs/multi-user.md).
+There is no global/shared fallback; a missing account vault fails closed.
+Existing Nextcloud sync remains an external account-vault sync integration,
+not an MCP upstream. No ranking, janitor or semantic-search change is implied.
+
+## Historical design below
+
+The remainder records the original v1 design and roadmap. It and
+[`docs/v2-design.md`](docs/v2-design.md) are historical, not active instructions
+to restore a shared vault, UI or MCP gateway. Current contracts above supersede
+their retired behavior. The design remains infrastructure-agnostic.
 
 ---
 

@@ -7,7 +7,7 @@ import-safety test blocks ldap3 from a fresh module load. No network.
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -430,16 +430,18 @@ def test_config_validation(tmp_path: Path, monkeypatch):
 def test_module_imports_without_ldap3(monkeypatch):
     """cortex.ldap must import with ldap3 absent and fail clearly on use."""
     monkeypatch.setitem(sys.modules, "ldap3", None)  # None => ImportError
-    try:
-        mod = importlib.reload(ldap_mod)
-        assert mod.ldap3 is None
-        with pytest.raises(mod.LdapError, match=r"cortex-memory\[ldap\]"):
-            mod.LdapClient(make_config())
-        # a factory-injected client is constructible; only real use needs ldap3
-        assert mod.escape_filter_value("(x)") == "\\28x\\29"
-    finally:
-        monkeypatch.undo()
-        importlib.reload(ldap_mod)
+    # Load in isolation: reload of the shared module replaces its exception
+    # classes underneath API imports and makes later LDAP outage tests fail.
+    name = "cortex._ldap_import_test"
+    spec = importlib.util.spec_from_file_location(name, ldap_mod.__file__)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, mod)
+    spec.loader.exec_module(mod)
+    assert mod.ldap3 is None
+    with pytest.raises(mod.LdapError, match=r"cortex-memory\[ldap\]"):
+        mod.LdapClient(make_config())
+    assert mod.escape_filter_value("(x)") == "\\28x\\29"
 
 
 # --------------------------------------------------------------------------

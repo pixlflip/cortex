@@ -61,8 +61,12 @@ def test_token_verifier_maps_principal(vault: Path):
 
 # -- per-request principal resolution -------------------------------------
 
-def test_http_server_builds_and_registers_tools(vault: Path):
+def test_http_server_builds_and_registers_tools(vault: Path, monkeypatch):
     srv = build_http_server(_http_config(vault))
+    # Listing is now governed even without a DB or a legacy gateway switch.
+    with pytest.raises(ValueError, match="unauthenticated"):
+        asyncio.run(srv.mcp.list_tools())
+    monkeypatch.setattr("cortex.server.get_access_token", lambda: SimpleNamespace(client_id="web"))
     tools = asyncio.run(srv.mcp.list_tools())
     assert {t.name for t in tools} >= {"discover_scopes", "read_note", "semantic_search"}
 

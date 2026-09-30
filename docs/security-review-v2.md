@@ -1,7 +1,9 @@
 # Cortex v2 focused security review
 
-> Historical v2 design/review: the product UI and legacy browser admin were
-> removed in the headless release. See README and multi-user.md for current operation.
+> Historical review only: the UI, shared/global vault and upstream MCP broker
+> are retired. The SSRF/proxy assertions below describe removed code, not active
+> protections. See [memory policy](memory-policy.md), README and multi-user.md
+> for the current headless memory-only contract.
 
 Review scope: multi-user identity, per-user/shared vault routing, the same-origin
 SPA/API, and governed upstream MCP passthrough. This is a design/code review,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Remove the operational upstream MCP broker: registration, discovery/calls,
+  HTTP/stdio connection workers, lazy session catalogs, and broker REST routes.
+  Cortex is a dedicated memory MCP; old `/api/v1/mcp/*` endpoints return 404.
+- Extract always-on memory deny-wins policy into `cortex.memory_policy`.
+  `memory_policy` replaces `gateway` configuration; only existing read/write
+  defaults and audit retention migrate. Old `gateway.enabled` cannot disable
+  authorization or restore upstream execution. Unknown tools fail closed.
+- Preserve identity/tokens, historical SQLite schema/migrations and inert
+  upstream records. No destructive migration; historical upstream audit is
+  retained. Account storage, JSON API, OAuth, LDAP and Nextcloud sync remain.
+  See `docs/memory-policy.md` for compatibility and cutover requirements.
+
 - Remove the React/Vite interface, packaged static assets, SPA fallback, and
   legacy HTML admin dashboard. Cortex is now headless; old UI paths return 404.
 - Remove the Node frontend build from Docker and CI. Retain JSON API, MCP,

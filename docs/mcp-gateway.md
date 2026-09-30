@@ -1,5 +1,10 @@
 # Governed MCP gateway
 
+> HISTORICAL ONLY — this registry/proxy, its REST handlers, connection workers
+> and discovery tools have been removed, not disabled. Do not follow the setup
+> instructions below on current Cortex. Existing database records are inert
+> rollback data. See [memory policy and retirement](memory-policy.md).
+
 Give an AI Cortex as its only MCP server. Cortex exposes its built-in memory
 tools plus explicitly registered upstream tools under stable namespaces such as
 `calendar.list_events`. The connecting user token determines what appears.

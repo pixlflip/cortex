@@ -1,5 +1,12 @@
 # Upgrade from Cortex v1 to v2
 
+> Historical v1→v2 procedure below, NOT current upgrade instructions. The
+> shared `main` vault, UI and upstream broker it describes are retired. For a
+> current upgrade, follow [account-vault migration](account-vaults.md) and
+> [memory policy/broker retirement](memory-policy.md). Existing account tokens
+> and upstream DB records need no destructive conversion. Back up first;
+> do not mint replacement tokens or register upstreams merely for this removal.
+
 The v2 migration is forward-only and idempotent. It leaves `vault.path` in
 place as the main/shared vault, imports legacy admin identities into SQLite,
 and provisions a private vault for every database user.

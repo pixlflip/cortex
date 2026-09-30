@@ -68,8 +68,8 @@ admin:
   path: ./cortex.admin.json
 
 database:
-  # SQLite identity/gateway database (v2): users, groups, sessions, API
-  # tokens, MCP server registry, tool permissions, tool-call audit. Created
+  # SQLite identity/memory-policy database: users, groups, sessions, API
+  # tokens, memory tool permissions and call audit (old upstream rows inert). Created
   # by `cortex db init`. Stores salted hashes only — never plaintext secrets,
   # never note content. Keep it local and out of git (gitignored by default).
   # Relative paths resolve next to this file.
@@ -109,26 +109,13 @@ server:
   # one-click Claude.ai / ChatGPT connector UIs expect OAuth 2.1 (a later step).
   # See docs/http-exposure.md.
 
-# Cortex can be the only MCP endpoint an AI receives. Registered upstream MCP
-# tools are namespaced (<server>.<tool>), filtered per user/group, rechecked on
-# every call, and audited without argument values. Upstream credentials are env
-# var NAMES in the database—not secret values.
-gateway:
-  enabled: true
-  allow_user_servers: false
-  allow_stdio_servers: false
-  # Exact, resolved executable paths only. Never allowlist shells, generic
-  # interpreters, package managers, env, or uvx.
-  stdio_allowed_executables: []
-  # Optional cwd must resolve beneath one of these operator-managed roots.
-  stdio_allowed_workdirs: []
-  block_private_networks: true
-  # Strongly recommended for internet-reachable installs. Globs match hosts.
-  outbound_allowlist: []       # e.g. ["mcp.example.com", "*.trusted.example"]
-  timeout_seconds: 20
-  max_concurrency: 16
+# Memory-only, always-on tool authorization; no upstream MCP broker.
+# Deny wins for users/groups, including admins. These are DB-user defaults;
+# writes also require writes.enabled and account/path authorization.
+# Legacy gateway defaults/retention migrate per field unless overridden here;
+# gateway.enabled and all transport settings are ignored. See docs/memory-policy.md.
+memory_policy:
   audit_retention_days: 90
-  # Safe defaults: Cortex reads visible; writes and external tools need grants.
   default_read_allow: true
   default_write_allow: false
 
@@ -160,7 +147,7 @@ writes:
   # Every mutation — including delete — is still exactly one git commit
   # (actor + reason), so nothing is ever truly destroyed: a bad write or
   # delete is always recoverable with `git revert` or `git show <sha>:<path>`.
-  # User/group tool policy is configured in the admin panel. This global switch
+  # User/group tool policy is configured through the JSON API. This global switch
   # still removes all mutating Cortex tools when false.
   enabled: false
 

@@ -31,7 +31,7 @@ server:
   port: 8765
   path: /mcp
 writes: { enabled: false }
-gateway: { enabled: true, block_private_networks: true }
+memory_policy: { default_read_allow: true, default_write_allow: false, audit_retention_days: 90 }
 llm: { provider: none }
 YAML
 
@@ -53,7 +53,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 curl -fsS http://127.0.0.1:18765/healthz | grep -q '"status":"ok"'
-for path in / /admin /assets/index.js /.env; do
+for path in / /admin /assets/index.js /.env /api/v1/mcp/tools /api/v1/mcp/servers; do
   status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18765${path}")"
   test "$status" = 404
 done
