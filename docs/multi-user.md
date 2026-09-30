@@ -1,99 +1,64 @@
 # Multi-user Cortex
 
-Cortex v2 keeps the original Obsidian vault as `main` and adds one private,
-git-audited vault per user. Local and LDAP identities use the same groups,
-vault grants, API tokens, tool permissions, and audit model.
+Cortex is a headless memory service. Each named account has its own git-audited
+vault; there is no global or shared default vault. Local and LDAP identities
+share the same token, tool-policy, and audit infrastructure.
 
-## First run
+## First run and administration
 
 ```bash
 cp cortex.example.yaml cortex.yaml
 cortex check
 cortex init
-```
-
-`cortex init` applies SQLite migrations, imports a legacy admin store when
-present, creates the first local `admin` account, provisions its private vault,
-and prints the initial password once. With HTTP transport, open `/` and sign in.
-
-Useful operator commands:
-
-```bash
 cortex user add alice
 cortex user passwd alice
-cortex user disable alice
+cortex token mint alice claude-desktop
 cortex vault list
 cortex vault provision alice
-cortex vault repair alice        # `main` is also accepted
-cortex vault archive alice       # reversible move; preserves .git
-cortex token mint alice claude-desktop
+cortex vault repair alice
+cortex vault archive alice
 ```
 
-Deleting a user removes their identity, sessions, and tokens but does not erase
-their vault. Archive the vault explicitly after the identity decision. Permanent
-vault deletion is CLI-only and requires `--force`.
+`cortex init` applies SQLite migrations, imports a legacy identity store when
+present, creates the first local `admin` account and provisions its vault.
+Passwords and minted tokens are shown once; store them outside the vault.
+There is no web dashboard or vault viewer. Use the CLI or authenticated
+`/api/v1` JSON API. Readiness is `/healthz`; `/` and former UI routes return 404.
+Optional OAuth consent remains available for MCP client authorization.
 
-## Grants and isolation
+Deleting a user removes identity, sessions, and tokens, not their note store.
+Archive their vault explicitly; permanent vault deletion requires CLI `--force`.
 
-| Identity | Visible vaults | Path scopes |
-|---|---|---|
-| Config principal | `main` only | configured read/write scopes |
-| User | own vault | `**` read/write |
-| User through groups | `main` | union of group read/write scopes |
-| Admin | all live vaults | `**` read/write |
+## Isolation
 
-The vault id and note path are separate values. Cortex chooses an authorized
-vault before canonicalizing and scope-checking the path. A foreign vault, an
-out-of-scope note, and an absent resource use the same not-found response.
+- An omitted vault selects the authenticated account, including administrators.
+- Ordinary accounts access their own vault only. A token can narrow paths,
+  never broaden its owner's access.
+- Administrators must explicitly select another account for cross-account work.
+- Legacy group path grants do not confer account-vault access. Group tool
+  permissions remain independent.
+- Missing owner storage fails closed. The retired `main` identifier is rejected.
 
-User API tokens may carry path globs. Those constraints narrow every vault the
-owner already reaches and can never add a grant. Use one token per AI/client so
-it can be revoked independently.
+See [account-owned vaults](account-vaults.md) for the authoritative storage and
+migration contract. Foreign vaults and absent/out-of-scope paths use the same
+not-found response to avoid existence leaks.
 
-## Shared memory
+## API
 
-Groups grant the main vault independently for reads and writes. Example:
-
-```text
-group: research
-read:  Projects/Research/**
-write: Projects/Research/Inbox/**
-```
-
-Manage local groups, membership, and scopes under **Administration → People →
-Groups**. The panel can override public-safe LDAP JIT/mapping policy in SQLite
-and supports dry-run/apply sync; connection and bind-secret settings remain
-config/environment-only.
-
-## Vault viewer and API
-
-The same-origin SPA uses `/api/v1`. The viewer renders sanitized Markdown and
-GFM, translates Obsidian wikilinks/embeds, shows properties and backlinks, and
-searches only visible notes. Note responses include an ETag; attachments use
-safe content types, `nosniff`, and a sandboxed CSP.
-
-Session-cookie mutations require `X-Cortex-CSRF`. User bearer tokens can also
-call the API and are CSRF-exempt. The hand-maintained contract is
-[`openapi.yaml`](openapi.yaml).
+User bearer tokens can call `/api/v1`. Existing session-cookie authentication
+is retained; its mutations require `X-Cortex-CSRF`. The API contract is
+[openapi.yaml](openapi.yaml). Notes use ETags; attachments use bounded reads,
+safe content types, `nosniff`, and sandboxed CSP where applicable.
 
 ## Backup
 
-Back up these together while Cortex is stopped or from a filesystem snapshot:
+Back up these together while stopped or from a consistent filesystem snapshot:
 
-- `vault.path` (main vault, including `.git`)
-- `vaults.root` (private vaults, including each `.git`)
-- `database.path` (SQLite identity/gateway/audit state)
+- `vaults.root`, including each account's `.git` history
+- `database.path` and the OAuth registration file beside it
 - `vaults.archive_dir`
-- `cortex.yaml` and the separately managed environment/secret file
+- public-safe configuration and separately protected secret files
 
-Search indexes are rebuildable caches and may be omitted. Restore paths and
-ownership, run `cortex migrate`, then `cortex vault repair <id>` as needed.
-
-For a live SQLite-only copy, use its online backup API rather than copying a
-WAL database piecemeal:
-
-```bash
-sqlite3 data/cortex.sqlite ".backup '/backup/cortex-$(date +%F).sqlite'"
-```
-
-Keep that database backup aligned with a snapshot of the vault roots.
+Indexes are rebuildable caches. Preserve any legacy migration source separately;
+it is not a live default vault. Use SQLite's online backup API rather than copying
+a live WAL database piecemeal, and align that backup with the vault snapshot.

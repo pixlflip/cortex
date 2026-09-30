@@ -35,22 +35,14 @@ Each request must send `Authorization: Bearer <token>`. The token maps to its
 principal; the principal's scopes are enforced on every tool call. An unknown or
 missing token gets `401`.
 
-## 2. Web app and admin panel
+## 2. Headless administration
 
-Run `cortex init` once before exposing HTTP. It initializes the git audit
-baseline and creates the admin UI state file with a generated password:
-
-```bash
-cortex init
-# admin username: admin
-# admin password: <shown once>
-```
-
-HTTP deployments with an initialized SQLite database expose the same-origin SPA
-at `/`. Sign in with the generated local admin to manage users, groups and
-shared scopes, private vaults, LDAP sync, user tokens, upstream MCP servers,
-deny-wins tool rules, and audit telemetry. Each person creates a separate token
-per AI client; token path scopes may narrow that client's vault access.
+Run `cortex init` once to initialize the identity database and account vaults.
+Use `cortex user add <username>` and `cortex token mint <username> <client-name>`
+for accounts and individually revocable tokens, or use the authenticated
+`/api/v1` API. Cortex serves no dashboard or static web application; `/` and
+former UI paths return 404. The optional OAuth authorization/consent page is
+a protocol dependency for external MCP clients, not a product interface.
 
 ## 3. Put TLS in front (reverse proxy)
 

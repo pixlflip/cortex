@@ -40,7 +40,7 @@ from mcp.server.auth.settings import (
 from mcp.server.lowlevel.server import request_ctx
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .admin import ADMIN_PATH, AdminStore, AdminUI
+from .admin import AdminStore
 from .access import VaultAccessError, VaultAccessResolver
 from .auth import (
     ADMIN_SUBJECT_PREFIX,
@@ -296,13 +296,6 @@ class CortexServer:
             mcp.custom_route(LOGIN_PATH, methods=["GET", "POST"])(
                 http.oauth_provider.handle_consent
             )
-        if http is not None and self.admin_store is not None and self.identity is None:
-            admin_ui = AdminUI(self.admin_store, self.config.server.public_url or f"http://{http.host}:{http.port}")
-            mcp.custom_route(ADMIN_PATH, methods=["GET", "POST"])(admin_ui.handle)
-            mcp.custom_route(f"{ADMIN_PATH}/login", methods=["POST"])(admin_ui.handle)
-            mcp.custom_route(f"{ADMIN_PATH}/logout", methods=["POST"])(admin_ui.handle)
-            mcp.custom_route(f"{ADMIN_PATH}/roles", methods=["POST"])(admin_ui.handle)
-            mcp.custom_route(f"{ADMIN_PATH}/clients", methods=["POST"])(admin_ui.handle)
         return mcp
 
     # -- principal resolution ---------------------------------------------
@@ -1450,7 +1443,7 @@ def build_http_server(config: CortexConfig) -> CortexServer:
     # when the identity DB exists — a pure-v1 setup grows no new routes.
     if identity is not None:
         from .api import build_api
-        from .webapp import register_web_app
+        from .health import register_health
 
         server.api = build_api(
             config,
@@ -1458,5 +1451,5 @@ def build_http_server(config: CortexConfig) -> CortexServer:
             gateway_runtime=server.gateway_runtime,
         )
         server.api.register(server.mcp)
-        register_web_app(server.mcp, config, server.vault_manager)
+        register_health(server.mcp, config, server.vault_manager)
     return server

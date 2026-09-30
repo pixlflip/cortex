@@ -1,5 +1,8 @@
 # Cortex v2 Design — Multi-user, Multi-vault, Web App, MCP Gateway
 
+> Historical v2 design/review: the product UI and legacy browser admin were
+> removed in the headless release. See README and multi-user.md for current operation.
+
 > Status: **canonical v2 design.** This document extends
 > [`ARCHITECTURE.md`](../ARCHITECTURE.md) (the v1 canonical design, which
 > remains authoritative for everything it covers). Where the two disagree,
