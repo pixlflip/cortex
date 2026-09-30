@@ -1,17 +1,16 @@
 """Cortex SQLite data layer (v2 design §4).
 
-One SQLite database holds identity and gateway state — users, groups,
-sessions, API tokens, MCP server registry, tool permissions, and tool-call
-audit telemetry. It never holds note content; notes live in vaults and git
-remains their audit trail.
+One SQLite database holds users, groups, sessions, API tokens, memory tool
+permissions and call audit. Historical upstream tables remain inert for
+rollback; there is no registry repository. It never holds note content;
+notes live in vaults and git remains their audit trail.
 
 Public surface:
 
 * :class:`Database` — the connection manager + migration runner.
 * Repositories (:class:`UsersRepo`, :class:`GroupsRepo`, :class:`ApiTokensRepo`,
-  :class:`SessionsRepo`) — typed CRUD primitives over the tables A3 makes
-  usable now. Later workstreams (D1/D2/D3) add repositories for the gateway
-  tables, whose schema already exists.
+  :class:`SessionsRepo`) — typed CRUD primitives for identity, memory policy
+  and audit. Migration history is retained unchanged.
 * :func:`import_admin_state` — one-shot, idempotent import of the legacy
   ``cortex.admin.json`` store.
 """
@@ -30,7 +29,6 @@ from .repos import (
     CreatedApiToken,
     CreatedSession,
     GroupsRepo,
-    McpServersRepo,
     SessionsRepo,
     ToolAuditRepo,
     ToolPermissionsRepo,
@@ -51,7 +49,6 @@ __all__ = [
     "GroupsRepo",
     "ApiTokensRepo",
     "SessionsRepo",
-    "McpServersRepo",
     "ToolPermissionsRepo",
     "SettingsRepo",
     "ToolAuditRepo",

@@ -123,5 +123,6 @@ curl -s -X POST https://cortex.example.com/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-Read [`mcp-gateway.md`](mcp-gateway.md) before registering upstream servers,
-especially the SSRF and untrusted-result boundaries.
+Cortex exposes only its own memory tools. Upstream registration and proxy calls
+are retired; see [memory policy and retirement](memory-policy.md). TLS reverse
+proxies and the client-side Anthropic connector above are unaffected.

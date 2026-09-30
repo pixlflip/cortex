@@ -3,7 +3,7 @@ import pytest
 from cortex.api import ApiV1
 from cortex.config import CortexConfig, WritesConfig
 from cortex.db import Database
-from cortex.gateway import PermissionResolver
+from cortex.memory_policy import PermissionResolver
 from cortex.sessions import SessionAuth
 from cortex.users import IdentityService
 

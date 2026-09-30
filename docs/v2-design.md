@@ -1,13 +1,9 @@
 # Cortex v2 Design — Multi-user, Multi-vault, Web App, MCP Gateway
 
-> Historical v2 design/review: the product UI and legacy browser admin were
-> removed in the headless release. See README and multi-user.md for current operation.
-
-> Status: **canonical v2 design.** This document extends
-> [`ARCHITECTURE.md`](../ARCHITECTURE.md) (the v1 canonical design, which
-> remains authoritative for everything it covers). Where the two disagree,
-> this document wins for v2 work. It is written so that an agent picking up
-> any issue in the v2 tree (#35–#55) can build from it cold.
+> Historical design only. The UI, shared/global vault, and upstream MCP broker
+> have been removed. This is not the current implementation contract or a
+> roadmap to reactivate them. See [memory policy](memory-policy.md),
+> [account vaults](account-vaults.md), README and multi-user.md for operation.
 
 Like the v1 document, this is intentionally infrastructure-agnostic: no IP
 addresses, no hostnames, no secrets. Everything environment-specific is a

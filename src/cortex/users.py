@@ -42,7 +42,6 @@ from .db.repos import (
     ApiTokensRepo,
     CreatedApiToken,
     GroupsRepo,
-    McpServersRepo,
     SessionsRepo,
     SettingsRepo,
     ToolAuditRepo,
@@ -117,7 +116,6 @@ class IdentityService:
         self.groups = GroupsRepo(db)
         self.tokens = ApiTokensRepo(db)
         self.sessions = SessionsRepo(db)
-        self.mcp_servers = McpServersRepo(db)
         self.tool_permissions = ToolPermissionsRepo(db)
         self.tool_audit = ToolAuditRepo(db)
         self.settings = SettingsRepo(db)

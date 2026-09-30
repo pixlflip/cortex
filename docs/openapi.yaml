@@ -2,14 +2,15 @@
 #
 # Authoritative description of the headless JSON REST surface that
 # scripting client build against. Kept accurate to src/cortex/api.py by hand;
-# later API issues (B3 vault-content, D gateway) extend this file.
+# upstream MCP broker routes are retired and intentionally absent.
 openapi: 3.1.0
 info:
   title: Cortex API
   version: "1.0"
   description: |
     JSON REST API for Cortex identity, multi-vault content/lifecycle,
-    self-service tokens, governed MCP registry/permissions, and audit.
+    self-service tokens, memory tool permissions, and audit.
+    Former /mcp/* registry routes return 404 without outbound activity.
 
     **Authentication.** Two schemes, resolved per request:
     - `cookieAuth` — the HttpOnly session cookie set by `POST /auth/login`.
@@ -55,8 +56,7 @@ tags:
     description: Identity-scoped vault discovery and read-oriented content.
   - name: audit
     description: Git mutation history and value-free tool-call telemetry.
-  - name: gateway
-    description: Governed upstream MCP registry and visible tool inventory.
+
   - name: policy
     description: Admin-only deny-wins tool permission rules.
 
@@ -724,76 +724,6 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/FreeformOk" }
 
-  /mcp/tools:
-    get:
-      tags: [gateway]
-      operationId: listVisibleMcpTools
-      summary: List the exact tool surface permitted for the caller.
-      responses:
-        "200": { $ref: "#/components/responses/FreeformOk" }
-
-  /mcp/servers:
-    get:
-      tags: [gateway]
-      operationId: listMcpServers
-      summary: List global and caller-owned enabled upstreams (all for admin).
-      responses:
-        "200": { $ref: "#/components/responses/FreeformOk" }
-    post:
-      tags: [gateway]
-      operationId: createMcpServer
-      summary: Register and test an HTTP or administrator-only local stdio upstream.
-      parameters:
-        - $ref: "#/components/parameters/CsrfHeader"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/McpServerInput" }
-      responses:
-        "201": { $ref: "#/components/responses/FreeformOk" }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "403": { $ref: "#/components/responses/Forbidden" }
-
-  /mcp/servers/{server_id}:
-    parameters:
-      - $ref: "#/components/parameters/ServerId"
-    get:
-      tags: [gateway]
-      operationId: getMcpServer
-      responses:
-        "200": { $ref: "#/components/responses/FreeformOk" }
-        "404": { $ref: "#/components/responses/NotFound" }
-    patch:
-      tags: [gateway]
-      operationId: updateMcpServer
-      parameters:
-        - $ref: "#/components/parameters/CsrfHeader"
-      responses:
-        "200": { $ref: "#/components/responses/FreeformOk" }
-    delete:
-      tags: [gateway]
-      operationId: deleteMcpServer
-      parameters:
-        - $ref: "#/components/parameters/CsrfHeader"
-      responses:
-        "204": { description: Server and dependent rules removed. }
-
-  /mcp/servers/{server_id}/{action}:
-    parameters:
-      - $ref: "#/components/parameters/ServerId"
-      - name: action
-        in: path
-        required: true
-        schema: { type: string, enum: [test, refresh] }
-    post:
-      tags: [gateway]
-      operationId: refreshMcpServer
-      parameters:
-        - $ref: "#/components/parameters/CsrfHeader"
-      responses:
-        "200": { $ref: "#/components/responses/FreeformOk" }
-
   /admin/permissions:
     get:
       tags: [policy]
@@ -808,6 +738,10 @@ paths:
     post:
       tags: [policy]
       operationId: setToolPermission
+      description: >
+        Memory-only deny-wins rules. tool_pattern must be cortex-prefixed or *;
+        non-null server_id and upstream patterns are rejected. Historical rules
+        remain readable but cannot restore upstream execution.
       parameters:
         - $ref: "#/components/parameters/CsrfHeader"
       responses:
@@ -864,7 +798,7 @@ components:
       in: path
       required: true
       schema: { type: string }
-      description: "main or a granted username vault id."
+      description: "An authorized account username; no main/global fallback."
     NotePath:
       name: path
       in: path
@@ -877,11 +811,7 @@ components:
       required: true
       schema: { type: string }
       description: Vault-relative attachment path; may contain `/`.
-    ServerId:
-      name: server_id
-      in: path
-      required: true
-      schema: { type: integer }
+
 
   responses:
     FreeformOk:
@@ -985,45 +915,6 @@ components:
         expires_at: { type: [integer, "null"], description: Unix seconds. }
         last_used_at: { type: [integer, "null"], description: Unix seconds. }
         revoked_at: { type: [integer, "null"], description: Unix seconds. }
-
-    McpServerInput:
-      oneOf:
-        - $ref: "#/components/schemas/HttpMcpServerInput"
-        - $ref: "#/components/schemas/StdioMcpServerInput"
-      discriminator: { propertyName: transport }
-
-    HttpMcpServerInput:
-      type: object
-      required: [name, url]
-      properties:
-        name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
-        transport: { type: string, enum: [streamable-http], default: streamable-http }
-        url: { type: string, format: uri }
-        description: { type: string }
-        auth_env: { type: string, description: Environment-variable name, never a value. }
-        headers_env: { type: object, additionalProperties: { type: string } }
-        global: { type: boolean, default: true }
-      additionalProperties: false
-
-    StdioMcpServerInput:
-      type: object
-      required: [name, transport, command]
-      description: Administrator-only; rejected unless gateway.allow_stdio_servers is enabled.
-      properties:
-        name: { type: string, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,47}$" }
-        transport: { type: string, const: stdio-cmd }
-        command: { type: string, description: Absolute exact-allowlisted executable path. }
-        args: { type: array, maxItems: 128, items: { type: string, maxLength: 4096 } }
-        cwd: { type: string, description: Optional absolute directory beneath an allowed root. }
-        env_refs:
-          type: object
-          maxProperties: 64
-          additionalProperties: { type: string }
-          description: Child variable name to Cortex parent variable name; never values.
-        description: { type: string }
-        global: { type: boolean, const: true }
-      additionalProperties: false
-      example: { name: harmless, transport: stdio-cmd, command: /opt/cortex-mcp/harmless/.venv/bin/harmless-mcp-server, args: [run, --transport, stdio], cwd: /opt/cortex-mcp/harmless, env_refs: { SERVICE_TOKEN: HARMLESS_MCP_TOKEN }, global: true }
 
     SyncReport:
       type: object

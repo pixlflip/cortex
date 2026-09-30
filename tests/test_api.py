@@ -190,11 +190,6 @@ def test_me_anonymous_is_401(client: TestClient):
         ("POST", "/admin/vaults/alice/repair"),
         ("GET", "/audit/commits"),
         ("GET", "/audit/tools"),
-        ("GET", "/mcp/tools"),
-        ("GET", "/mcp/servers"),
-        ("POST", "/mcp/servers"),
-        ("GET", "/mcp/servers/1"),
-        ("POST", "/mcp/servers/1/refresh"),
         ("GET", "/admin/permissions"),
         ("GET", "/admin/janitor"),
     ],
@@ -654,29 +649,23 @@ def test_admin_can_edit_and_persist_public_ldap_policy(identity: IdentityService
 def test_permission_preview_uses_actual_enabled_tool_inventory(
     identity: IdentityService, api: ApiV1
 ):
-    server = identity.mcp_servers.create(
-        "calendar", url="https://calendar.example.com/mcp"
-    )
-    identity.mcp_servers.set_inventory(
-        server["id"],
-        [{"name": "list", "inputSchema": {"type": "object"}}],
-    )
-    disabled = identity.mcp_servers.create(
-        "disabled", url="https://disabled.example.com/mcp"
-    )
-    identity.mcp_servers.set_inventory(
-        disabled["id"],
-        [{"name": "hidden", "inputSchema": {"type": "object"}}],
-        error="offline",
-    )
+    # Seed historical data directly: there is intentionally no registry repo.
+    with identity.db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO mcp_servers (name, url, transport, enabled, created_at, tools_json) "
+            "VALUES ('calendar', 'https://calendar.invalid/mcp', 'streamable-http', 1, 0, ?)",
+            ('[{"name":"list"}]',),
+        )
     client = make_client(api)
     login(client, "admin", "admin-pw")
     response = client.get(f"{API_PREFIX}/admin/permissions?user=alice")
     assert response.status_code == 200
     preview = {row["tool_id"]: row for row in response.json()["preview"]}
     assert preview["cortex.search"]["allowed"] is True
-    assert preview["calendar.list"]["allowed"] is False
-    assert "disabled.hidden" not in preview
+    assert all(tool_id.startswith("cortex.") for tool_id in preview)
+    assert "calendar.list" not in preview
+    assert "cortex.get_file" in preview
+    assert "cortex.write_note" not in preview
 
 
 def test_ldap_sync_without_ldap_config(client: TestClient):

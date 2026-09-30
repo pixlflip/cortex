@@ -1,10 +1,8 @@
 """JSON REST API foundation — the ``/api/v1`` surface (A6, #40).
 
-This headless management API is mounted as a route group on the
-same Starlette app that serves MCP and the legacy admin UI. This phase is
-**auth + user/group/token management only** — vault-content endpoints are B3,
-MCP-gateway endpoints are D. The conventions established here are reused by
-every later API issue:
+This headless account and memory API is mounted on the same Starlette app
+that serves the dedicated memory MCP. No upstream MCP registry or proxy
+endpoints are exposed.
 
 **Auth.** Two credential kinds, resolved per request (design §8.1):
 
@@ -60,15 +58,7 @@ from starlette.routing import Route
 
 from .config import CortexConfig, Principal
 from .access import VaultAccessError, VaultAccessResolver
-from .gateway import (
-    GatewayError,
-    GatewayRuntime,
-    PermissionResolver,
-    validate_env_name,
-    validate_header_name,
-    validate_outbound_url,
-    validate_server_name,
-)
+from .memory_policy import PermissionResolver, memory_tool_ids
 from .ldap import DirectoryService, LdapError
 from .scopes import filter_paths, path_allowed
 from .serialization import normalize_json
@@ -194,7 +184,6 @@ class ApiV1:
         *,
         directory: DirectoryService | None = None,
         rate_limiter: LoginRateLimiter | None = None,
-        gateway_runtime: GatewayRuntime | None = None,
     ):
         self.config = config
         self.identity = identity
@@ -206,7 +195,6 @@ class ApiV1:
             identity, config
         )
         self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
-        self.gateway = gateway_runtime or GatewayRuntime(config, identity)
         self.permissions = PermissionResolver(config, identity)
 
     # -- wiring ---------------------------------------------------------------
@@ -246,18 +234,6 @@ class ApiV1:
             ),
             (f"{p}/audit/commits", ["GET"], self.commit_audit),
             (f"{p}/audit/tools", ["GET"], self.tool_audit),
-            (f"{p}/mcp/tools", ["GET"], self.mcp_tools),
-            (f"{p}/mcp/servers", ["GET", "POST"], self.mcp_servers),
-            (
-                f"{p}/mcp/servers/{{server_id}}",
-                ["GET", "PATCH", "DELETE"],
-                self.mcp_server_item,
-            ),
-            (
-                f"{p}/mcp/servers/{{server_id}}/{{action}}",
-                ["POST"],
-                self.mcp_server_action,
-            ),
             (f"{p}/admin/permissions", ["GET", "POST"], self.tool_permissions),
             (
                 f"{p}/admin/permissions/{{permission_id}}",
@@ -298,8 +274,6 @@ class ApiV1:
                 response = error_response(404, "not_found", _NOT_FOUND)
             except VaultManagerError as exc:
                 response = error_response(400, "invalid_request", str(exc))
-            except GatewayError as exc:
-                response = error_response(400, "gateway_error", str(exc))
             except LdapError:
                 # Covers LdapUnavailableError (outage) and configuration/
                 # protocol failures alike: callers get one non-revealing 503
@@ -1204,333 +1178,14 @@ class ApiV1:
         events.sort(key=lambda item: item["date"], reverse=True)
         return JSONResponse({"commits": events[:limit]})
 
-    # -- D1-D4: MCP registry, permissions, and call audit ---------------------
-
-    @staticmethod
-    def _server_summary(row: dict, *, include_env_refs: bool = False) -> dict:
-        tools = json.loads(row.get("tools_json") or "[]")
-        result = {
-            "id": row["id"],
-            "name": row["name"],
-            "description": row.get("description"),
-            "url": row.get("url"),
-            "transport": row["transport"],
-            "owner_user_id": row["owner_user_id"],
-            "visibility": row["visibility"],
-            "enabled": bool(row["enabled"]),
-            "tools": tools,
-            "tool_count": len(tools),
-            "last_error": row.get("last_error"),
-            "last_checked_at": row.get("last_checked_at"),
-            "created_at": row["created_at"],
-            "updated_at": row.get("updated_at"),
-        }
-        if include_env_refs:
-            result["auth_env"] = row.get("auth_env")
-            result["headers_env"] = json.loads(row.get("headers_env_json") or "{}")
-            if row["transport"] == "stdio-cmd":
-                result["command"] = row.get("command")
-                result["args"] = json.loads(row.get("args_json") or "[]")
-                result["cwd"] = row.get("cwd")
-                result["env_refs"] = json.loads(row.get("env_refs_json") or "{}")
-        return result
-
-    def _server_for_identity(self, ident: ApiIdentity, raw_id: str) -> dict:
-        try:
-            server_id = int(raw_id)
-        except ValueError:
-            raise ApiError(404, "not_found", _NOT_FOUND)
-        row = self.identity.mcp_servers.get(server_id)
-        if row is None or (
-            not ident.is_admin and row["owner_user_id"] != ident.user["id"]
-        ):
-            raise ApiError(404, "not_found", _NOT_FOUND)
-        return row
-
-    async def mcp_servers(self, request: Request) -> Response:
-        ident = self._require_identity(request)
-        if request.method == "GET":
-            rows = self.identity.mcp_servers.visible_to(
-                ident.user["id"], is_admin=ident.is_admin
-            )
-            return JSONResponse(
-                {
-                    "servers": [
-                        self._server_summary(row, include_env_refs=ident.is_admin)
-                        for row in rows
-                    ],
-                    "allow_user_servers": self.config.gateway.allow_user_servers,
-                    "allow_stdio_servers": self.config.gateway.allow_stdio_servers
-                    and ident.is_admin,
-                }
-            )
-        if not ident.is_admin and not self.config.gateway.allow_user_servers:
-            raise ApiError(403, "forbidden", "personal MCP servers are disabled")
-        body = await self._json_body(request)
-        name = validate_server_name(self._str_field(body, "name", required=True))
-        transport = body.get("transport", "streamable-http")
-        if transport == "stdio-cmd" and not ident.is_admin:
-            raise ApiError(
-                403, "forbidden", "local stdio MCP servers require an administrator"
-            )
-        if transport == "stdio-cmd" and not self.config.gateway.allow_stdio_servers:
-            raise ApiError(403, "forbidden", "local stdio MCP servers are disabled")
-        if transport not in ("streamable-http", "stdio-cmd"):
-            raise ApiError(400, "invalid_request", "unsupported MCP transport")
-        url = (
-            validate_outbound_url(
-                self._str_field(body, "url", required=True), self.config
-            )
-            if transport == "streamable-http"
-            else None
-        )
-        owner = (
-            None if ident.is_admin and body.get("global", True) else ident.user["id"]
-        )
-        headers_env = body.get("headers_env", {})
-        if not isinstance(headers_env, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in headers_env.items()
-        ):
-            raise ApiError(
-                400, "invalid_request", "headers_env must map header names to env names"
-            )
-        headers_env = {
-            validate_header_name(key): validate_env_name(value)
-            for key, value in headers_env.items()
-        }
-        args = (
-            body.get("args")
-            if "args" in body
-            else ([] if transport == "stdio-cmd" else None)
-        )
-        env_refs = (
-            body.get("env_refs")
-            if "env_refs" in body
-            else ({} if transport == "stdio-cmd" else None)
-        )
-        if env_refs is not None and (
-            not isinstance(env_refs, dict)
-            or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in env_refs.items()
-            )
-        ):
-            raise ApiError(
-                400,
-                "invalid_request",
-                "env_refs must map child variable names to Cortex variable names",
-            )
-        if env_refs is not None:
-            env_refs = {
-                validate_env_name(k): validate_env_name(v) for k, v in env_refs.items()
-            }
-        command = self._str_field(body, "command")
-        cwd = self._str_field(body, "cwd")
-        candidate = {
-            "transport": transport,
-            "url": url,
-            "command": command,
-            "cwd": cwd,
-            "args_json": json.dumps(args) if args is not None else None,
-            "env_refs_json": json.dumps(env_refs) if env_refs is not None else None,
-        }
-        if transport == "stdio-cmd":
-            try:
-                self.gateway._stdio_parameters(candidate)
-            except (GatewayError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                raise ApiError(400, "invalid_request", str(exc)) from exc
-        try:
-            row = self.identity.mcp_servers.create(
-                name,
-                url=url,
-                transport=transport,
-                owner_user_id=owner,
-                description=self._str_field(body, "description"),
-                auth_env=validate_env_name(self._str_field(body, "auth_env")),
-                headers_env=headers_env,
-                command=command,
-                args=args,
-                env_refs=env_refs,
-                cwd=cwd,
-                visibility="group" if owner is None else "personal",
-                enabled=False,
-            )
-        except ValueError as exc:
-            raise ApiError(400, "invalid_request", str(exc)) from exc
-        error = None
-        try:
-            await self.gateway.discover(row)
-        except GatewayError as exc:
-            error = str(exc)
-        row = self.identity.mcp_servers.get(row["id"])
-        return JSONResponse(
-            {
-                "server": self._server_summary(row, include_env_refs=ident.is_admin),
-                "validation_error": error,
-            },
-            status_code=201,
-        )
-
-    async def mcp_server_item(self, request: Request) -> Response:
-        ident = self._require_identity(request)
-        row = self._server_for_identity(ident, request.path_params["server_id"])
-        if request.method == "GET":
-            return JSONResponse(
-                {"server": self._server_summary(row, include_env_refs=ident.is_admin)}
-            )
-        if request.method == "DELETE":
-            await self.gateway.unregister(row)
-            self.identity.mcp_servers.delete(row["id"])
-            return Response(status_code=204)
-        body = await self._json_body(request)
-        fields = {}
-        for key in ("description", "auth_env"):
-            if key in body:
-                fields[key] = self._str_field(body, key)
-        if "auth_env" in fields:
-            fields["auth_env"] = validate_env_name(fields["auth_env"])
-        if "enabled" in body:
-            fields["enabled"] = bool(self._bool_field(body, "enabled"))
-        if "url" in body:
-            fields["url"] = validate_outbound_url(
-                self._str_field(body, "url", required=True), self.config
-            )
-        if "headers_env" in body:
-            headers = body["headers_env"]
-            if not isinstance(headers, dict):
-                raise ApiError(400, "invalid_request", "headers_env must be an object")
-            fields["headers_env_json"] = json.dumps(
-                {
-                    validate_header_name(key): validate_env_name(value)
-                    for key, value in headers.items()
-                }
-            )
-        connection_changed = bool(
-            {
-                "url",
-                "auth_env",
-                "headers_env_json",
-                "command",
-                "args_json",
-                "env_refs_json",
-                "cwd",
-            }.intersection(fields)
-        )
-        if row["transport"] == "stdio-cmd" and not ident.is_admin:
-            raise ApiError(
-                403, "forbidden", "local stdio MCP servers require an administrator"
-            )
-        if row["transport"] == "stdio-cmd":
-            for key in ("command", "cwd"):
-                if key in body:
-                    fields[key] = self._str_field(body, key)
-            if "args" in body:
-                fields["args_json"] = json.dumps(body["args"])
-            if "env_refs" in body:
-                refs = body["env_refs"]
-                if not isinstance(refs, dict):
-                    raise ApiError(400, "invalid_request", "env_refs must be an object")
-                fields["env_refs_json"] = json.dumps(
-                    {
-                        validate_env_name(k): validate_env_name(v)
-                        for k, v in refs.items()
-                    }
-                )
-            connection_changed = connection_changed or bool(
-                {"command", "cwd", "args", "env_refs"}.intersection(body)
-            )
-            candidate = {**row, **fields}
-            self.gateway._stdio_parameters(candidate)
-        if fields.get("enabled") is False:
-            await self.gateway.close_registration(row["id"])
-        if connection_changed:
-            await self.gateway.close_registration(row["id"])
-        row = self.identity.mcp_servers.update(row["id"], **fields)
-        validation_error = None
-        if connection_changed:
-            try:
-                await self.gateway.discover(row)
-            except GatewayError as exc:
-                # Discovery persists the failure and disables the registration,
-                # so a bad update cannot leave stale tools callable.
-                validation_error = str(exc)
-            row = self.identity.mcp_servers.get(row["id"])
-        else:
-            self.gateway.sync_registration(row)
-        return JSONResponse(
-            {
-                "server": self._server_summary(row, include_env_refs=ident.is_admin),
-                "validation_error": validation_error,
-            }
-        )
-
-    async def mcp_server_action(self, request: Request) -> Response:
-        ident = self._require_identity(request)
-        row = self._server_for_identity(ident, request.path_params["server_id"])
-        if request.path_params["action"] not in ("test", "refresh"):
-            raise ApiError(404, "not_found", _NOT_FOUND)
-        tools = await self.gateway.discover(row)
-        refreshed = self.identity.mcp_servers.get(row["id"])
-        return JSONResponse(
-            {
-                "server": self._server_summary(
-                    refreshed, include_env_refs=ident.is_admin
-                ),
-                "tools": tools,
-            }
-        )
+    # -- Memory tool permissions and retained call audit --------------------
 
     def _tool_catalog(self, user_id: int, *, is_admin: bool) -> list[dict]:
-        """Return the real tool inventory visible to one identity."""
-        builtin = [
-            "discover_scopes",
-            "status",
-            "list_notes",
-            "search",
-            "read_note",
-            "read_frontmatter",
-            "read_section",
-            "context_pack",
-            "semantic_search",
+        """Only classified Cortex memory tools; historical registries are inert."""
+        return [
+            {"id": tool_id, "server": "cortex", "name": tool_id.split(".", 1)[1]}
+            for tool_id in memory_tool_ids(self.config)
         ]
-        if self.config.writes.enabled:
-            builtin += [
-                "write_note",
-                "patch_note",
-                "append_note",
-                "update_frontmatter",
-                "set_memory_state",
-                "supersede_note",
-                "delete_note",
-                "move_note",
-            ]
-        items = [
-            {"id": f"cortex.{name}", "server": "cortex", "name": name}
-            for name in builtin
-        ]
-        for row in self.identity.mcp_servers.visible_to(user_id, is_admin=is_admin):
-            if not row["enabled"]:
-                continue
-            for tool in json.loads(row.get("tools_json") or "[]"):
-                items.append(
-                    {
-                        "id": f"{row['name']}.{tool['name']}",
-                        "server": row["name"],
-                        "name": tool["name"],
-                        "description": tool.get("description"),
-                        "inputSchema": tool.get("inputSchema"),
-                    }
-                )
-        return items
-
-    async def mcp_tools(self, request: Request) -> Response:
-        ident = self._require_identity(request)
-        principal = self._api_principal(ident)
-        items = []
-        for item in self._tool_catalog(ident.user["id"], is_admin=ident.is_admin):
-            tool_id = item["id"]
-            if self.permissions.allowed(principal, tool_id):
-                items.append(item)
-        return JSONResponse({"tools": items})
 
     async def tool_permissions(self, request: Request) -> Response:
         ident = self._require_identity(request, admin=True)
@@ -1561,16 +1216,17 @@ class ApiV1:
         else:
             raise ApiError(400, "invalid_request", "subject_type must be user or group")
         server_id = body.get("server_id")
-        if server_id is not None and not isinstance(server_id, int):
-            raise ApiError(400, "invalid_request", "server_id must be an integer")
-        if server_id is not None and self.identity.mcp_servers.get(server_id) is None:
-            raise ApiError(404, "not_found", _NOT_FOUND)
+        if server_id is not None:
+            raise ApiError(400, "invalid_request", "upstream tool permissions are retired")
+        tool_pattern = self._str_field(body, "tool_pattern", required=True)
+        assert tool_pattern is not None
+        if not (tool_pattern == "*" or tool_pattern.startswith("cortex.")):
+            raise ApiError(400, "invalid_request", "only Cortex memory tool patterns are supported")
         rule = self.identity.tool_permissions.set(
             subject_type=subject_type,
             subject_id=subject["id"],
-            tool_pattern=self._str_field(body, "tool_pattern", required=True),
+            tool_pattern=tool_pattern,
             effect=self._str_field(body, "effect", required=True),
-            server_id=server_id,
             created_by=ident.user["id"],
         )
         return JSONResponse({"permission": rule}, status_code=201)
@@ -1641,23 +1297,12 @@ class ApiV1:
 def build_api(
     config: CortexConfig,
     identity: IdentityService,
-    *,
-    gateway_runtime: GatewayRuntime | None = None,
 ) -> ApiV1:
     """Standard construction used by ``build_http_server``: cookie Secure
     flag follows the public base URL's scheme (the #19 rule).
-
-    The HTTP API and MCP transport must share one gateway runtime so API-driven
-    registration, refresh, disable, and removal update the live MCP tool
-    manager rather than an unattached shadow instance.
     """
     base = (
         config.server.public_url or f"http://{config.server.host}:{config.server.port}"
     )
     session_auth = SessionAuth(identity, secure_cookies=base.startswith("https://"))
-    return ApiV1(
-        config,
-        identity,
-        session_auth,
-        gateway_runtime=gateway_runtime,
-    )
+    return ApiV1(config, identity, session_auth)

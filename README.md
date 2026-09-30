@@ -19,8 +19,8 @@ through a secure [Model Context Protocol](https://modelcontextprotocol.io)
   Git is the single audit trail and rollback mechanism.
 - **Deterministic by default** — search, reads, and context packs spend zero
   model tokens. Only the one `semantic_search` tool calls an LLM.
-- **One governed MCP** — connect an AI only to Cortex; it receives Cortex and
-  upstream MCP tools filtered by the token owner's deny-wins policy.
+- **Dedicated memory MCP** — only Cortex memory tools, filtered by the token
+  owner's always-on deny-wins policy. No upstream registry or proxy.
 - **Self-improving (bounded)** — an optional, report-first janitor tidies and
   watches the vault on a heartbeat, never able to edit its own limits.
 
@@ -91,10 +91,11 @@ then configure the AI client with Cortex as its memory MCP endpoint:
 }
 ```
 
-Tool discovery is identity-specific. Built-in tools and namespaced upstream
-tools (`calendar.list_events`, for example) are omitted unless allowed, and
-authorization is checked again at call time. See
-[`docs/mcp-gateway.md`](docs/mcp-gateway.md).
+Tool discovery is identity-specific and memory-only. Authorization is checked
+again at call time, including when an old config sets `gateway.enabled: false`.
+Upstream tools, `search_mcps`/`peek_mcp`/`load_mcp`, and `/api/v1/mcp/*` broker
+routes have been removed. This is an intentional breaking change, not a switch.
+See [memory policy and broker retirement](docs/memory-policy.md) before cutover.
 
 For local stdio clients, register Cortex as a server that runs `cortex serve`
 with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
@@ -160,9 +161,10 @@ Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
 - `vaults.root` — account-owned directories (`<root>/<username>`).
 - `vaults` — private-vault root, index directory, templates, archives, sync.
 - `principals` — static identities, their `scopes` (path globs), and `token_env`.
-- `database.path` — SQLite identity, session, gateway, and telemetry state.
-- `gateway` — upstream registration policy, SSRF controls, timeouts, and audit
-  retention. Secrets are environment references only.
+- `database.path` — SQLite identity, sessions, memory permissions and telemetry;
+  historical upstream records remain inert for rollback.
+- `memory_policy` — existing read/write permission defaults and memory audit
+  retention. No authorization-off switch. See the migration compatibility rules.
 - `sync.adapter` — `none` (default, local-only) · `git` · `nextcloud` · `s3`.
 - `llm.provider` — `none` (default) · `openrouter` · `openai` · `anthropic` ·
   `ollama`. OpenRouter (one key, many models; defaulting to the latest Claude
@@ -185,16 +187,16 @@ never modifies vault content.
   There is no general or shared default vault.
 - Headless JSON API and MCP access, with scope-checked notes and attachments.
   The React UI, static assets, and legacy browser admin have been removed.
-- Governed upstream MCP aggregation with per-user/group glob permissions,
-  deny-wins behavior, discovery/call parity, SSRF defenses, bounded calls,
-  circuit breaking, hot tool refresh, and argument-shape-only telemetry.
+- Memory-only per-user/group tool permissions, deny-wins behavior (including
+  admins), listing/call parity, and argument-shape-only call telemetry.
 - Reproducible Docker/Compose and Python-wheel packaging, a v1→v2 migration
   command, health checks, CI, and documented backup/upgrade procedures.
 
 Start with [`docs/multi-user.md`](docs/multi-user.md),
-[`docs/mcp-gateway.md`](docs/mcp-gateway.md), and
-[`docs/upgrading-v2.md`](docs/upgrading-v2.md). The focused security review is
-[`docs/security-review-v2.md`](docs/security-review-v2.md).
+[`docs/memory-policy.md`](docs/memory-policy.md), and
+[account-vault migration](docs/account-vaults.md). The original
+[v2 upgrade](docs/upgrading-v2.md) and [security review](docs/security-review-v2.md)
+are historical.
 
 ---
 

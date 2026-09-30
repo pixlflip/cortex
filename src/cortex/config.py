@@ -150,10 +150,11 @@ class AdminConfig:
 
 @dataclass
 class DatabaseConfig:
-    # SQLite identity/gateway database (v2 design §4/§5): users, groups,
-    # sessions, API tokens, MCP server registry, tool permissions, tool-call
+    # SQLite identity/memory-policy database: users, groups,
+    # sessions, API tokens, tool permissions, tool-call
     # audit. Holds salted hashes only — never plaintext secrets, never note
-    # content. Relative paths resolve next to cortex.yaml. Never commit this.
+    # content. Historical upstream records remain inert for rollback.
+    # Relative paths resolve next to cortex.yaml. Never commit this.
     path: Path = Path("./data/cortex.sqlite")
 
 
@@ -274,21 +275,11 @@ class WritesConfig:
 
 
 @dataclass
-class GatewayConfig:
-    """Governed external-MCP aggregation and audit policy (D1-D3)."""
+class MemoryPolicyConfig:
+    """Always-on memory tool policy. There is no authorization-off switch."""
 
-    enabled: bool = True
-    allow_user_servers: bool = False
-    allow_stdio_servers: bool = False
-    stdio_allowed_executables: list[str] = field(default_factory=list)
-    stdio_allowed_workdirs: list[str] = field(default_factory=list)
-    block_private_networks: bool = True
-    outbound_allowlist: list[str] = field(default_factory=list)
-    timeout_seconds: float = 20.0
-    max_concurrency: int = 16
     audit_retention_days: int = 90
-    # With no explicit rule, deterministic Cortex reads are available while
-    # mutations and external tools require a grant.
+    # Existing DB-user defaults; static principals retain scoped memory access.
     default_read_allow: bool = True
     default_write_allow: bool = False
 
@@ -307,7 +298,7 @@ class CortexConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     janitor: JanitorConfig = field(default_factory=JanitorConfig)
     writes: WritesConfig = field(default_factory=WritesConfig)
-    gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    memory_policy: MemoryPolicyConfig = field(default_factory=MemoryPolicyConfig)
     # None ⇒ LDAP integration fully off (the default).
     ldap: LdapConfig | None = None
 
@@ -473,25 +464,27 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         enabled=writes_raw.get("enabled", False),
     )
 
-    gateway_raw = raw.get("gateway", {}) or {}
-    gateway = GatewayConfig(
-        enabled=bool(gateway_raw.get("enabled", True)),
-        allow_user_servers=bool(gateway_raw.get("allow_user_servers", False)),
-        allow_stdio_servers=bool(gateway_raw.get("allow_stdio_servers", False)),
-        stdio_allowed_executables=list(
-            gateway_raw.get("stdio_allowed_executables", []) or []
-        ),
-        stdio_allowed_workdirs=list(
-            gateway_raw.get("stdio_allowed_workdirs", []) or []
-        ),
-        block_private_networks=bool(gateway_raw.get("block_private_networks", True)),
-        outbound_allowlist=list(gateway_raw.get("outbound_allowlist", []) or []),
-        timeout_seconds=float(gateway_raw.get("timeout_seconds", 20.0)),
-        max_concurrency=int(gateway_raw.get("max_concurrency", 16)),
-        audit_retention_days=int(gateway_raw.get("audit_retention_days", 90)),
-        default_read_allow=bool(gateway_raw.get("default_read_allow", True)),
-        default_write_allow=bool(gateway_raw.get("default_write_allow", False)),
-    )
+    # Migration compatibility ONLY for these existing policy values. Retired
+    # transport/enabled settings cannot construct or reactivate any broker.
+    legacy_policy = raw.get("gateway", {}) or {}
+    policy_raw = raw.get("memory_policy", {}) or {}
+    if not isinstance(legacy_policy, dict) or not isinstance(policy_raw, dict):
+        raise ConfigError("memory_policy and legacy gateway must be mappings")
+    policy_values = {}
+    for key, default in (
+        ("default_read_allow", True),
+        ("default_write_allow", False),
+        ("audit_retention_days", 90),
+    ):
+        value = policy_raw.get(key, legacy_policy.get(key, default))
+        if key != "audit_retention_days" and not isinstance(value, bool):
+            raise ConfigError(f"memory_policy.{key} must be a boolean")
+        if key == "audit_retention_days" and (
+            type(value) is not int or value < 1
+        ):
+            raise ConfigError("memory_policy.audit_retention_days must be a positive integer")
+        policy_values[key] = value
+    memory_policy = MemoryPolicyConfig(**policy_values)
 
     ldap = _build_ldap(raw.get("ldap"))
 
@@ -508,7 +501,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         llm=llm,
         janitor=janitor,
         writes=writes,
-        gateway=gateway,
+        memory_policy=memory_policy,
         ldap=ldap,
     )
     _validate(cfg)
@@ -653,12 +646,8 @@ def _validate(cfg: CortexConfig) -> None:
             "enabling writes without git audit — which would allow unaudited, "
             "unrecoverable changes — is not permitted."
         )
-    if cfg.gateway.timeout_seconds <= 0:
-        raise ConfigError("gateway.timeout_seconds must be positive")
-    if cfg.gateway.max_concurrency < 1:
-        raise ConfigError("gateway.max_concurrency must be at least 1")
-    if cfg.gateway.audit_retention_days < 1:
-        raise ConfigError("gateway.audit_retention_days must be at least 1")
+    if cfg.memory_policy.audit_retention_days < 1:
+        raise ConfigError("memory_policy.audit_retention_days must be at least 1")
 
 
 def load_config(path: str | os.PathLike[str]) -> CortexConfig:
@@ -669,5 +658,12 @@ def load_config(path: str | os.PathLike[str]) -> CortexConfig:
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ConfigError("config root must be a mapping")
+    # Ignore retired connection settings even when their old secret env refs
+    # are no longer available. Only the three policy migration inputs survive.
+    if isinstance(raw.get("gateway"), dict):
+        raw["gateway"] = {
+            key: value for key, value in raw["gateway"].items()
+            if key in {"default_read_allow", "default_write_allow", "audit_retention_days"}
+        }
     raw = _interpolate(raw)
     return _build(raw, base_dir=cfg_path.resolve().parent)

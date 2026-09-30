@@ -15,7 +15,7 @@ Commands:
                      git) pull/push across ALL vaults. Run on a timer.
     cortex vault     Manage per-user vaults (registry & provisioning):
                      list | provision | archive | delete.
-    cortex db        Manage the SQLite identity/gateway database:
+    cortex db        Manage the SQLite identity/memory-policy database:
                      init | migrate | status | import-admin.
     cortex user      Manage local user accounts:
                      add | list | disable | enable | passwd | delete.
@@ -812,7 +812,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pj.set_defaults(func=cmd_janitor)
 
-    pd = sub.add_parser("db", help="manage the SQLite identity/gateway database")
+    pd = sub.add_parser("db", help="manage the SQLite identity/memory-policy database")
     pd_sub = pd.add_subparsers(dest="db_command", required=True)
     pd_sub.add_parser(
         "init",
