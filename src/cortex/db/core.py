@@ -262,6 +262,23 @@ def _m0003_runtime_settings(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m0005_vault_grants(conn: sqlite3.Connection) -> None:
+    """Explicit cross-account grants; no legacy/group grants are imported."""
+    conn.execute("""
+        CREATE TABLE vault_grants (
+            principal_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            read_scopes_json TEXT NOT NULL,
+            write_scopes_json TEXT NOT NULL,
+            updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (principal_user_id, owner_user_id),
+            CHECK (principal_user_id != owner_user_id)
+        )
+    """)
+    conn.execute("CREATE INDEX idx_vault_grants_owner ON vault_grants(owner_user_id)")
+
+
 def _split_statements(script: str) -> list[str]:
     """Split a DDL script into single statements for ``execute()``.
 
@@ -292,6 +309,7 @@ MIGRATIONS: list[Migration] = [
     Migration(2, "gateway_and_shared_writes", _m0002_gateway_and_shared_writes),
     Migration(3, "runtime_settings", _m0003_runtime_settings),
     Migration(4, "stdio_mcp_servers", _m0004_stdio_mcp_servers),
+    Migration(5, "vault_grants", _m0005_vault_grants),
 ]
 
 

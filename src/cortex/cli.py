@@ -26,6 +26,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -612,6 +613,31 @@ def cmd_token(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_vault_grant(args: argparse.Namespace) -> int:
+    """Trusted local-operator policy management; never a memory MCP tool."""
+    from .users import AuthzError, IdentityError
+
+    identity = _identity(_load(args))
+    try:
+        if args.grant_command == "list":
+            print(json.dumps({"grants": identity.list_vault_grants()}, indent=2))
+        elif args.grant_command == "set":
+            grant = identity.set_vault_grant(
+                args.username, args.vault, read_scopes=args.read_scope,
+                write_scopes=args.write_scope,
+            )
+            print(json.dumps({"grant": grant}, indent=2))
+        else:
+            removed = identity.revoke_vault_grant(args.username, args.vault)
+            print("grant revoked" if removed else "grant already absent")
+        return 0
+    except (IdentityError, AuthzError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        identity.vault_manager.close()
+
+
 def cmd_vault(args: argparse.Namespace) -> int:
     """Manage per-user vaults: provision (create/repair), list, archive (move
     aside, keeping git history), delete (guarded — needs --force)."""
@@ -871,6 +897,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     pv = sub.add_parser("vault", help="manage per-user vaults (registry & provisioning)")
     pv_sub = pv.add_subparsers(dest="vault_command", required=True)
+    pg = pv_sub.add_parser("grant", help="administer explicit cross-account grants (local operator)")
+    pg_sub = pg.add_subparsers(dest="grant_command", required=True)
+    pg_sub.add_parser("list", help="list explicit grants").set_defaults(func=cmd_vault_grant)
+    pg_set = pg_sub.add_parser("set", help="replace both scope sets; omitted scopes deny access")
+    pg_set.add_argument("username", help="grantee account (exact name)")
+    pg_set.add_argument("vault", help="owner account (exact name)")
+    pg_set.add_argument("--read-scope", action="append", default=[], help="read glob (repeatable)")
+    pg_set.add_argument("--write-scope", action="append", default=[], help="write glob (repeatable)")
+    pg_set.set_defaults(func=cmd_vault_grant)
+    pg_revoke = pg_sub.add_parser("revoke", help="remove an explicit grant")
+    pg_revoke.add_argument("username")
+    pg_revoke.add_argument("vault")
+    pg_revoke.set_defaults(func=cmd_vault_grant)
     pv_sub.add_parser(
         "list", help="list registered vaults (main + per-user) and their paths"
     ).set_defaults(func=cmd_vault)

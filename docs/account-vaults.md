@@ -10,13 +10,72 @@ The retired `main` identifier is rejected, never redirected to an account.
 - Missing owner storage fails closed: no fallback to the first available vault.
 - Administrators can explicitly select other registered accounts. Administration
   is not a shared memory namespace, and orphan directories confer no API grant.
-- Ordinary users see only their own account. Token scopes narrow paths within
-  that account. Legacy group read/write path grants confer no memory access;
-  group tool policies are independent and remain available.
+- Ordinary users see only their own account unless an administrator explicitly
+  grants paths in another account vault. Token scopes intersect every read and
+  write grant independently; they never confer vault access on their own.
+  Legacy group path grants confer no memory access; tool policy is independent.
 - Config-only standalone identities address only their named account directory.
   An identity-backed server requires a matching actual account.
 - The JSON API returns `default_vault`; no first-available-account fallback exists.
 - Service startup and readiness do not read or depend on `vault.path`.
+
+## Explicit cross-account grants
+
+Schema migration 5 adds `vault_grants` to the identity database, initially empty.
+Each row binds a grantee account ID to an owner account ID, with separate lists
+of read and write globs. Deleting either account cascades the grant, so recreating
+a username does not inherit it. Disabled grantees or owners suspend explicit
+access. A missing, archived or symlinked vault fails closed. Grants are read on
+every API/MCP call: replacing or revoking one needs no restart or new credential.
+Already-running operations are not retroactively cancelled.
+
+Only enabled administrators or the trusted local CLI operator may list, replace
+or revoke grants. Neither the vault owner nor the grantee can delegate access.
+There is no grant-management MCP tool. A grant does not confer administrator,
+tool-policy, provisioning, archive, Git-history or whole-vault activity access.
+The global write switch and deny-wins memory tool policy still apply to writes.
+
+The local operator commands (example account names, not default grants):
+
+```bash
+cortex vault grant set assistant owner --read-scope 'Projects/Example/**' --write-scope 'Projects/Example/Inbox/**'
+cortex vault grant list
+cortex vault grant revoke assistant owner
+```
+
+`set` replaces BOTH lists atomically. Flags are repeatable; an omitted list is
+empty and denies that operation. Read-only: omit `--write-scope`. Write-only:
+omit `--read-scope`. Content-dependent note mutations (including overwrite,
+patch, append, frontmatter/lifecycle edits and a move's source) also require read
+access; write-only access can create notes, delete notes or upload attachments,
+but cannot use these mutations to read existing content indirectly.
+Quote globs so the shell does not expand them. No grant
+changes ownership, owner/admin permissions or the default selected vault.
+
+API administration uses `GET /api/v1/admin/vault-grants` and
+`PUT`/`DELETE /api/v1/admin/vault-grants/{username}/{vault}`. PUT requires exactly
+`{"read_scopes": ["Projects/Example/**"], "write_scopes": []}` (both lists required).
+Session mutations require CSRF and same-origin validation. Bearer administration
+requires an administrator credential with no token scope restriction; even an
+explicit `scopes: ["**"]` token is rejected on these grant-management routes.
+Account names are exact, not patterns. Grants accept only canonical vault-relative
+globs (up to 128 per operation, 1024 characters each); no normalization, absolute
+paths, hidden components, backslashes or traversal components are accepted.
+
+Effective permission is `(any grant glob matches path) AND (any token glob
+matches path)`, independently for reads and writes. Unrestricted credentials omit
+the second condition; an empty token scope list denies everything. `*` and `?`
+stay in one directory segment; `**` crosses directories. Partially overlapping
+patterns work without approximation. Discovery's `scopes` and `write_scopes`
+remain OR lists, but an element may be an array of globs requiring ALL of them
+to match: e.g. `[["Projects/*/report.*", "Projects/Example/*.md"]]`. These
+conjunctions are output only, not valid administrative grant/token input.
+A grant's vault ID can remain discoverable even when token/glob intersections
+match no paths; no content or whole-vault activity metadata is exposed.
+
+For standalone config principals, omitted/null `write_scopes` retains the old
+read-scope fallback. Explicit `write_scopes: []` now denies writes. Resolved DB
+vault grants always carry an explicit write list; they never use that fallback.
 
 ## Upgrade existing installations
 

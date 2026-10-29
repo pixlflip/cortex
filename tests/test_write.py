@@ -55,7 +55,7 @@ def _server(
             Principal(
                 name="p",
                 scopes=list(scopes),
-                write_scopes=list(write_scopes) if write_scopes is not None else [],
+                write_scopes=list(write_scopes) if write_scopes is not None else None,
             )
         ],
         writes=WritesConfig(enabled=writes_enabled),

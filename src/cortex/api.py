@@ -220,6 +220,8 @@ class ApiV1:
             (f"{p}/ldap/sync", ["POST"], self.ldap_sync),
             (f"{p}/ldap/status", ["GET", "PATCH"], self.ldap_status),
             (f"{p}/admin/tokens", ["GET"], self.admin_tokens),
+            (f"{p}/admin/vault-grants", ["GET"], self.vault_grants_collection),
+            (f"{p}/admin/vault-grants/{{username}}/{{vault}}", ["PUT", "DELETE"], self.vault_grant_item),
             (f"{p}/vaults", ["GET"], self.vaults_collection),
             (f"{p}/vaults/{{vault}}/tree", ["GET"], self.vault_tree),
             (f"{p}/vaults/{{vault}}/search", ["GET"], self.vault_search),
@@ -843,6 +845,36 @@ class ApiV1:
             }
         )
 
+    # -- admin: explicit account-vault grants --------------------------------
+
+    def _require_grant_admin(self, request: Request) -> ApiIdentity:
+        ident = self._require_identity(request, admin=True)
+        # A path-restricted credential is not a grant-administration credential.
+        if ident.principal is not None and ident.principal.token_scopes is not None:
+            raise ApiError(403, "forbidden", "grant administration requires an unrestricted admin credential")
+        return ident
+
+    async def vault_grants_collection(self, request: Request) -> Response:
+        ident = self._require_grant_admin(request)
+        return JSONResponse({"grants": self.identity.list_vault_grants(actor=ident.user)})
+
+    async def vault_grant_item(self, request: Request) -> Response:
+        ident = self._require_grant_admin(request)  # before lookup or parsing
+        username, vault = request.path_params["username"], request.path_params["vault"]
+        self._get_user_or_404(username)
+        self._get_user_or_404(vault)
+        if request.method == "DELETE":
+            self.identity.revoke_vault_grant(username, vault, actor=ident.user)
+            return Response(status_code=204)
+        body = await self._json_body(request)
+        if set(body) != {"read_scopes", "write_scopes"}:
+            raise ApiError(400, "invalid_request", "read_scopes and write_scopes are required; no other fields allowed")
+        grant = self.identity.set_vault_grant(
+            username, vault, read_scopes=body["read_scopes"],
+            write_scopes=body["write_scopes"], actor=ident.user,
+        )
+        return JSONResponse({"grant": grant})
+
     # -- B2/B3: one authorization path for every vault-facing API -------------
 
     def _api_principal(self, ident: ApiIdentity):
@@ -883,13 +915,14 @@ class ApiV1:
                     "write_scopes": list(grant.write_scopes),
                     "note_count": len(notes),
                     "size_bytes": size,
-                    "head_commit": bundle.git.head(),
-                    "last_commit_iso": bundle.git.head_time(),
-                    "last_indexed_iso": stats["last_indexed"],
-                    "index_note_count": stats["note_count"],
+                    # A slice does not grant whole-vault activity/size metadata.
+                    "head_commit": bundle.git.head() if grant.relation != "explicit" else None,
+                    "last_commit_iso": bundle.git.head_time() if grant.relation != "explicit" else None,
+                    "last_indexed_iso": stats["last_indexed"] if grant.relation != "explicit" else None,
+                    "index_note_count": stats["note_count"] if grant.relation != "explicit" else None,
                     "sync_adapter": self.vault_manager.sync_config_for(
                         grant.vault_id
-                    ).adapter,
+                    ).adapter if grant.relation != "explicit" else None,
                 }
             )
         return JSONResponse({"vaults": items, "default_vault": next(
@@ -1137,10 +1170,9 @@ class ApiV1:
         limit = self._query_int(request, "limit", 100, minimum=1, maximum=500)
         events: list[dict] = []
         for grant in self.vault_access.grants(principal):
-            # The user endpoint is their private-vault history, even when a
-            # group grants a slice of main. A git commit can touch several
-            # paths, so exposing main's commit metadata would leak activity
-            # outside that slice. Admins retain the macro timeline.
+            # Cross-account path grants never expose whole-vault Git history:
+            # a commit can touch multiple paths outside the granted slice.
+            # Admins retain the macro timeline.
             if not ident.is_admin and grant.relation != "owner":
                 continue
             if vault_filter and grant.vault_id != vault_filter:

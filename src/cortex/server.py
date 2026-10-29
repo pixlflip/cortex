@@ -386,7 +386,7 @@ class CortexServer:
         Like ``_require_visible``, canonicalizes first and returns the
         canonical path the caller must operate on."""
         norm = _canonical_note_path(path)
-        scopes = principal.write_scopes or principal.scopes
+        scopes = principal.scopes if principal.write_scopes is None else principal.write_scopes
         if norm is None or not path_allowed(norm, scopes):
             # Same non-leaking wording as _require_visible: don't distinguish
             # "absent" from "not in scope".
@@ -405,13 +405,14 @@ class CortexServer:
     def _require_writable_file(principal: Principal, path: str) -> str:
         """Canonicalize an arbitrary vault file and enforce write scope."""
         norm = canonical_asset_path(path)
-        scopes = principal.write_scopes or principal.scopes
+        scopes = principal.scopes if principal.write_scopes is None else principal.write_scopes
         if norm is None or not path_allowed(norm, scopes):
             raise ValueError(f"file not found or not in scope: {path}")
         return norm
 
     def _status_payload(
-        self, principal: Principal, bundle: VaultBundle | None = None
+        self, principal: Principal, bundle: VaultBundle | None = None,
+        *, expose_activity: bool = True,
     ) -> dict:
         """Deterministic freshness/visibility snapshot for ``principal``, the
         payload behind the ``status`` MCP tool. Lets a caller judge whether
@@ -428,10 +429,10 @@ class CortexServer:
         payload = {
             "principal": principal.name,
             "visible_note_count": len(visible),
-            "head_commit": git.head(),
-            "last_commit_iso": git.head_time(),
-            "last_indexed_iso": stats["last_indexed"],
-            "index_note_count": stats["note_count"],
+            "head_commit": git.head() if expose_activity else None,
+            "last_commit_iso": git.head_time() if expose_activity else None,
+            "last_indexed_iso": stats["last_indexed"] if expose_activity else None,
+            "index_note_count": stats["note_count"] if expose_activity else None,
         }
         if bundle is not None:
             payload["vault"] = bundle.vault_id
@@ -639,6 +640,10 @@ class CortexServer:
         exists = store.exists(path)
         if exists and not overwrite:
             raise ValueError(f"note already exists (pass overwrite=True to replace): {path}")
+        if exists:
+            # Replacement preserves managed metadata from the original note.
+            # A write-only grant may create, but must not inspect that metadata.
+            self._require_visible(principal, path)
         original = self._note_bytes(store, path) if exists else None
         updated = self._ordinary_metadata(content.encode('utf-8'), original, principal, reason, memory_state)
         receipt = self._save_note_updates(principal, {path: updated}, {path: original}, reason, bundle)
@@ -649,6 +654,7 @@ class CortexServer:
     def _do_patch_note(self, principal: Principal, path: str, old_string: str,
                        new_string: str, reason: str, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
+        self._require_visible(principal, path)  # match counts would be a read oracle
         store = bundle.store if bundle is not None else self.vault
         original = self._note_bytes(store, path)
         text = original.decode('utf-8')
@@ -669,6 +675,7 @@ class CortexServer:
     def _do_append_note(self, principal: Principal, path: str, text: str, reason: str,
                         *, separator: str = '\n\n', bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
+        self._require_visible(principal, path)
         store = bundle.store if bundle is not None else self.vault
         original = self._note_bytes(store, path)
         raw = original + separator.encode('utf-8') + text.encode('utf-8')
@@ -679,6 +686,7 @@ class CortexServer:
     def _do_update_frontmatter(self, principal: Principal, path: str, patch: dict,
                                reason: str, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
+        self._require_visible(principal, path)  # response includes existing metadata
         store = bundle.store if bundle is not None else self.vault
         if not isinstance(patch, dict):
             raise ValueError('patch must be a mapping')
@@ -694,6 +702,7 @@ class CortexServer:
     def _do_set_memory_state(self, principal: Principal, path: str, state: MemoryState,
                              reason: str, expected_sha256: str, bundle: VaultBundle | None = None) -> dict:
         path = self._require_writable(principal, path)
+        self._require_visible(principal, path)
         store = bundle.store if bundle is not None else self.vault
         patch = memory_patch(state, actor=principal.name, reason=reason)
         if state == 'superseded':
@@ -800,6 +809,8 @@ class CortexServer:
         # the source and write for the destination.
         src = self._require_writable(principal, src)
         dest = self._require_writable(principal, dest)
+        # Otherwise a write-only source could be moved into a readable scope.
+        self._require_visible(principal, src)
         store = bundle.store if bundle is not None else self.vault
         try:
             store.move_note(src, dest, overwrite=overwrite)
@@ -951,8 +962,11 @@ class CortexServer:
             looking ``search``/``context_pack`` result, or to confirm a
             periodic ``cortex sync`` actually ran recently."""
             p = self._get_principal()
-            bundle, scoped = self._select_vault(p, vault)
-            return self._status_payload(scoped, bundle)
+            try:
+                bundle, scoped, grant = self.vault_access.select(p, vault)
+            except VaultAccessError as exc:
+                raise ValueError("vault not found or not in scope") from exc
+            return self._status_payload(scoped, bundle, expose_activity=grant.relation != "explicit")
 
         @mcp.tool()
         def list_notes(vault: str | None = None) -> list[str]:
