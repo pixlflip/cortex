@@ -49,6 +49,7 @@ EXPECTED_TABLES = {
     "tool_call_audit",
     "janitor_reports",
     "app_settings",
+    "vault_grants",
 }
 
 

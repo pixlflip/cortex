@@ -32,8 +32,8 @@ Archive their vault explicitly; permanent vault deletion requires CLI `--force`.
 ## Isolation
 
 - An omitted vault selects the authenticated account, including administrators.
-- Ordinary accounts access their own vault only. A token can narrow paths,
-  never broaden its owner's access.
+- Ordinary accounts access their own vault, plus any explicit administrator-set
+  cross-account path grants. A token intersects and can never broaden those grants.
 - Administrators must explicitly select another account for cross-account work.
 - Legacy group path grants do not confer account-vault access. Group tool
   permissions remain independent.

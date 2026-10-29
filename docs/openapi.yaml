@@ -579,11 +579,94 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
+  /admin/vault-grants:
+    get:
+      tags: [policy]
+      operationId: listVaultGrants
+      summary: List explicit cross-account grants (admin).
+      description: Requires an enabled administrator and an unrestricted credential.
+      responses:
+        "200":
+          description: Explicit grants; owner/admin powers are not stored here.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/VaultGrant" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/vault-grants/{username}/{vault}:
+    parameters:
+      - name: username
+        in: path
+        required: true
+        schema: { type: string }
+        description: Exact grantee account name.
+      - $ref: "#/components/parameters/VaultId"
+    put:
+      tags: [policy]
+      operationId: setVaultGrant
+      summary: Atomically replace both read and write grants (admin).
+      description: |
+        Requires an enabled administrator with an unrestricted credential.
+        A scoped bearer (even scopes=["**"]) cannot administer grants.
+        Both accounts must exist and be distinct. Empty lists deny access;
+        writes never fall back to reads. This does not grant memory tool policy.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [read_scopes, write_scopes]
+              properties:
+                read_scopes: { $ref: "#/components/schemas/GrantScopes" }
+                write_scopes: { $ref: "#/components/schemas/GrantScopes" }
+      responses:
+        "200":
+          description: The persisted grant.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  grant: { $ref: "#/components/schemas/VaultGrant" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [policy]
+      operationId: revokeVaultGrant
+      summary: Revoke an explicit grant (admin, idempotent for existing accounts).
+      description: Requires an enabled administrator and an unrestricted credential.
+      parameters:
+        - $ref: "#/components/parameters/CsrfHeader"
+      responses:
+        "204": { description: Grant absent; subsequent calls no longer have this access. }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /vaults:
     get:
       tags: [vaults]
       operationId: listVisibleVaults
       summary: List only vaults granted to the caller, including health/freshness.
+      description: |
+        Explicit cross-account grants have relation=explicit. Their whole-vault
+        activity, index statistics and sync adapter fields are null; note counts
+        and sizes include only readable paths. Effective scopes/write_scopes are
+        OR lists of globs or arrays of globs (each array requires ALL to match).
+        This exactly intersects token restrictions without broadening grants.
       responses:
         "200": { $ref: "#/components/responses/FreeformOk" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
@@ -851,6 +934,24 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    GrantScopes:
+      type: array
+      maxItems: 128
+      items: { type: string, minLength: 1, maxLength: 1024 }
+      description: Canonical vault-relative globs. Empty denies; no null or implicit fallback.
+
+    VaultGrant:
+      type: object
+      properties:
+        principal: { type: string }
+        vault: { type: string }
+        principal_user_id: { type: integer }
+        owner_user_id: { type: integer }
+        read_scopes: { $ref: "#/components/schemas/GrantScopes" }
+        write_scopes: { $ref: "#/components/schemas/GrantScopes" }
+        updated_by: { type: [integer, "null"], description: Administrator ID or null for local operator. }
+        updated_at: { type: integer, description: Unix seconds. }
+
     Error:
       type: object
       required: [error]

@@ -267,9 +267,8 @@ def test_writes_enabled_and_write_scopes_parsed_from_yaml(tmp_path: Path):
     cfg = load_config(cfg_file)
     assert cfg.writes.enabled is True
     assert cfg.principal("narrow").write_scopes == ["Inbox/**"]
-    # write_scopes omitted in YAML => defaults to empty list (caller falls
-    # back to read `scopes`; see CortexServer._require_writable).
-    assert cfg.principal("fallback").write_scopes == []
+    # Only omitted/null write_scopes fall back; explicit [] denies writes.
+    assert cfg.principal("fallback").write_scopes is None
 
 
 def test_writes_require_git_audit(tmp_path: Path):

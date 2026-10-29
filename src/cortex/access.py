@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import CortexConfig, Principal
+from .scopes import Scope, intersect_scopes
 from .vaults import VaultBundle, VaultManager, VaultManagerError
 
 
@@ -20,8 +21,8 @@ class VaultAccessError(Exception):
 @dataclass(frozen=True)
 class VaultGrant:
     vault_id: str
-    scopes: tuple[str, ...]
-    write_scopes: tuple[str, ...]
+    scopes: tuple[Scope, ...]
+    write_scopes: tuple[Scope, ...]
     relation: str
 
     def principal(self, source: Principal) -> Principal:
@@ -63,8 +64,8 @@ class VaultAccessResolver:
             # On an identity-backed server, a missing DB account is not a user.
             if self.identity is not None or not self.manager.exists(principal.name):
                 return []
-            return [VaultGrant(principal.name, tuple(principal.scopes),
-                               tuple(principal.write_scopes or principal.scopes), "owner")]
+            writes = principal.scopes if principal.write_scopes is None else principal.write_scopes
+            return [VaultGrant(principal.name, tuple(principal.scopes), tuple(writes), "owner")]
         if user["disabled"]:
             return []
         token_scopes = principal.token_scopes
@@ -73,13 +74,22 @@ class VaultAccessResolver:
             return []
         ids = [user["username"]]
         if user["is_admin"]:
-            # Cross-account access remains explicit and admin-only. Unowned
-            # directories are not grants, even if left behind by old versions.
+            # Unowned directories never confer access, even for administrators.
             ids += [u["username"] for u in self.identity.list_users()
                     if u["username"] != user["username"]]
-        return [VaultGrant(v, scopes, scopes,
-                           "owner" if v == user["username"] else "admin")
-                for v in ids if self.manager.exists(v)]
+        grants = [VaultGrant(v, scopes, scopes,
+                             "owner" if v == user["username"] else "admin")
+                  for v in ids if self.manager.exists(v)]
+        if not user["is_admin"]:
+            # Read current durable policy on EVERY resolution (no grant cache).
+            # Account deletion cascades both ends; disabled owners/grantees do
+            # not activate explicit grants. Owner/admin powers are independent.
+            for row in self.identity.vault_grants.list(user["id"], active_only=True):
+                read = intersect_scopes(row["read_scopes"], token_scopes)
+                write = intersect_scopes(row["write_scopes"], token_scopes)
+                if (read or write) and self.manager.exists(row["vault"]):
+                    grants.append(VaultGrant(row["vault"], read, write, "explicit"))
+        return grants
 
     def visible_vaults(self, principal: Principal) -> list[str]:
         return [g.vault_id for g in self.grants(principal)]
@@ -97,7 +107,7 @@ class VaultAccessResolver:
         else:
             # Never default to a different account, even for administrators.
             grant = next((g for g in grants if g.vault_id == principal.name), None)
-        if grant is None or (write and not grant.write_scopes):
+        if grant is None or not (grant.write_scopes if write else grant.scopes):
             raise VaultAccessError("vault not found or not in scope")
         try:
             bundle = self.manager.get(grant.vault_id)

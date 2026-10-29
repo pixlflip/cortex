@@ -43,7 +43,7 @@ def server(
             Principal(
                 name="p",
                 scopes=scopes or ["Public/**"],
-                write_scopes=write_scopes or [],
+                write_scopes=write_scopes,
             )
         ],
         writes=WritesConfig(enabled=writes),

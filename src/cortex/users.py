@@ -49,6 +49,9 @@ from .db.repos import (
     UsersRepo,
 )
 from .pwhash import sha256_hex
+from .db.vault_grants import VaultGrantsRepo
+from .scopes import validate_grant_scopes
+from .vaults import sanitize_vault_id, VaultManagerError
 
 #: Default session lifetime — matches the legacy admin cookie TTL so the two
 #: cookie schemes age identically during the transition.
@@ -119,6 +122,7 @@ class IdentityService:
         self.tool_permissions = ToolPermissionsRepo(db)
         self.tool_audit = ToolAuditRepo(db)
         self.settings = SettingsRepo(db)
+        self.vault_grants = VaultGrantsRepo(db)
         # Optional VaultManager (cortex.vaults). When set, creating a user
         # provisions their per-user vault (B1). Left None in pure-v1 / DB-only
         # flows so nothing touches the filesystem. Wired via
@@ -346,6 +350,64 @@ class IdentityService:
         user = self.get_user(username)
         group = self.get_group(group_name)
         return self.groups.remove_member(group["id"], user["id"])
+
+    # -- explicit cross-account vault grants -----------------------------------
+
+    def _require_grant_admin(self, actor: dict | None) -> None:
+        # CLI OPERATOR is trusted. Never trust a stale admin/disabled flag from
+        # a previously resolved actor for a permission-changing operation.
+        if actor is OPERATOR:
+            return
+        current = self.users.get(actor.get("id"))
+        if current is None:
+            raise AuthzError("this operation requires an admin")
+        self._require_admin(current)
+
+    def list_vault_grants(self, *, actor: dict | None = OPERATOR) -> list[dict]:
+        self._require_grant_admin(actor)
+        return self.vault_grants.list()
+
+    def _grant_accounts(self, username: str, vault: str) -> tuple[dict, dict]:
+        # Exact lookup: no trimming, aliases, globbed accounts or orphan dirs.
+        try:
+            if sanitize_vault_id(vault) != vault:
+                raise IdentityError("vault must be an exact account name")
+        except VaultManagerError as exc:
+            raise IdentityError(str(exc)) from exc
+        principal, owner = self.get_user(username), self.get_user(vault)
+        if principal["id"] == owner["id"]:
+            raise IdentityError("explicit grants must address another account")
+        return principal, owner
+
+    def set_vault_grant(
+        self, username: str, vault: str, *, read_scopes: list[str],
+        write_scopes: list[str], actor: dict | None = OPERATOR,
+    ) -> dict:
+        """Atomically replace both permissions, never infer write from read.
+
+        Enabled admins or the trusted local operator only. Granting access
+        confers no right to administer accounts, vaults, tool policy or grants.
+        """
+        self._require_grant_admin(actor)
+        principal, owner = self._grant_accounts(username, vault)
+        try:
+            read = validate_grant_scopes(read_scopes)
+            write = validate_grant_scopes(write_scopes)
+        except ValueError as exc:
+            raise IdentityError(str(exc)) from exc
+        self.vault_grants.set(
+            principal["id"], owner["id"], read_scopes=read, write_scopes=write,
+            updated_by=actor["id"] if actor is not OPERATOR else None,
+        )
+        return next(g for g in self.vault_grants.list(principal["id"])
+                    if g["owner_user_id"] == owner["id"])
+
+    def revoke_vault_grant(
+        self, username: str, vault: str, *, actor: dict | None = OPERATOR,
+    ) -> bool:
+        self._require_grant_admin(actor)
+        principal, owner = self._grant_accounts(username, vault)
+        return self.vault_grants.delete(principal["id"], owner["id"])
 
     # -- identity → scopes ------------------------------------------------------
 

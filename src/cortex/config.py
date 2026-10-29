@@ -26,6 +26,8 @@ from typing import Any
 
 import yaml
 
+from .scopes import Scope
+
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
 
@@ -112,16 +114,14 @@ class Principal:
     """A named identity that may be granted scoped access to the vault."""
 
     name: str
-    scopes: list[str] = field(default_factory=list)
+    scopes: list[Scope] = field(default_factory=list)
     # Name of the env var holding this principal's bearer token (HTTP transport).
     token_env: str | None = None
     # Resolved token value (populated at load; never written back to disk).
     token: str | None = None
-    # Scopes a principal may *mutate* (write/delete). Empty/unset => falls back
-    # to `scopes` (read scopes), so writes work immediately with no extra
-    # config. Set this to narrow the writable area independent of what's
-    # readable — the hook for per-principal write permissioning later.
-    write_scopes: list[str] = field(default_factory=list)
+    # Unset (None) preserves the standalone read-scope fallback. An explicit
+    # empty list denies writes; a resolved vault grant NEVER uses the fallback.
+    write_scopes: list[Scope] | None = None
     # Present only when this principal came from a user API token. These
     # globs narrow every vault grant the user already holds; ``None`` means a
     # session/static credential with no token-level narrowing.
@@ -389,7 +389,8 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
                 scopes=list(p_raw.get("scopes", []) or []),
                 token_env=token_env,
                 token=token,
-                write_scopes=list(p_raw.get("write_scopes", []) or []),
+                write_scopes=(list(p_raw["write_scopes"])
+                              if p_raw.get("write_scopes") is not None else None),
             )
         )
 
