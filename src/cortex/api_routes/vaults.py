@@ -18,6 +18,7 @@ from ..recall import recall_hits
 from ..vault import VaultError, canonical_asset_path, canonical_note_path
 from ..vaults import VaultManagerError
 
+from ._base import ApiBase
 from ._common import (
     ApiError,
     ApiIdentity,
@@ -26,7 +27,7 @@ from ._common import (
 )
 
 
-class VaultRoutesMixin:
+class VaultRoutesMixin(ApiBase):
     """Handler mixin for :class:`cortex.api.ApiV1`."""
 
     # -- admin: explicit account-vault grants --------------------------------

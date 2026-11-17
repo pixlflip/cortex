@@ -7,13 +7,14 @@ from starlette.responses import JSONResponse, Response
 
 from ..memory_policy import memory_tool_ids
 
+from ._base import ApiBase
 from ._common import (
     ApiError,
     _NOT_FOUND,
 )
 
 
-class PolicyRoutesMixin:
+class PolicyRoutesMixin(ApiBase):
     """Handler mixin for :class:`cortex.api.ApiV1`."""
 
     # -- Memory tool permissions and retained call audit --------------------

@@ -154,7 +154,7 @@ class IdentityService:
         local operator — the CLI running on the server box, equivalent in
         power to whoever edits cortex.yaml. Any other actor must be an
         enabled user row with ``is_admin`` set."""
-        if actor is OPERATOR:
+        if actor is OPERATOR or actor is None:
             return
         if actor.get("is_admin") and not actor.get("disabled"):
             return
@@ -165,7 +165,7 @@ class IdentityService:
         return actor is not None and actor.get("id") == user["id"]
 
     def _require_admin_or_self(self, actor: dict | None, user: dict) -> None:
-        if self._is_self(actor, user) and not actor.get("disabled"):
+        if actor is not None and self._is_self(actor, user) and not actor.get("disabled"):
             return
         self._require_admin(actor)
 
@@ -233,6 +233,12 @@ class IdentityService:
             return
         manager.provision(username)
 
+    def _updated_user(self, user_id: int, **fields) -> dict:
+        updated = self.users.update(user_id, **fields)
+        if updated is None:  # deleted concurrently
+            raise IdentityError("no such user")
+        return updated
+
     def get_user(self, username: str) -> dict:
         user = self.users.get_by_username(username)
         if user is None:
@@ -247,14 +253,14 @@ class IdentityService:
         resolution all stop immediately (live sessions are deleted)."""
         self._require_admin(actor)
         user = self.get_user(username)
-        updated = self.users.update(user["id"], disabled=True)
+        updated = self._updated_user(user["id"], disabled=True)
         self.sessions.delete_for_user(user["id"])
         return updated
 
     def enable_user(self, username: str, *, actor: dict | None = OPERATOR) -> dict:
         self._require_admin(actor)
         user = self.get_user(username)
-        return self.users.update(user["id"], disabled=False)
+        return self._updated_user(user["id"], disabled=False)
 
     def delete_user(self, username: str, *, actor: dict | None = OPERATOR) -> None:
         """Delete a user row; sessions and API tokens go with it (FK CASCADE).
@@ -266,7 +272,7 @@ class IdentityService:
     def set_admin(self, username: str, is_admin: bool, *, actor: dict | None = OPERATOR) -> dict:
         self._require_admin(actor)
         user = self.get_user(username)
-        return self.users.update(user["id"], is_admin=bool(is_admin))
+        return self._updated_user(user["id"], is_admin=bool(is_admin))
 
     def set_password(
         self, username: str, password: str, *, actor: dict | None = OPERATOR
@@ -356,9 +362,10 @@ class IdentityService:
     def _require_grant_admin(self, actor: dict | None) -> None:
         # CLI OPERATOR is trusted. Never trust a stale admin/disabled flag from
         # a previously resolved actor for a permission-changing operation.
-        if actor is OPERATOR:
+        if actor is OPERATOR or actor is None:
             return
-        current = self.users.get(actor.get("id"))
+        actor_id = actor.get("id")
+        current = self.users.get(actor_id) if isinstance(actor_id, int) else None
         if current is None:
             raise AuthzError("this operation requires an admin")
         self._require_admin(current)
@@ -457,7 +464,7 @@ class IdentityService:
                 for candidate in token_scopes
                 if any(within(candidate, grant) for grant in scopes)
             ]
-        return Principal(name=username, scopes=scopes, token_scopes=token_scopes)
+        return Principal(name=username, scopes=list(scopes), token_scopes=token_scopes)
 
     # -- API tokens -------------------------------------------------------------
 

@@ -471,7 +471,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
     policy_raw = raw.get("memory_policy", {}) or {}
     if not isinstance(legacy_policy, dict) or not isinstance(policy_raw, dict):
         raise ConfigError("memory_policy and legacy gateway must be mappings")
-    policy_values = {}
+    policy_values: dict[str, Any] = {}
     for key, default in (
         ("default_read_allow", True),
         ("default_write_allow", False),

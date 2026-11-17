@@ -42,7 +42,7 @@ try:  # pragma: no cover - exercised via the import-safety test
     import ldap3
     from ldap3.core.exceptions import LDAPException
 except ImportError:  # pragma: no cover
-    ldap3 = None  # type: ignore[assignment]
+    ldap3 = None  # type: ignore[assignment, unused-ignore]
 
     class LDAPException(Exception):  # type: ignore[no-redef]
         """Placeholder so `except LDAPException` stays valid without ldap3."""

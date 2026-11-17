@@ -24,7 +24,6 @@ from cortex.config import (
     DatabaseConfig,
     GitConfig,
     IndexConfig,
-    SyncConfig,
     VaultConfig,
     VaultsConfig,
     load_config,
@@ -33,7 +32,6 @@ from cortex.db import Database
 from cortex.gitlog import GitAudit
 from cortex.users import IdentityService
 from cortex.vaults import (
-    MAIN_VAULT_ID,
     VaultManager,
     VaultManagerError,
     attach_vault_manager,

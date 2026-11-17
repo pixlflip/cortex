@@ -15,6 +15,7 @@ import hashlib
 import mimetypes
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
@@ -68,6 +69,31 @@ def _validate_frontmatter_block(content: str, path: str) -> None:
 
 class NoteWriteMixin:
     """Mutation helpers shared by the MCP write tools (mixed into CortexServer)."""
+
+    if TYPE_CHECKING:
+        # Provided by CortexServer; declared here so the mixin type-checks.
+        @property
+        def _local_bundle(self) -> VaultBundle: ...
+
+        @property
+        def vault(self) -> VaultStore: ...
+
+        @staticmethod
+        def _require_visible(principal: Principal, path: str) -> str: ...
+
+        @staticmethod
+        def _require_writable(principal: Principal, path: str) -> str: ...
+
+        @staticmethod
+        def _require_writable_file(principal: Principal, path: str) -> str: ...
+
+        def _commit_and_reindex(
+            self,
+            principal: Principal,
+            reason: str,
+            *paths: str,
+            bundle: VaultBundle | None = None,
+        ) -> str | None: ...
 
     # -- write orchestration -------------------------------------------------
     #
@@ -283,7 +309,9 @@ class NoteWriteMixin:
             raise ValueError('replacement is itself superseded; possible cycle')
         # Validate the old record's ancestry with DFS colors. Shared ancestors
         # are legal; a back-edge or replacement-as-ancestor is not.
-        pending, visiting, complete = [(old_path, False)], set(), set()
+        pending: list[tuple[str, bool]] = [(old_path, False)]
+        visiting: set[str] = set()
+        complete: set[str] = set()
         while pending:
             current, exiting = pending.pop()
             if exiting:

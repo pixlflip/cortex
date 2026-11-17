@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ..ldap import DirectoryService
 
+from ._base import ApiBase
 from ._common import (
     ApiError,
     _BAD_LOGIN,
@@ -14,13 +17,15 @@ from ._common import (
 )
 
 
-class IdentityRoutesMixin:
+class IdentityRoutesMixin(ApiBase):
     """Handler mixin for :class:`cortex.api.ApiV1`."""
 
     # -- auth endpoints -----------------------------------------------------------
 
     def _get_directory(self) -> DirectoryService:
         if self._directory is None:
+            if self.config.ldap is None:
+                raise ApiError(400, "ldap_not_configured", "LDAP is not configured")
             self._directory = DirectoryService(self.identity, self.config.ldap)
         return self._directory
 
@@ -78,6 +83,7 @@ class IdentityRoutesMixin:
         payload = {"user": self._user_summary(ident.user), "auth": ident.via}
         if ident.via == "session":
             session_token = self.session_auth.session_token(request)
+            assert session_token is not None  # a session identity implies a cookie
             payload["csrf_token"] = self.identity.csrf_token_for(session_token)
         return JSONResponse(payload)
 
@@ -318,7 +324,7 @@ class IdentityRoutesMixin:
                     "invalid_request",
                     "group_mappings must map non-empty LDAP group names to Cortex groups",
                 )
-            policy = {
+            policy: dict[str, Any] = {
                 "jit_provisioning": (
                     jit if jit is not None else self.config.ldap.jit_provisioning
                 ),

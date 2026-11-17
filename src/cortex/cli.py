@@ -34,8 +34,6 @@ from . import __version__
 from .admin import AdminStore
 from .config import ConfigError, CortexConfig, load_config
 from .gitlog import GitAudit, GitError
-from .search_index import SearchIndex
-from .vault import VaultStore
 
 
 def _resolve_config_path(arg: str | None) -> str:
@@ -672,13 +670,13 @@ def cmd_vault(args: argparse.Namespace) -> int:
                 )
             return 0
         if action == "repair":
-            result = manager.repair(args.vault)
-            print(f"repaired vault '{result.vault_id}' at {result.root}")
-            if result.initialized_git:
+            repaired = manager.repair(args.vault)
+            print(f"repaired vault '{repaired.vault_id}' at {repaired.root}")
+            if repaired.initialized_git:
                 print("  restored git audit repository")
-            if result.baseline_commit:
-                print(f"  baseline commit: {result.baseline_commit[:10]}")
-            print(f"  rebuilt index: {result.indexed_notes} note(s)")
+            if repaired.baseline_commit:
+                print(f"  baseline commit: {repaired.baseline_commit[:10]}")
+            print(f"  rebuilt index: {repaired.indexed_notes} note(s)")
             return 0
         if action == "archive":
             dest = manager.archive(args.username)
@@ -781,6 +779,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         from .server import build_stdio_server
 
         server = build_stdio_server(cfg)
+        assert server.principal is not None  # stdio always binds one principal
         print(
             f"cortex serving account-owned memory over stdio "
             f"as principal '{server.principal.name}'",

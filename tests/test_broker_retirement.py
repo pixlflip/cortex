@@ -224,7 +224,7 @@ def test_new_policy_wins_per_field_and_unsafe_boolean_rejected(tmp_path):
 @pytest.mark.anyio
 async def test_real_memory_call_account_boundary_and_safe_audit(tmp_path):
     cfg = deployed_config(tmp_path, False)
-    identity = IdentityService(Database(cfg.database.path), cfg)
+    IdentityService(Database(cfg.database.path), cfg)
     srv = build_http_server(cfg)
     for name in ("alice", "bob"):
         srv.identity.create_user(name, password="pw")

@@ -110,7 +110,7 @@ def inspect_vault(vault_id: str, store, boundary: JanitorBoundary) -> JanitorRep
         scanned += 1
         raw = store.read_text(path)
         match = _FRONTMATTER.match(raw)
-        frontmatter = {} if match is None and not raw.startswith("---") else None
+        frontmatter: dict | None = {} if match is None and not raw.startswith("---") else None
         if raw.startswith("---") and match is None:
             findings.append(JanitorFinding(path, "frontmatter", "unclosed frontmatter block"))
         elif match is not None:
@@ -184,12 +184,11 @@ def _inspect_lifecycle(metadata: dict[str, dict], visible: dict[str, str], findi
             target = _note_target(ref, visible)
             if target is not None:
                 backlinks.setdefault(target, []).append(replacement)
-    for old, replacement in replacement_by_path.items():
-        if replacement is None or replacement == old:
+    for old, successor in replacement_by_path.items():
+        if successor is None or successor == old:
             continue
-        refs = backlinks.get(old, [])
-        if replacement not in refs:
-            findings.append(JanitorFinding(old, "lifecycle", f"replacement backlink missing or inconsistent: {replacement}"))
+        if successor not in backlinks.get(old, []):
+            findings.append(JanitorFinding(old, "lifecycle", f"replacement backlink missing or inconsistent: {successor}"))
     # Detect replacement chains/cycles, including cycles which do not begin at a
     # valid superseded note. A bounded walk keeps malformed metadata harmless.
     for start in replacement_by_path:

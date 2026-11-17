@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 import logging
 
 import anyio
@@ -44,14 +45,18 @@ from .config import CortexConfig, Principal
 from .memory_policy import GovernedFastMCP, ToolGovernor
 from .llm import build_provider
 from .scopes import filter_paths, path_allowed
-from .recall import recall_hits
-from .search_index import IndexHit
+from .recall import RecallHit, recall_hits
 from .vault import (
+    VaultStore,
     VaultError,
     canonical_asset_path,
     canonical_note_path,
 )
 from .vaults import VaultBundle, VaultManager
+
+if TYPE_CHECKING:
+    from .api import ApiV1
+    from .oauth import CortexOAuthProvider
 from .note_writes import (  # noqa: F401 - re-exported for compatibility
     MAX_FILE_WRITE_BYTES,
     NoteWriteMixin,
@@ -131,7 +136,7 @@ class HttpServe:
     port: int
     path: str
     token_verifier: TokenVerifier | None = None
-    oauth_provider: object | None = None
+    oauth_provider: CortexOAuthProvider | None = None
 
 
 class CortexServer(NoteWriteMixin):
@@ -168,7 +173,7 @@ class CortexServer(NoteWriteMixin):
 
         # The /api/v1 route group (cortex.api.ApiV1); attached by
         # build_http_server when the identity DB exists, else None.
-        self.api = None
+        self.api: ApiV1 | None = None
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
         self.mcp = self._build_mcp(http)
@@ -177,7 +182,7 @@ class CortexServer(NoteWriteMixin):
         self.mcp.governor = ToolGovernor(config, identity, self._get_principal)
 
     @property
-    def _local_bundle(self):
+    def _local_bundle(self) -> VaultBundle:
         # Helpers without an explicit bundle are for authenticated stdio only.
         # HTTP requests must always carry their request-selected account bundle.
         if self.principal is None:
@@ -185,7 +190,7 @@ class CortexServer(NoteWriteMixin):
         return self.vault_access.select(self.principal)[0]
 
     @property
-    def vault(self):
+    def vault(self) -> VaultStore:
         return self._local_bundle.store
 
     @property
@@ -455,7 +460,7 @@ class CortexServer(NoteWriteMixin):
 
         # Dedup to the single best (top-ranked) chunk per note, preserving rank
         # order, then cap to max_notes distinct notes.
-        best_per_note: dict[str, IndexHit] = {}
+        best_per_note: dict[str, RecallHit] = {}
         order: list[str] = []
         for h in scoped:
             if h.path not in best_per_note:
@@ -468,7 +473,7 @@ class CortexServer(NoteWriteMixin):
         used_paths: list[str] = []
         used = 0
         for rel in order:
-            hit: IndexHit = best_per_note[rel]
+            hit: RecallHit = best_per_note[rel]
             breadcrumb = f" — {hit.headings}" if hit.headings else ""
             header = f"\n## {rel}{breadcrumb} [memory_state={hit.memory_state}]"
             if hit.warnings:
@@ -586,7 +591,8 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         from .api import build_api
         from .health import register_health
 
-        server.api = build_api(config, identity)
-        server.api.register(server.mcp)
+        api = build_api(config, identity)
+        api.register(server.mcp)
+        server.api = api
         register_health(server.mcp, config, server.vault_manager)
     return server

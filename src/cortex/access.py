@@ -8,10 +8,14 @@ of those stores a caller may address before any path-level scope check runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .config import CortexConfig, Principal
 from .scopes import Scope, intersect_scopes
 from .vaults import VaultBundle, VaultManager, VaultManagerError
+
+if TYPE_CHECKING:
+    from .users import IdentityService
 
 
 class VaultAccessError(Exception):
@@ -46,16 +50,17 @@ class VaultAccessResolver:
         self,
         config: CortexConfig,
         manager: VaultManager,
-        identity=None,
+        identity: IdentityService | None = None,
     ):
         self.config = config
         self.manager = manager
         self.identity = identity
 
-    def _user(self, principal: Principal) -> dict | None:
+    def _user(self, principal: Principal) -> dict[str, Any] | None:
         if self.identity is None:
             return None
-        return self.identity.users.get_by_username(principal.name)
+        user: dict[str, Any] | None = self.identity.users.get_by_username(principal.name)
+        return user
 
     def grants(self, principal: Principal) -> list[VaultGrant]:
         user = self._user(principal)
@@ -66,6 +71,8 @@ class VaultAccessResolver:
                 return []
             writes = principal.scopes if principal.write_scopes is None else principal.write_scopes
             return [VaultGrant(principal.name, tuple(principal.scopes), tuple(writes), "owner")]
+        identity = self.identity
+        assert identity is not None  # _user() only returns identity-DB rows
         if user["disabled"]:
             return []
         token_scopes = principal.token_scopes
@@ -75,7 +82,7 @@ class VaultAccessResolver:
         ids = [user["username"]]
         if user["is_admin"]:
             # Unowned directories never confer access, even for administrators.
-            ids += [u["username"] for u in self.identity.list_users()
+            ids += [u["username"] for u in identity.list_users()
                     if u["username"] != user["username"]]
         grants = [VaultGrant(v, scopes, scopes,
                              "owner" if v == user["username"] else "admin")
@@ -84,7 +91,7 @@ class VaultAccessResolver:
             # Read current durable policy on EVERY resolution (no grant cache).
             # Account deletion cascades both ends; disabled owners/grantees do
             # not activate explicit grants. Owner/admin powers are independent.
-            for row in self.identity.vault_grants.list(user["id"], active_only=True):
+            for row in identity.vault_grants.list(user["id"], active_only=True):
                 read = intersect_scopes(row["read_scopes"], token_scopes)
                 write = intersect_scopes(row["write_scopes"], token_scopes)
                 if (read or write) and self.manager.exists(row["vault"]):
