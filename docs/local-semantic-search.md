@@ -47,7 +47,7 @@
 Notes:
 
 - Vectors are stored in each vault's existing index file
-  (`vaults.index_dir/<vault>.sqlite`), roughly 3 KiB per chunk for a
+  (`vaults.index_dir/<vault>.index.sqlite`), roughly 3 KiB per chunk for a
   768-dimension model. Back them up with the index or simply rebuild them.
 - MCP writes refresh the lexical index immediately; their embeddings are
   picked up by the next `cortex sync` / `cortex index --embeddings`. Until

@@ -133,5 +133,5 @@ runuser -u cortex -- bash -lc '
 systemctl restart cortex
 ```
 
-See [`upgrading-v2.md`](upgrading-v2.md) for backup, migration, verification,
+See [`upgrading.md`](upgrading.md) for backup, migration, verification,
 and rollback details.

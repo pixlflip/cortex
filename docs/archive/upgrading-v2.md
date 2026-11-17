@@ -2,8 +2,8 @@
 
 > Historical v1→v2 procedure below, NOT current upgrade instructions. The
 > shared `main` vault, UI and upstream broker it describes are retired. For a
-> current upgrade, follow [account-vault migration](account-vaults.md) and
-> [memory policy/broker retirement](memory-policy.md). Existing account tokens
+> current upgrade, follow [account-vault migration](../account-vaults.md) and
+> [memory policy/broker retirement](../memory-policy.md). Existing account tokens
 > and upstream DB records need no destructive conversion. Back up first;
 > do not mint replacement tokens or register upstreams merely for this removal.
 
