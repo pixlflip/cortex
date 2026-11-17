@@ -7,7 +7,7 @@ import base64
 from typing import TYPE_CHECKING
 
 from ..llm import LLMError
-from ..recall import recall_hits
+from ..recall import recall_hits, resolve_mode
 from ..scopes import filter_paths
 from ..serialization import normalize_json
 from ..access import VaultAccessError
@@ -152,24 +152,39 @@ def register_read_tools(server: CortexServer) -> None:
         limit: int = 50,
         include_historical: bool = False,
         vault: str | None = None,
+        mode: str | None = None,
     ) -> list[dict]:
-        """Search visible notes. By default, ranked keyword/natural-language
-        search over an FTS5/BM25 index (porter-stemmed, heading-aware) —
-        returns matching chunks with line numbers, trimmed snippets, and a
-        relevance score (lower is better). Pass regex=True for a literal
-        substring/regex scan instead (no ranking; score omitted).
-        Deterministic; no model spend."""
+        """Search visible notes. Ranked natural-language search over an
+        FTS5/BM25 index (porter-stemmed, heading-aware) — returns matching
+        chunks with line numbers, trimmed snippets, and a relevance score
+        (lower is better). Pass regex=True for a literal substring/regex scan
+        instead (no ranking; score omitted; mode ignored).
+
+        ``mode``: "lexical" (BM25 only), "hybrid" (BM25 fused with the local
+        embedding index; errors if that index is unavailable) or "auto"
+        (hybrid when available, else lexical). Defaults to the server's
+        search.default_mode. Each result reports ``retrieval_mode``; hybrid
+        results add ``lexical_rank``, ``semantic_rank`` and ``similarity``.
+        Never calls a chat model; hybrid mode embeds the query with the
+        operator's configured (normally local) embedding model."""
         p = server._get_principal()
         bundle, p = server._select_vault(p, vault)
         capped = max(1, min(limit, 200))
         hits = recall_hits(bundle.store, bundle.index, query, p.scopes,
-                           include_historical=include_historical, regex=regex)
-        return [
-            {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score,
-             "memory_state": h.memory_state, "warnings": h.warnings or [],
-             "state_changed_at": h.state_changed_at}
-            for h in hits[:capped]
-        ]
+                           include_historical=include_historical, regex=regex,
+                           mode=resolve_mode(mode, server.config.search.default_mode),
+                           semantic=server.semantic)
+        results = []
+        for h in hits[:capped]:
+            item = {"path": h.path, "line": h.line, "snippet": h.snippet, "score": h.score,
+                    "memory_state": h.memory_state, "warnings": h.warnings or [],
+                    "state_changed_at": h.state_changed_at,
+                    "retrieval_mode": h.retrieval_mode}
+            if h.retrieval_mode == "hybrid":
+                item.update(lexical_rank=h.lexical_rank, semantic_rank=h.semantic_rank,
+                            similarity=h.similarity)
+            results.append(item)
+        return results
 
     @mcp.tool()
     def read_note(
@@ -219,12 +234,15 @@ def register_read_tools(server: CortexServer) -> None:
         budget_chars: int = 6000,
         include_historical: bool = False,
         vault: str | None = None,
+        mode: str | None = None,
     ) -> str:
         """Assemble a compact, token-budgeted context bundle for a query from
-        the highest-matching visible notes. Deterministic; no model spend."""
+        the highest-matching visible notes. No chat-model spend. ``mode`` is
+        as for ``search`` (lexical | hybrid | auto; default from config)."""
         p = server._get_principal()
         bundle, p = server._select_vault(p, vault)
-        used, ctx = server._gather_context(p, query, max_notes, budget_chars, bundle, include_historical)
+        used, ctx = server._gather_context(p, query, max_notes, budget_chars, bundle,
+                                           include_historical, mode=mode)
         if not used:
             return f"# Context pack for: {query}\n\n_No visible notes matched this query._\n"
         return f"# Context pack for: {query}\n{ctx}"
@@ -234,9 +252,10 @@ def register_read_tools(server: CortexServer) -> None:
         question: str, max_notes: int = 8, vault: str | None = None, include_historical: bool = False
     ) -> str:
         """Fuzzy 'comb the vault and synthesize' search. This is the only tool
-        that spends model tokens: it retrieves the most relevant *visible*
-        notes (deterministic, scope-checked) and asks the configured LLM to
-        answer the question grounded in them. Returns a clear notice if no
+        that spends chat-model tokens: it retrieves the most relevant
+        *visible* notes (scope-checked; hybrid lexical + embedding retrieval
+        when a local embedding index is available) and asks the configured LLM
+        to answer the question grounded in them. Returns a clear notice if no
         provider is configured."""
         p = server._get_principal()
         bundle, p = server._select_vault(p, vault)

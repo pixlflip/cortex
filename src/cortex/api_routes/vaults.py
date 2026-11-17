@@ -14,7 +14,7 @@ from starlette.responses import JSONResponse, Response
 from ..scopes import filter_paths, path_allowed
 from ..serialization import normalize_json
 from ..memory_lifecycle import inspect_memory_bytes
-from ..recall import recall_hits
+from ..recall import SemanticUnavailable, recall_hits, resolve_mode
 from ..vault import VaultError, canonical_asset_path, canonical_note_path
 from ..vaults import VaultManagerError
 
@@ -183,8 +183,15 @@ class VaultRoutesMixin(ApiBase):
         historical = request.query_params.get("include_historical", "false").lower()
         if historical not in ("true", "false"):
             raise ApiError(400, "invalid_request", "include_historical must be true or false")
-        hits = recall_hits(bundle.store, bundle.index, query, scoped.scopes,
-                           include_historical=historical == "true")
+        try:
+            mode = resolve_mode(request.query_params.get("mode"), self.config.search.default_mode)
+            hits = recall_hits(bundle.store, bundle.index, query, scoped.scopes,
+                               include_historical=historical == "true",
+                               mode=mode, semantic=self.semantic)
+        except SemanticUnavailable as exc:
+            raise ApiError(409, "semantic_unavailable", str(exc)) from None
+        except ValueError as exc:
+            raise ApiError(400, "invalid_request", str(exc)) from None
         folder = request.query_params.get("folder")
         tag = request.query_params.get("tag")
         results: list[dict] = []
@@ -212,6 +219,12 @@ class VaultRoutesMixin(ApiBase):
                     "headings": hit.headings,
                     "memory_state": hit.memory_state,
                     "memory_warnings": hit.warnings or [],
+                    "retrieval_mode": hit.retrieval_mode,
+                    **(
+                        {"lexical_rank": hit.lexical_rank, "semantic_rank": hit.semantic_rank,
+                         "similarity": hit.similarity}
+                        if hit.retrieval_mode == "hybrid" else {}
+                    ),
                 }
             )
         return JSONResponse({"results": results[:limit]})

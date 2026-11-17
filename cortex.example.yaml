@@ -91,6 +91,35 @@ index:
   chunk_chars: 1500
   overlap: 150
 
+
+search:
+  # Mode used when a search/context_pack call does not name one:
+  #   auto    — hybrid when a healthy embedding index exists, else lexical
+  #   lexical — FTS5/BM25 only
+  #   hybrid  — always fuse with embeddings (requires semantic.enabled)
+  default_mode: auto
+  # Optional local embedding index for concept ("semantic") retrieval, fused
+  # with BM25 by reciprocal-rank fusion. Off by default. Vectors live in each
+  # vault's existing index file; build/refresh with `cortex index --embeddings`
+  # (and `cortex sync`, which refreshes them when enabled). See
+  # docs/local-semantic-search.md.
+  semantic:
+    enabled: false
+    provider: openai-compatible        # POST {base_url}/embeddings
+    base_url: http://127.0.0.1:11434/v1  # e.g. local Ollama
+    model: nomic-embed-text            # whichever embedding model you installed
+    # api_key_env: CORTEX_EMBEDDINGS_KEY  # only if your endpoint needs one
+    # A non-loopback base_url sends note text off this host, so it is refused
+    # unless you acknowledge it here.
+    allow_remote: false
+    # dimensions: 768                  # optional; rejects mismatched responses
+    timeout_seconds: 30
+    batch_size: 32
+    rrf_k: 60
+    lexical_weight: 1.0
+    semantic_weight: 1.0
+    max_candidates: 200
+
 server:
   transport: stdio             # stdio (local) | http (remote, Streamable HTTP)
   host: 127.0.0.1

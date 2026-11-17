@@ -28,14 +28,18 @@ it lives under (e.g. ``"Hello Cortex > What is this vault?"``).
 
 from __future__ import annotations
 
+import hashlib
+import heapq
 import logging
 import re
 import sqlite3
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .embeddings import EmbeddingError, EmbeddingProvider, dot, normalized, pack_normalized, unpack
 from .vault import SearchHit, VaultError, VaultStore, _HEADING_RE
 
 logger = logging.getLogger(__name__)
@@ -321,6 +325,25 @@ class SearchIndex:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # Semantic vectors live beside FTS5 in the same per-vault file. Keyed by
+        # (path, start_line, model) rather than the FTS rowid, which changes
+        # whenever a note is re-chunked; content_hash lets unchanged chunks
+        # keep their vector across re-indexing.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chunk_embeddings ("
+            " path TEXT NOT NULL,"
+            " start_line INTEGER NOT NULL,"
+            " content_hash TEXT NOT NULL,"
+            " model_id TEXT NOT NULL,"
+            " dimensions INTEGER NOT NULL,"
+            " vector BLOB NOT NULL,"
+            " updated_at TEXT NOT NULL,"
+            " PRIMARY KEY (path, start_line, model_id)"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS chunk_embeddings_model ON chunk_embeddings(model_id)"
+        )
         try:
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5("
@@ -499,6 +522,235 @@ class SearchIndex:
             IndexHit(path=h.path, score=0.0, snippet=h.snippet, line=h.line, headings="", body=h.snippet)
             for h in hits
         ]
+
+    # -- semantic (embedding) index -----------------------------------------
+
+    @staticmethod
+    def embedding_text(title: str, headings: str, tags: str, body: str) -> str:
+        """The exact text sent to the embedding provider for one chunk."""
+        return f"Title: {title}\nHeadings: {headings}\nTags: {tags}\n\n{body}"
+
+    def _meta_set(self, **values: str | None) -> None:
+        assert self._conn is not None
+        for key, value in values.items():
+            if value is None:
+                self._conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+            else:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, value),
+                )
+
+    def _meta_get(self, key: str) -> str | None:
+        assert self._conn is not None
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def _chunk_texts(self) -> dict[tuple[str, int], str]:
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT path, start_line, title, headings, tags, body FROM chunks"
+        ).fetchall()
+        return {
+            (row["path"], int(row["start_line"])): self.embedding_text(
+                row["title"] or "", row["headings"] or "", row["tags"] or "", row["body"] or ""
+            )
+            for row in rows
+        }
+
+    def sync_embeddings(self, provider: EmbeddingProvider, *, batch_size: int = 32) -> dict:
+        """Embed new/changed chunks and drop stale vectors for this model.
+
+        Only chunks whose embedding text changed (by SHA-256) are sent to the
+        provider. Vectors from every batch are validated before anything is
+        written; on any failure the previous rows are kept untouched, the
+        error is recorded in ``meta`` and lexical search is unaffected. Rows
+        from a different model are discarded once the new model succeeds.
+        """
+        if not self.enabled or not self.fts_available or self._conn is None:
+            return {"embedded": 0, "removed": 0, "error": "search index unavailable"}
+        conn = self._conn
+        self.sync()
+        model_id = provider.identity
+        texts = self._chunk_texts()
+        current = {
+            key: hashlib.sha256(text.encode("utf-8")).hexdigest() for key, text in texts.items()
+        }
+        existing = {
+            (row["path"], int(row["start_line"])): row["content_hash"]
+            for row in conn.execute(
+                "SELECT path, start_line, content_hash FROM chunk_embeddings WHERE model_id = ?",
+                (model_id,),
+            )
+        }
+        missing = [key for key, digest in current.items() if existing.get(key) != digest]
+        vectors: list[tuple[tuple[str, int], bytes, int]] = []
+        try:
+            for start in range(0, len(missing), max(1, batch_size)):
+                batch = missing[start : start + max(1, batch_size)]
+                result = provider.embed([texts[key] for key in batch])
+                if len(result) != len(batch):
+                    raise EmbeddingError("embedding provider returned the wrong vector count")
+                for key, vector in zip(batch, result, strict=True):
+                    vectors.append((key, pack_normalized(vector), len(vector)))
+            widths = {width for _, _, width in vectors}
+            stored = self._meta_get("embedding_dimensions")
+            if stored and self._meta_get("embedding_model") == model_id:
+                widths.add(int(stored))
+            if len(widths) > 1:
+                raise EmbeddingError("embedding dimensions changed without a model change")
+        except EmbeddingError as exc:
+            self._meta_set(embedding_error=str(exc)[:200], embedding_error_at=_utcnow_iso())
+            conn.commit()
+            logger.warning("embedding refresh failed; keeping previous vectors: %s", exc)
+            return {"embedded": 0, "removed": 0, "pending": len(missing), "error": str(exc)}
+
+        now = _utcnow_iso()
+        removed = 0
+        try:
+            for (path, start_line), blob, width in vectors:
+                conn.execute(
+                    "INSERT INTO chunk_embeddings "
+                    "(path, start_line, content_hash, model_id, dimensions, vector, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(path, start_line, model_id) DO UPDATE SET "
+                    "content_hash=excluded.content_hash, dimensions=excluded.dimensions, "
+                    "vector=excluded.vector, updated_at=excluded.updated_at",
+                    (path, start_line, current[(path, start_line)], model_id, width, blob, now),
+                )
+            for path, start_line in set(existing) - set(current):
+                conn.execute(
+                    "DELETE FROM chunk_embeddings WHERE path = ? AND start_line = ? AND model_id = ?",
+                    (path, start_line, model_id),
+                )
+                removed += 1
+            removed += conn.execute(
+                "DELETE FROM chunk_embeddings WHERE model_id != ?", (model_id,)
+            ).rowcount
+            dims = str(vectors[0][2]) if vectors else self._meta_get("embedding_dimensions")
+            self._meta_set(
+                embedding_model=model_id,
+                embedding_dimensions=dims,
+                last_embedded=now,
+                embedding_error=None,
+                embedding_error_at=None,
+            )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            raise
+        return {"embedded": len(vectors), "removed": removed, "pending": 0, "error": None}
+
+    def semantic_ready(self, model_id: str) -> bool:
+        """True when a complete snapshot exists for ``model_id``."""
+        if not self.enabled or not self.fts_available or self._conn is None:
+            return False
+        if self._meta_get("embedding_model") != model_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM chunk_embeddings WHERE model_id = ? LIMIT 1", (model_id,)
+        ).fetchone()
+        return row is not None
+
+    def semantic_search(
+        self,
+        query_vector: Sequence[float],
+        *,
+        model_id: str,
+        allowed: Callable[[str], bool],
+        limit: int,
+        snippet_chars: int = 160,
+    ) -> list[tuple[IndexHit, float]]:
+        """Top ``limit`` chunks by cosine similarity, considering ONLY paths
+        for which ``allowed(path)`` is true.
+
+        Authorization runs before a row can enter the bounded heap, so
+        out-of-scope chunks can never consume a scoped caller's candidate
+        window (or be returned). Rows whose chunk no longer exists are
+        skipped. Returns ``(hit, similarity)`` pairs, best first.
+        """
+        if not self.enabled or not self.fts_available or self._conn is None or limit < 1:
+            return []
+        query = normalized(query_vector)
+        heap: list[tuple[float, str, int]] = []
+        allowed_cache: dict[str, bool] = {}
+        for row in self._conn.execute(
+            "SELECT path, start_line, dimensions, vector FROM chunk_embeddings WHERE model_id = ?",
+            (model_id,),
+        ):
+            path = row["path"]
+            ok = allowed_cache.get(path)
+            if ok is None:
+                ok = allowed_cache[path] = bool(allowed(path))
+            if not ok or int(row["dimensions"]) != len(query):
+                continue
+            similarity = dot(query, unpack(row["vector"]))
+            item = (similarity, path, int(row["start_line"]))
+            if len(heap) < limit:
+                heapq.heappush(heap, item)
+            elif item > heap[0]:
+                heapq.heapreplace(heap, item)
+        results: list[tuple[IndexHit, float]] = []
+        for similarity, path, start_line in sorted(heap, reverse=True):
+            row = self._conn.execute(
+                "SELECT headings, body FROM chunks WHERE path = ? AND start_line = ? LIMIT 1",
+                (path, start_line),
+            ).fetchone()
+            if row is None:
+                continue
+            body = row["body"] or ""
+            snippet = body[:snippet_chars].strip()
+            if len(body) > snippet_chars:
+                snippet = snippet.rstrip() + "…"
+            results.append(
+                (
+                    IndexHit(
+                        path=path, score=-similarity, snippet=snippet, line=start_line,
+                        headings=row["headings"] or "", body=body,
+                    ),
+                    similarity,
+                )
+            )
+        return results
+
+    def embedding_stats(self, model_id: str | None = None) -> dict:
+        empty = {
+            "model": None, "dimensions": None, "vector_count": 0, "pending_chunks": 0,
+            "last_embedded": None, "last_error": None, "last_error_at": None,
+        }
+        if not self.enabled or not self.fts_available or self._conn is None:
+            return empty
+        conn = self._conn
+        model = model_id or self._meta_get("embedding_model")
+        count = 0
+        pending = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        if model:
+            count = int(conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings WHERE model_id = ?", (model,)
+            ).fetchone()[0])
+            current = {
+                key: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                for key, text in self._chunk_texts().items()
+            }
+            stored = {
+                (row["path"], int(row["start_line"])): row["content_hash"]
+                for row in conn.execute(
+                    "SELECT path, start_line, content_hash FROM chunk_embeddings WHERE model_id = ?",
+                    (model,),
+                )
+            }
+            pending = sum(1 for key, digest in current.items() if stored.get(key) != digest)
+        dims = self._meta_get("embedding_dimensions")
+        return {
+            "model": model,
+            "dimensions": int(dims) if dims else None,
+            "vector_count": count,
+            "pending_chunks": pending,
+            "last_embedded": self._meta_get("last_embedded"),
+            "last_error": self._meta_get("embedding_error"),
+            "last_error_at": self._meta_get("embedding_error_at"),
+        }
 
     # -- stats -------------------------------------------------------------
 

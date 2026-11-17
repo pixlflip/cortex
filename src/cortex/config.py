@@ -168,6 +168,41 @@ class IndexConfig:
     overlap: int = 150
 
 
+SEARCH_MODES = ("auto", "lexical", "hybrid")
+
+
+@dataclass
+class SemanticSearchConfig:
+    """Optional local embedding index (docs/local-semantic-search.md).
+
+    Off by default. ``base_url`` must be loopback unless ``allow_remote`` is
+    set, because indexing sends note chunks to the embedding endpoint.
+    """
+
+    enabled: bool = False
+    provider: str = "openai-compatible"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    model: str = ""
+    api_key_env: str | None = None
+    api_key: str | None = None
+    allow_remote: bool = False
+    dimensions: int | None = None
+    timeout_seconds: float = 30.0
+    batch_size: int = 32
+    rrf_k: int = 60
+    lexical_weight: float = 1.0
+    semantic_weight: float = 1.0
+    max_candidates: int = 200
+
+
+@dataclass
+class SearchConfig:
+    # Retrieval mode used when a tool/API call does not name one: "auto" uses
+    # hybrid when a healthy semantic index exists and lexical otherwise.
+    default_mode: str = "auto"
+    semantic: SemanticSearchConfig = field(default_factory=SemanticSearchConfig)
+
+
 @dataclass
 class ServerConfig:
     transport: str = "stdio"  # stdio | http
@@ -294,6 +329,7 @@ class CortexConfig:
     admin: AdminConfig = field(default_factory=AdminConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     janitor: JanitorConfig = field(default_factory=JanitorConfig)
@@ -307,6 +343,71 @@ class CortexConfig:
             if p.name == name:
                 return p
         return None
+
+
+def _build_search(raw: Any) -> SearchConfig:
+    from .embeddings import PROVIDERS, is_loopback_url
+
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise ConfigError("search must be a mapping")
+    mode = raw.get("default_mode", "auto")
+    if mode not in SEARCH_MODES:
+        raise ConfigError(f"search.default_mode must be one of {', '.join(SEARCH_MODES)}")
+    sem = raw.get("semantic", {}) or {}
+    if not isinstance(sem, dict):
+        raise ConfigError("search.semantic must be a mapping")
+    defaults = SemanticSearchConfig()
+
+    def number(key: str, cast: type, minimum: float) -> Any:
+        value = sem.get(key, getattr(defaults, key))
+        if isinstance(value, bool):
+            raise ConfigError(f"search.semantic.{key} must be a number")
+        try:
+            value = cast(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"search.semantic.{key} must be a number") from exc
+        if value < minimum:
+            raise ConfigError(f"search.semantic.{key} must be at least {minimum}")
+        return value
+
+    dimensions = sem.get("dimensions")
+    if dimensions is not None:
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1:
+            raise ConfigError("search.semantic.dimensions must be a positive integer")
+    api_key_env = sem.get("api_key_env")
+    cfg = SemanticSearchConfig(
+        enabled=bool(sem.get("enabled", False)),
+        provider=str(sem.get("provider", defaults.provider)),
+        base_url=str(sem.get("base_url", defaults.base_url)),
+        model=str(sem.get("model", "") or ""),
+        api_key_env=api_key_env,
+        api_key=os.environ.get(api_key_env) if api_key_env else None,
+        allow_remote=bool(sem.get("allow_remote", False)),
+        dimensions=dimensions,
+        timeout_seconds=number("timeout_seconds", float, 1),
+        batch_size=number("batch_size", int, 1),
+        rrf_k=number("rrf_k", int, 1),
+        lexical_weight=number("lexical_weight", float, 0),
+        semantic_weight=number("semantic_weight", float, 0),
+        max_candidates=number("max_candidates", int, 1),
+    )
+    if cfg.enabled:
+        if cfg.provider not in PROVIDERS:
+            raise ConfigError(f"search.semantic.provider must be one of {', '.join(PROVIDERS)}")
+        if not cfg.model:
+            raise ConfigError("search.semantic.model is required when semantic search is enabled")
+        scheme = cfg.base_url.split(":", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            raise ConfigError("search.semantic.base_url must be an http(s) URL")
+        if not is_loopback_url(cfg.base_url) and not cfg.allow_remote:
+            raise ConfigError(
+                "search.semantic.base_url is not a loopback address; indexing would send "
+                "note text to it. Set search.semantic.allow_remote: true to acknowledge."
+            )
+    if mode == "hybrid" and not cfg.enabled:
+        raise ConfigError("search.default_mode: hybrid requires search.semantic.enabled")
+    return SearchConfig(default_mode=mode, semantic=cfg)
 
 
 def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
@@ -427,6 +528,8 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         overlap=int(index_raw.get("overlap", 150)),
     )
 
+    search = _build_search(raw.get("search"))
+
     server_raw = raw.get("server", {}) or {}
     server = ServerConfig(
         transport=server_raw.get("transport", "stdio"),
@@ -498,6 +601,7 @@ def _build(raw: dict[str, Any], base_dir: Path) -> CortexConfig:
         admin=admin,
         database=database,
         index=index,
+        search=search,
         server=server,
         llm=llm,
         janitor=janitor,

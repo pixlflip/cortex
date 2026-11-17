@@ -45,7 +45,7 @@ from .config import CortexConfig, Principal
 from .memory_policy import GovernedFastMCP, ToolGovernor
 from .llm import build_provider
 from .scopes import filter_paths, path_allowed
-from .recall import RecallHit, recall_hits
+from .recall import RecallHit, SemanticRetrieval, recall_hits, resolve_mode
 from .vault import (
     VaultStore,
     VaultError,
@@ -176,6 +176,8 @@ class CortexServer(NoteWriteMixin):
         self.api: ApiV1 | None = None
         # None when llm.provider is "none"; raises at startup on misconfig.
         self.provider = build_provider(config.llm)
+        # None unless search.semantic.enabled; used for hybrid retrieval only.
+        self.semantic = SemanticRetrieval.from_config(config.search)
         self.mcp = self._build_mcp(http)
         self._register()
         # Memory authorization is unconditional, never tied to a broker switch.
@@ -403,6 +405,19 @@ class CortexServer(NoteWriteMixin):
             "last_indexed_iso": stats["last_indexed"] if expose_activity else None,
             "index_note_count": stats["note_count"] if expose_activity else None,
         }
+        if self.semantic is not None:
+            model_id = self.semantic.provider.identity
+            emb = index.embedding_stats(model_id)
+            payload["semantic"] = {
+                "default_mode": self.config.search.default_mode,
+                "model": model_id,
+                "ready": index.semantic_ready(model_id),
+                "remote_endpoint": self.config.search.semantic.allow_remote,
+                "dimensions": emb["dimensions"],
+                "pending_chunks": emb["pending_chunks"] if expose_activity else None,
+                "last_embedded_iso": emb["last_embedded"] if expose_activity else None,
+                "last_error": emb["last_error"] if expose_activity else None,
+            }
         if bundle is not None:
             payload["vault"] = bundle.vault_id
         return payload
@@ -440,6 +455,7 @@ class CortexServer(NoteWriteMixin):
         budget_chars: int,
         bundle: VaultBundle | None = None,
         include_historical: bool = False,
+        mode: str | None = None,
     ) -> tuple[list[str], str]:
         """Deterministically gather the top *visible* chunks for a query into a
         compact, budgeted context string. Shared by context_pack and
@@ -456,7 +472,10 @@ class CortexServer(NoteWriteMixin):
         counted toward max_notes nor surfaced."""
         index = bundle.index if bundle is not None else self.index
         store = bundle.store if bundle is not None else self.vault
-        scoped = recall_hits(store, index, query, principal.scopes, include_historical=include_historical)
+        scoped = recall_hits(
+            store, index, query, principal.scopes, include_historical=include_historical,
+            mode=resolve_mode(mode, self.config.search.default_mode), semantic=self.semantic,
+        )
 
         # Dedup to the single best (top-ranked) chunk per note, preserving rank
         # order, then cap to max_notes distinct notes.

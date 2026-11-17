@@ -1,4 +1,68 @@
-# Local semantic search design
+# Local semantic search
+
+> **Status (0.3.0):** phases 1–3 below are implemented: the
+> OpenAI-compatible embedding provider, the `chunk_embeddings` table,
+> incremental `cortex index --embeddings` / `cortex sync` refresh, scoped
+> cosine ranking with weighted RRF in `search`, `context_pack`,
+> `semantic_search` and `GET /api/v1/vaults/{vault}/search`, and the
+> `status` / `cortex check` reporting. Phase 0 (a real-vault relevance
+> judgment set) and phase 4 (benchmark-driven tuning, optional `sqlite-vec`)
+> remain open; until phase 0 exists, `search.semantic.enabled` stays off by
+> default. The rest of this page is the original design, kept as the
+> contract the implementation follows.
+
+## Operating it
+
+1. Run an embedding model on the Cortex host, for example with Ollama:
+
+   ```bash
+   ollama pull nomic-embed-text
+   ```
+
+2. Enable it in `cortex.yaml`:
+
+   ```yaml
+   search:
+     default_mode: auto
+     semantic:
+       enabled: true
+       base_url: http://127.0.0.1:11434/v1
+       model: nomic-embed-text
+   ```
+
+3. Check the endpoint and build the vectors:
+
+   ```bash
+   cortex check
+   cortex index --embeddings
+   ```
+
+   `cortex check` embeds a fixed probe string only, never note text. The
+   `cortex sync` timer then keeps vectors current; only chunks whose text
+   changed are re-embedded.
+
+4. Confirm with the `status` MCP tool: its `semantic` block reports the
+   model, `ready`, `pending_chunks`, `last_embedded_iso` and `last_error`.
+
+Notes:
+
+- Vectors are stored in each vault's existing index file
+  (`vaults.index_dir/<vault>.sqlite`), roughly 3 KiB per chunk for a
+  768-dimension model. Back them up with the index or simply rebuild them.
+- MCP writes refresh the lexical index immediately; their embeddings are
+  picked up by the next `cortex sync` / `cortex index --embeddings`. Until
+  then hybrid results for the changed note come from BM25 alone.
+- Changing `model` invalidates only the vectors; FTS5 is untouched. Run
+  `cortex index --embeddings` after the change.
+- Rollback: set `search.semantic.enabled: false` (or `default_mode: lexical`).
+  Stored vectors are ignored and can be left in place.
+- An endpoint outage never breaks search: `auto` falls back to lexical, the
+  previous vectors are kept, and the error is shown in `status`. Only an
+  explicit `mode: hybrid` request returns an error.
+
+---
+
+## Design
 
 ## Decision
 

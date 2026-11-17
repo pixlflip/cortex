@@ -57,6 +57,24 @@ def cmd_check(args: argparse.Namespace) -> int:
     for vault_id in manager.vault_ids():
         print(f"  account: {vault_id}")
     print("  legacy vault.path is migration input only; never served")
+    sem = cfg.search.semantic
+    if not sem.enabled:
+        print("  semantic search: disabled (lexical FTS5 only)")
+        return 0
+    from .embeddings import EmbeddingError, build_embedding_provider, is_loopback_url
+
+    provider = build_embedding_provider(sem)
+    assert provider is not None
+    where = "loopback" if is_loopback_url(sem.base_url) else "REMOTE (allow_remote: true)"
+    try:
+        # A fixed probe string: no note content leaves the host during check.
+        vector = provider.embed(["cortex check"])[0]
+    except EmbeddingError as exc:
+        print(f"  semantic search: endpoint check FAILED ({where} {sem.base_url}): {exc}",
+              file=sys.stderr)
+        return 1
+    print(f"  semantic search: {provider.identity} at {where} {sem.base_url}, "
+          f"{len(vector)} dimensions")
     return 0
 
 
@@ -69,6 +87,15 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 0
     from .vaults import VaultManager
 
+    provider = None
+    if args.embeddings:
+        if not cfg.search.semantic.enabled:
+            print("semantic search is disabled in config (search.semantic.enabled: false); "
+                  "nothing to embed.", file=sys.stderr)
+            return 2
+        from .embeddings import build_embedding_provider
+
+        provider = build_embedding_provider(cfg.search.semantic)
     manager = VaultManager(cfg)
     warned_fts = False
     failed = False
@@ -100,6 +127,17 @@ def cmd_index(args: argparse.Namespace) -> int:
             print(f"  notes:        {stats['note_count']}")
             print(f"  chunks:       {stats['chunk_count']}")
             print(f"  last indexed: {stats['last_indexed'] or 'never'}")
+            if provider is not None:
+                outcome = idx.sync_embeddings(provider, batch_size=cfg.search.semantic.batch_size)
+                if outcome["error"]:
+                    failed = True
+                    print(f"  embeddings:   FAILED ({outcome['error']}); previous vectors kept",
+                          file=sys.stderr)
+                else:
+                    emb = idx.embedding_stats(provider.identity)
+                    print(f"  embeddings:   {emb['vector_count']} vectors "
+                          f"({outcome['embedded']} new/changed, {outcome['removed']} removed), "
+                          f"model {provider.identity}")
     finally:
         manager.close()
     return 1 if failed else 0
@@ -205,7 +243,10 @@ def run_sync_all(cfg: CortexConfig) -> list[tuple[str, dict | Exception]]:
     main vault and ``vaults.sync`` for each user vault."""
     from .vaults import VaultManager
 
+    from .embeddings import build_embedding_provider
+
     manager = VaultManager(cfg)
+    provider = build_embedding_provider(cfg.search.semantic) if cfg.index.enabled else None
     results: list[tuple[str, dict | Exception]] = []
     try:
         for vault_id in manager.vault_ids():
@@ -220,6 +261,12 @@ def run_sync_all(cfg: CortexConfig) -> list[tuple[str, dict | Exception]]:
                     adapter=sc.adapter,
                     options=sc.options or {},
                 )
+                if provider is not None:
+                    # Failure keeps the previous vectors and leaves lexical
+                    # search untouched; it is reported, not fatal.
+                    summary["embeddings"] = bundle.index.sync_embeddings(
+                        provider, batch_size=cfg.search.semantic.batch_size
+                    )
                 results.append((vault_id, summary))
             except Exception as exc:  # noqa: BLE001 - isolate per-vault failure
                 results.append((vault_id, exc))
@@ -243,6 +290,12 @@ def _print_sync_summary(vault_id: str, summary: dict) -> bool:
         )
     else:
         print("  index: disabled")
+    emb = summary.get("embeddings")
+    if emb is not None:
+        if emb["error"]:
+            print(f"  embeddings: FAILED ({emb['error']}); previous vectors kept", file=sys.stderr)
+        else:
+            print(f"  embeddings: {emb['embedded']} new/changed, {emb['removed']} removed")
     if summary["remote"] == "ok":
         print("  remote: pulled/pushed")
     elif summary["remote"] == "skipped":
@@ -824,6 +877,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     pi = sub.add_parser("index", help="build/refresh the FTS5 search index")
     pi.add_argument("--rebuild", action="store_true", help="drop and rebuild the index from scratch")
+    pi.add_argument(
+        "--embeddings",
+        action="store_true",
+        help="also embed new/changed chunks with search.semantic (local embedding index)",
+    )
     pi.set_defaults(func=cmd_index)
 
     sub.add_parser(

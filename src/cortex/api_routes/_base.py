@@ -17,6 +17,7 @@ from starlette.requests import Request
 from ..config import CortexConfig
 from ..access import VaultAccessResolver
 from ..memory_policy import PermissionResolver
+from ..recall import SemanticRetrieval
 from ..ldap import DirectoryService
 from ..sessions import CSRF_HEADER, SAFE_METHODS, SessionAuth
 from ..users import IdentityError, IdentityService
@@ -53,6 +54,7 @@ class ApiBase:
         )
         self.vault_access = VaultAccessResolver(config, self.vault_manager, identity)
         self.permissions = PermissionResolver(config, identity)
+        self.semantic = SemanticRetrieval.from_config(config.search)
 
     # -- authentication ---------------------------------------------------------
 
