@@ -47,6 +47,13 @@ _CODE_TTL = 600  # seconds
 _ACCESS_TTL = 3600  # seconds
 
 
+def _client_id(client: OAuthClientInformationFull) -> str:
+    """The client's id. The SDK assigns one at registration, so absence is a bug."""
+    if not client.client_id:
+        raise ValueError("OAuth client has no client_id")
+    return client.client_id
+
+
 def _now() -> int:
     return int(time.time())
 
@@ -105,7 +112,7 @@ class CortexOAuthProvider:
         return self._clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        self._clients[client_info.client_id] = client_info
+        self._clients[_client_id(client_info)] = client_info
         self._persist_clients()
 
     def _load_clients(self) -> dict[str, OAuthClientInformationFull]:
@@ -159,7 +166,7 @@ class CortexOAuthProvider:
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
         code = self._codes.get(authorization_code)
-        if code is None or code.client_id != client.client_id:
+        if code is None or client.client_id is None or code.client_id != client.client_id:
             return None
         if code.expires_at and code.expires_at < _now():
             self._codes.pop(authorization_code, None)
@@ -174,7 +181,7 @@ class CortexOAuthProvider:
         self._codes.pop(authorization_code.code, None)
         source_token = self._source_by_code.pop(authorization_code.code, None)
         return self._issue(
-            client_id=client.client_id,
+            client_id=_client_id(client),
             scopes=authorization_code.scopes,
             subject=authorization_code.subject,
             resource=authorization_code.resource,
@@ -187,7 +194,7 @@ class CortexOAuthProvider:
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
         rt = self._refresh.get(refresh_token)
-        if rt is None or rt.client_id != client.client_id:
+        if rt is None or client.client_id is None or rt.client_id != client.client_id:
             return None
         return rt
 
@@ -201,7 +208,7 @@ class CortexOAuthProvider:
         self._refresh.pop(refresh_token.token, None)
         source_token = self._source_by_refresh.pop(refresh_token.token, None)
         return self._issue(
-            client_id=client.client_id,
+            client_id=_client_id(client),
             scopes=scopes or refresh_token.scopes,
             subject=refresh_token.subject,
             resource=None,
@@ -277,7 +284,7 @@ class CortexOAuthProvider:
             code=code,
             scopes=params.scopes or [],
             expires_at=_now() + _CODE_TTL,
-            client_id=client.client_id,
+            client_id=_client_id(client),
             code_challenge=params.code_challenge,
             redirect_uri=params.redirect_uri,
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,

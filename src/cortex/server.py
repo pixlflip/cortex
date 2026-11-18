@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 import logging
 
 import anyio
@@ -32,6 +32,7 @@ from mcp.server.auth.settings import (
     RevocationOptions,
 )
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import AnyHttpUrl
 
 from .admin import AdminStore
 from .access import VaultAccessError, VaultAccessResolver
@@ -229,7 +230,7 @@ class CortexServer(NoteWriteMixin):
 
         if http is None:
             return GovernedFastMCP("cortex", lifespan=lifespan)
-        kwargs = dict(
+        kwargs: dict[str, Any] = dict(
             auth=http.auth_settings,
             transport_security=http.transport_security,
             host=http.host,
@@ -585,8 +586,8 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         )
         resource_url = base.rstrip(chr(47)) + sc.path
         auth_settings = AuthSettings(
-            issuer_url=base,
-            resource_server_url=resource_url,
+            issuer_url=AnyHttpUrl(base),
+            resource_server_url=AnyHttpUrl(resource_url),
             required_scopes=[],
             client_registration_options=ClientRegistrationOptions(enabled=True),
             revocation_options=RevocationOptions(enabled=True),
@@ -597,7 +598,7 @@ def build_http_server(config: CortexConfig) -> CortexServer:
         )
     else:
         auth_settings = AuthSettings(
-            issuer_url=base, resource_server_url=base, required_scopes=[]
+            issuer_url=AnyHttpUrl(base), resource_server_url=AnyHttpUrl(base), required_scopes=[]
         )
         http = HttpServe(
             auth_settings, transport_security, sc.host, sc.port, sc.path,

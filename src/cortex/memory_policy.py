@@ -159,7 +159,7 @@ class ToolGovernor:
         return result
 
 
-class GovernedFastMCP(FastMCP):  # type: ignore[misc]  # FastMCP is untyped here
+class GovernedFastMCP(FastMCP):  # type: ignore[misc, unused-ignore]  # untyped in older mcp
     """The advertised and callable memory surfaces share an unconditional guard."""
 
     governor: ToolGovernor | None = None
