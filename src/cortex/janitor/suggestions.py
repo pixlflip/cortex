@@ -87,17 +87,17 @@ def review_lifecycle(
         for item in raw:
             if not isinstance(item, dict) or set(item) != {"path", "state", "reason"}:
                 raise ValueError("suggestion must be an object")
-            path, state, reason = item.get("path"), item.get("state"), item.get("reason")
-            if not isinstance(path, str) or path not in allowed_paths:
+            suggested_path, state, reason = item.get("path"), item.get("state"), item.get("reason")
+            if not isinstance(suggested_path, str) or suggested_path not in allowed_paths:
                 raise ValueError("suggestion refers to an unselected path")
-            if path in seen:
+            if suggested_path in seen:
                 raise ValueError("duplicate suggestion path")
-            seen.add(path)
+            seen.add(suggested_path)
             if not isinstance(state, str) or state not in _ALLOWED:
                 raise ValueError("suggestion has an invalid state")
             if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
                 raise ValueError("suggestion has an invalid reason")
-            output.append(LifecycleSuggestion(path, state, reason))
+            output.append(LifecycleSuggestion(suggested_path, state, reason))
         return LifecycleReview(tuple(output))
     except Exception:
         # Deliberately do not expose provider text, exception text, URLs, or keys.

@@ -4,30 +4,35 @@
 #   2. import notes into ./data/vaults/<owning-account>
 #   3. docker compose run --rm cortex check
 #   4. docker compose run --rm cortex init  # create the git audit baseline
+#   5. docker compose up -d                 # headless HTTP API + MCP on :8765
 #
 # Secrets (tokens, API keys) come from the environment / a .env file — never
 # bake them into the image or commit them. See cortex.example.yaml for which
 # env vars each principal/provider references.
+#
+# Prefer the published image over a local build:
+#   CORTEX_IMAGE=ghcr.io/pixlflip/cortex:latest docker compose up -d
+
+x-cortex: &cortex
+  build:
+    context: .
+    # args: { EXTRAS: "openai" }   # uncomment to bundle a provider SDK
+  image: ${CORTEX_IMAGE:-cortex:latest}
+  environment:
+    CORTEX_CONFIG: /data/cortex.yaml
+    # Provide tokens/keys here or via a .env file, e.g.:
+    # CORTEX_TOKEN_LOCAL: ${CORTEX_TOKEN_LOCAL}
+    # CORTEX_LLM_API_KEY: ${CORTEX_LLM_API_KEY}
+  volumes:
+    - ./data:/data/data
+    - ./cortex.yaml:/data/cortex.yaml:ro
 
 services:
+  # Headless HTTP server (server.transport: http). Put a TLS-terminating reverse
+  # proxy in front for remote clients; see docs/http-exposure.md.
   cortex:
-    build:
-      context: .
-      # args: { EXTRAS: "openai" }   # uncomment to bundle a provider SDK
-    image: cortex:latest
-    environment:
-      CORTEX_CONFIG: /data/cortex.yaml
-      # Provide tokens/keys here or via a .env file, e.g.:
-      # CORTEX_TOKEN_LOCAL: ${CORTEX_TOKEN_LOCAL}
-      # CORTEX_LLM_API_KEY: ${CORTEX_LLM_API_KEY}
-    volumes:
-      - ./data:/data/data
-      - ./cortex.yaml:/data/cortex.yaml:ro
-    # stdin_open/tty let stdio MCP clients attach (docker compose run -it).
-    stdin_open: true
-    tty: true
-    # For remote MCP clients (server.transport: http), expose the port and put
-    # a TLS-terminating reverse proxy in front. See docs/http-exposure.md.
+    <<: *cortex
+    restart: unless-stopped
     ports:
       - "8765:8765"
     healthcheck:
@@ -36,3 +41,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # Local stdio MCP transport (server.transport: stdio). Not started by
+  # `docker compose up`; an MCP client launches it per session with:
+  #   docker compose --profile stdio run --rm -T cortex-stdio
+  # stdin stays open and no TTY is allocated, so MCP's JSON-RPC framing is not
+  # mangled by terminal line handling.
+  cortex-stdio:
+    <<: *cortex
+    profiles: ["stdio"]
+    stdin_open: true
+    tty: false
+    command: ["serve"]
+    healthcheck:
+      disable: true

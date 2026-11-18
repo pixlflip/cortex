@@ -26,7 +26,6 @@ from cortex.vaults import attach_vault_manager
 
 @pytest.fixture
 def multivault(tmp_path: Path):
-    accounts = tmp_path / "vaults"
     cfg = CortexConfig(
         vault=VaultConfig(),
         vaults=VaultsConfig(

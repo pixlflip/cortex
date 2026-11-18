@@ -3,7 +3,6 @@ import asyncio
 import hashlib
 import json
 import subprocess
-from pathlib import Path
 import pytest
 from cortex.config import CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
 from cortex.server import CortexServer

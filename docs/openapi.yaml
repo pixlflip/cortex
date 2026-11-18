@@ -698,13 +698,27 @@ paths:
       - name: tag
         in: query
         schema: { type: string }
+      - name: include_historical
+        in: query
+        schema: { type: boolean, default: false }
+      - name: mode
+        in: query
+        description: >
+          Retrieval mode. `lexical` is FTS5/BM25 only; `hybrid` fuses BM25 with
+          the local embedding index and fails with 409 when that index is not
+          available; `auto` uses hybrid when available. Defaults to the server's
+          `search.default_mode`. Results carry `retrieval_mode`, and hybrid
+          results add `lexical_rank`, `semantic_rank` and `similarity`.
+        schema: { type: string, enum: [auto, lexical, hybrid] }
     get:
       tags: [vaults]
       operationId: searchVault
-      summary: Full-text search within the caller's visible note scopes.
+      summary: Ranked search (lexical or hybrid) within the caller's visible note scopes.
       responses:
         "200": { $ref: "#/components/responses/FreeformOk" }
+        "400": { description: Invalid query parameter. }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "`mode=hybrid` requested but semantic search is unavailable (`semantic_unavailable`)." }
 
   /vaults/{vault}/notes/{path}:
     parameters:

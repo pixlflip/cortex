@@ -135,9 +135,9 @@ def test_get_file_rejects_out_of_scope_hidden_traversal_and_symlink(vault: Path)
 
 
 def test_get_file_bounds_are_validated_and_chunk_length_is_capped(vault: Path, monkeypatch):
-    import cortex.server as server_module
+    import cortex.mcp_tools.read_tools as read_tools_module
 
-    monkeypatch.setattr(server_module, "MAX_FILE_CHUNK_BYTES", 4)
+    monkeypatch.setattr(read_tools_module, "MAX_FILE_CHUNK_BYTES", 4)
     srv = server(vault)
     result = call(srv, "get_file", path="Public/attachments/image.bin", length=99)
     assert result["length"] == 4
@@ -197,13 +197,13 @@ def test_put_file_refuses_overwrite_invalid_base64_hash_mismatch_and_markdown(va
 
 
 def test_put_file_enforces_write_scope_and_size_limit(vault: Path, monkeypatch):
-    import cortex.server as server_module
+    import cortex.note_writes as note_writes_module
 
     srv = server(vault, scopes=["**"], write_scopes=["Public/uploads/**"], writes=True)
     encoded = base64.b64encode(b"12345").decode("ascii")
     with pytest.raises(ToolError, match="not in scope"):
         call(srv, "put_file", path="Private/no.bin", content_base64=encoded, reason="no")
-    monkeypatch.setattr(server_module, "MAX_FILE_WRITE_BYTES", 4)
+    monkeypatch.setattr(note_writes_module, "MAX_FILE_WRITE_BYTES", 4)
     with pytest.raises(ToolError, match="put_file limit"):
         call(srv, "put_file", path="Public/uploads/large.bin", content_base64=encoded, reason="large")
 

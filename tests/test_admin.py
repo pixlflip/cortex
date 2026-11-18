@@ -6,7 +6,7 @@ from pathlib import Path
 
 from cortex.admin import AdminStore
 from cortex.auth import Authenticator
-from cortex.config import AdminConfig, CortexConfig, Principal, ServerConfig, VaultConfig, load_config
+from cortex.config import AdminConfig, CortexConfig, Principal, VaultConfig, load_config
 from cortex.server import build_http_server
 
 

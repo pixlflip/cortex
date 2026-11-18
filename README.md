@@ -28,12 +28,12 @@ Anyone can spin one up — locally, in Docker, or on a homelab — and keep thei
 memory *theirs*: a fully working Obsidian vault for humans, a governed memory
 API for agents.
 
-**Breaking storage correction:** legacy `vault.path` is no longer served or
-synced. Read [account-vault migration](docs/account-vaults.md) before upgrading
-an existing installation. No automatic merging or deletion is performed.
+**Upgrading from 0.2.x?** 0.3.0 is a breaking release: legacy `vault.path` is
+no longer served, and the web UI and upstream MCP broker are gone. Follow
+[upgrading to 0.3.0](docs/upgrading.md). No automatic merging or deletion is
+performed.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the broader design; the account-vault
-contract supersedes its historical shared-vault sections.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how Cortex is put together.
 
 ---
 
@@ -49,6 +49,11 @@ docker compose run --rm cortex check        # validate setup
 docker compose run --rm cortex init         # DB + admin + git baselines
 docker compose up -d                        # headless API + MCP on :8765
 ```
+
+To skip the local build, use the published image:
+`CORTEX_IMAGE=ghcr.io/pixlflip/cortex:latest docker compose up -d`. For a local
+stdio MCP client, have it launch
+`docker compose --profile stdio run --rm -T cortex-stdio`.
 
 Run `cortex sync` any time (or on a schedule — see
 [`docs/bare-metal.md`](docs/bare-metal.md)) to snapshot pending human edits
@@ -106,7 +111,7 @@ with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
 | `status` | Freshness signal: git HEAD/commit time, last index refresh, visible note count |
 | `list_notes` | List visible note paths |
 | `list_files` | List visible vault files, including binary attachments |
-| `search` | Substring/regex search over visible notes |
+| `search` | Ranked search over visible notes: BM25, or hybrid BM25 + local embeddings; `regex=True` for literal scans |
 | `read_note` | Read a full note (scope-checked) |
 | `get_file` | Pull a scoped file in bounded, binary-safe base64 chunks |
 | `read_frontmatter` | Read a note's YAML frontmatter |
@@ -114,10 +119,12 @@ with `CORTEX_CONFIG` pointing at your config. Built-in tools include:
 | `context_pack` | Compact, budgeted bundle for a query |
 | `semantic_search` | Fuzzy "comb & synthesize" — the only tool that uses an LLM |
 
-The proposed path to genuinely local concept retrieval (hybrid FTS5 plus
-on-machine embeddings, with optional local synthesis) is documented in
-[`docs/local-semantic-search.md`](docs/local-semantic-search.md). It is a design,
-not yet part of the shipped configuration surface.
+`search` and `context_pack` can also find notes by meaning rather than shared
+words: enable `search.semantic` with a local embedding model (for example
+Ollama) and run `cortex index --embeddings`. Lexical and semantic ranks are
+fused, everything stays on the host by default, and lexical search keeps
+working if the model is down. See
+[`docs/local-semantic-search.md`](docs/local-semantic-search.md).
 
 With `writes.enabled: true` in `cortex.yaml` (default **false** — otherwise
 these tools are not registered at all), the mutating tools appear. Each one
@@ -165,7 +172,11 @@ Key knobs (see [`cortex.example.yaml`](cortex.example.yaml)):
   historical upstream records remain inert for rollback.
 - `memory_policy` — existing read/write permission defaults and memory audit
   retention. No authorization-off switch. See the migration compatibility rules.
-- `sync.adapter` — `none` (default, local-only) · `git` · `nextcloud` · `s3`.
+- `search` — default retrieval mode and the optional local embedding index
+  (`search.semantic`, off by default; loopback endpoints only unless
+  `allow_remote: true`).
+- `vaults.sync.adapter` — `none` (default, local-only) · `git`. `nextcloud` and
+  `s3` are reserved names that currently only snapshot locally.
 - `llm.provider` — `none` (default) · `openrouter` · `openai` · `anthropic` ·
   `ollama`. OpenRouter (one key, many models; defaulting to the latest Claude
   Sonnet) is the recommended way to enable `semantic_search`.
@@ -178,34 +189,38 @@ never modifies vault content.
 
 ---
 
-## What v2 includes
+## Documentation
 
-- Local accounts, LDAP/Active Directory login and sync, groups, sessions,
-  CSRF-protected same-origin API, and individually revocable user tokens.
-- One git-audited vault per account, explicit cross-account administration,
-  lifecycle repair/archive operations, and token-level path narrowing.
-  There is no general or shared default vault.
-- Headless JSON API and MCP access, with scope-checked notes and attachments.
-  The React UI, static assets, and legacy browser admin have been removed.
-- Memory-only per-user/group tool permissions, deny-wins behavior (including
-  admins), listing/call parity, and argument-shape-only call telemetry.
-- Reproducible Docker/Compose and Python-wheel packaging, a v1→v2 migration
-  command, health checks, CI, and documented backup/upgrade procedures.
-
-Start with [`docs/multi-user.md`](docs/multi-user.md),
-[`docs/memory-policy.md`](docs/memory-policy.md), and
-[account-vault migration](docs/account-vaults.md). The original
-[v2 upgrade](docs/upgrading-v2.md) and [security review](docs/security-review-v2.md)
-are historical.
+| Topic | Document |
+| --- | --- |
+| Design and safety model | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Upgrading to 0.3.0 | [docs/upgrading.md](docs/upgrading.md) |
+| Accounts, vault ownership and grants | [docs/account-vaults.md](docs/account-vaults.md) |
+| Users, groups, LDAP, tokens | [docs/multi-user.md](docs/multi-user.md) |
+| Tool policy and the broker retirement | [docs/memory-policy.md](docs/memory-policy.md) |
+| Memory lifecycle | [docs/memory-lifecycle.md](docs/memory-lifecycle.md) |
+| Janitor | [docs/memory-janitor.md](docs/memory-janitor.md) |
+| Hybrid / semantic search | [docs/local-semantic-search.md](docs/local-semantic-search.md) |
+| Remote HTTP exposure | [docs/http-exposure.md](docs/http-exposure.md) |
+| Bare-metal install | [docs/bare-metal.md](docs/bare-metal.md) |
+| JSON API reference | [docs/openapi.yaml](docs/openapi.yaml) |
+| Releasing | [docs/release-checklist.md](docs/release-checklist.md) |
+| Retired designs (history only) | [docs/archive/](docs/archive/) |
 
 ---
 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
+pip install -c requirements/dev.txt -e ".[dev]"   # the versions CI uses
+ruff check src tests
+mypy
+pytest --cov                                      # includes end-to-end MCP tests
 ```
+
+Dependencies are declared as ranges in `pyproject.toml` and locked in
+`requirements/`; after changing them run `scripts/lock.sh` (see
+[requirements/README.md](requirements/README.md)).
 
 ## License
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any
 
 from .core import Database
 from ..scopes import validate_grant_scopes
@@ -36,7 +37,7 @@ class VaultGrantsRepo:
                  updated_by, int(time.time())),
             )
 
-    def list(self, principal_user_id: int | None = None, *, active_only: bool = False) -> list[dict]:
+    def list(self, principal_user_id: int | None = None, *, active_only: bool = False) -> list[dict[str, Any]]:
         # Join actual account rows, never directory names or group membership.
         sql = """SELECT g.*, p.username AS principal, o.username AS vault
                  FROM vault_grants g

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-import os
 from pathlib import Path
 
 import pytest
@@ -113,7 +112,7 @@ def test_search(vault: Path):
 
 def test_path_traversal_rejected(vault: Path):
     store = VaultStore(vault)
-    with pytest.raises(Exception):
+    with pytest.raises(VaultError):
         store.read_text("../../etc/passwd")
 
 

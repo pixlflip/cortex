@@ -13,7 +13,7 @@ import pytest
 
 from cortex.config import (
     AuthConfig,
-    CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig, WritesConfig
+    CortexConfig, IndexConfig, Principal, VaultConfig, VaultsConfig
 )
 from cortex.search_index import SearchIndex, chunk_note, sanitize_fts_query
 from cortex.server import CortexServer

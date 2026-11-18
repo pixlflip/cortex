@@ -2,283 +2,185 @@
 
 > Every mind needs a memory that is dynamic, not stationary.
 
-Cortex is a **dynamic memory layer for AI agents, assistants, and chatbots**
-backed by a real **Obsidian vault**. The vault is not an interchangeable blob of
-documents; it is the product's memory substrate: Obsidian-compatible Markdown,
-YAML frontmatter, folders, links, and direct human editability. Cortex exposes
-that vault to AI clients and humans through a secure
-[Model Context Protocol](https://modelcontextprotocol.io) (MCP) server. It is
-designed so that **anyone can spin one up** — locally with Docker, on a server,
-or on a homelab — and point their AI tools at their own memory without handing
-the whole vault to every caller.
+Cortex is a headless, governed memory service for AI agents. Each account owns
+an ordinary Obsidian-compatible Markdown vault on disk; humans edit it with any
+editor, and AI clients reach it only through Cortex's memory MCP server (plus
+an authenticated JSON API and the CLI). Every change is a git commit, every
+read is scoped, and nothing outside a caller's grant is visible.
 
-## Current service contract
-
-Cortex is headless and vault-only: a dedicated memory MCP, authenticated JSON
-memory/account API, CLI, readiness at `/healthz`, and optional OAuth consent.
-It has no product UI, upstream MCP registration/proxy, connection workers or
-dynamic session catalogs. Tools are governed unconditionally by memory-only
-deny-wins policy; unknown/non-Cortex tool IDs fail closed. Authentication,
-account ownership and path scopes remain separate guards.
-
-The current contracts are [account vaults](docs/account-vaults.md),
-[memory policy](docs/memory-policy.md), and [multi-user operation](docs/multi-user.md).
-There is no global/shared fallback; a missing account vault fails closed.
-Existing Nextcloud sync remains an external account-vault sync integration,
-not an MCP upstream. No ranking, janitor or semantic-search change is implied.
-
-## Historical design below
-
-The remainder records the original v1 design and roadmap. It and
-[`docs/v2-design.md`](docs/v2-design.md) are historical, not active instructions
-to restore a shared vault, UI or MCP gateway. Current contracts above supersede
-their retired behavior. The design remains infrastructure-agnostic.
+This document describes Cortex as it is now (0.3.x). The original v1 design and
+the retired v2 UI/gateway design are kept in [`docs/archive/`](docs/archive/).
 
 ---
 
-## 1. The problem
+## 1. Front doors
 
-People accumulate knowledge in Obsidian vaults. That knowledge is *stationary*:
-it sits in human-readable Markdown files, and every tool that wants it either
-gets raw filesystem access (no scoping, no audit, no safety) or nothing at all.
-AI assistants in particular need **scoped, structured, auditable** retrieval —
-not "here's my entire life, please don't mess it up."
+| Surface | Transport | Who uses it | Module |
+| --- | --- | --- | --- |
+| Memory MCP | stdio (local) or Streamable HTTP | AI clients | `server`, `mcp_tools/` |
+| JSON API `/api/v1` | HTTP, same app as MCP | scripts, admins | `api`, `api_routes/` |
+| OAuth 2.1 consent | HTTP (optional) | one-click MCP connectors | `oauth` |
+| Readiness `/healthz` | HTTP | orchestrators | `health` |
+| CLI `cortex …` | local process | operators | `cli` |
 
-Cortex turns a stationary Obsidian vault into a **governed, self-improving
-memory**:
+There is no web UI, vault viewer, or upstream MCP proxy. `/` and former UI
+paths return 404. The MCP server exposes only Cortex's own memory tools.
 
-- **Fast, deterministic retrieval** for machines (search, read, context packs).
-- **A single audit trail** so every change is attributable and reversible.
-- **Enforced scoping** so different callers see different slices.
-- **A background intelligence** that keeps the vault healthy and watches for
-  drift — without being in the hot path and without the power to change its own
-  limits.
-
----
-
-## 2. Two faces
-
-Cortex has exactly two faces, kept deliberately separate.
-
-### Face A — Synchronous front door (MCP server)
-
-A credentialed MCP server exposing **scoped, deterministic** vault tools. This
-is what web and desktop AI clients connect to. It is the *only* sanctioned way
-in. It enforces safety **at the tool layer**, never trusting the caller.
-
-### Face B — Asynchronous maintenance mind (the Janitor)
-
-A separate, low-power AI worker on a heartbeat. It tidies, validates, and
-watches the vault for drift. It is **not** in the request path (except as the
-backend for the one semantic-search tool). It runs under hard boundaries it
-cannot edit.
-
-The separation is the point: the front door stays fast and predictable; the
-maintenance mind stays bounded and observable. They never blur.
-
----
-
-## 3. Layers (bottom to top)
+## 2. Request path
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Clients: Claude Desktop, web apps, IDEs, CLIs (MCP)           │
-└───────────────────────────┬──────────────────────────────────┘
-                            │  MCP (stdio for local, HTTP for remote)
-┌───────────────────────────▼──────────────────────────────────┐
-│  Auth & Scoping:  token → principal → scopes                  │
-├──────────────────────────────────────────────────────────────┤
-│  MCP Tools (v1 read-only):                                    │
-│    discover_scopes · search · read_note · read_section        │
-│    read_frontmatter · context_pack · semantic_search*         │
-├──────────────────────────────────────────────────────────────┤
-│  Vault Store (filesystem)   │   Git Audit (actor + reason)    │
-├─────────────────────────────┴────────────────────────────────┤
-│  Sync Adapter (git-native default · nextcloud · s3 · none)    │
-├──────────────────────────────────────────────────────────────┤
-│  Janitor (dark by default) ── LLM provider (claude/openai/    │
-│                                ollama/none)  *also backs       │
-│                                semantic_search                 │
-└──────────────────────────────────────────────────────────────┘
+ MCP client ──stdio──┐                 ┌── JSON API client (session cookie or bearer)
+                     │                 │
+ MCP client ─HTTP────┤                 │
+  bearer / OAuth     ▼                 ▼
+            ┌───────────────────────────────────────────┐
+            │ Authentication                            │  auth, oauth, sessions, users
+            │   token / session → principal             │
+            ├───────────────────────────────────────────┤
+            │ Tool policy (MCP only)                    │  memory_policy
+            │   deny-wins rules per user/group;         │
+            │   hides tools from tools/list, refuses    │
+            │   calls, records value-free audit rows    │
+            ├───────────────────────────────────────────┤
+            │ Vault selection                           │  access, vaults, db.vault_grants
+            │   own account by default; admin or        │
+            │   explicit grant for another account      │
+            ├───────────────────────────────────────────┤
+            │ Path scope                                │  scopes
+            │   canonical path ∈ read/write globs,      │
+            │   intersected with token narrowing        │
+            ├───────────────────────────────────────────┤
+            │ Retrieval / mutation                      │  vault, search_index, recall,
+            │   files · FTS5 · embeddings · git         │  embeddings, note_writes, gitlog
+            └───────────────────────────────────────────┘
 ```
 
-### 3.1 Vault Store
+The four guards are independent and all must pass. A failure at vault selection
+or path scope is reported exactly like a missing resource ("not found or not in
+scope"), so callers cannot probe for what exists outside their grant.
 
-- The vault is a **local Obsidian vault**. All reads/writes go through the
-  filesystem — never a remote call in the request path.
-- Notes are Obsidian-compatible Markdown with optional YAML frontmatter. Cortex
-  treats Obsidian vault semantics as the memory format, not as one example among
-  many.
-- The store exposes primitives: list notes, read a note, read its frontmatter,
-  read a named section (by heading), and substring/regex search.
+## 3. Identity and authorization
 
-### 3.2 Git Audit
+- **Principals.** A request runs as one principal. Over stdio it is the
+  configured `auth.local_principal`. Over HTTP it comes from a bearer token:
+  config principals (`token_env`), database user API tokens (`user:` subjects),
+  legacy admin-store clients, or an OAuth access token bound server-side to one
+  of those.
+- **Accounts and vaults.** Database users (local or LDAP) each own one vault at
+  `vaults.root/<username>` with its own git repository and index. There is no
+  global vault and no fallback: a missing account vault fails closed. See
+  [account vaults](docs/account-vaults.md).
+- **Cross-account access** happens only through an administrator acting
+  explicitly, or an explicit `vault_grants` row with separate read and write
+  globs. Grants are re-read on every call.
+- **Token narrowing.** A user token may carry scopes; they intersect every
+  grant and can only reduce access.
+- **Tool policy.** `memory_policy.ToolGovernor` wraps the MCP server. Rules are
+  globs over `cortex.<tool>` for users and groups; any matching deny wins, then
+  any allow, then the configured read/write defaults. Unknown tool IDs fail
+  closed. See [memory policy](docs/memory-policy.md).
+- **Writes switch.** With `writes.enabled: false` (the default) mutating tools
+  are never registered, whatever the policy says.
 
-- The vault folder is a git repository. **Every mutation is immediately
-  committed**, with the message encoding *actor* and *reason*:
-  - `cortex-janitor: normalize frontmatter`
-  - `principal:didact via mcp: append decision record`
-- Git is the **single** audit + rollback mechanism. No separate version store.
-- Rollback = `git revert` / `git checkout` of a path. Diffs are the change log.
+Authorization-critical modules (`access`, `scopes`, `memory_policy`,
+`db.vault_grants`) are type-checked strictly and held to a 95% coverage floor
+in CI.
 
-### 3.3 Sync Adapter (pluggable)
+## 4. Storage
 
-The source-of-truth / propagation layer is an adapter so the same Cortex runs
-for very different users. **The default is `none` (local-only):** the vault is
-just a folder, git audit (3.2) still applies for rollback, and you bring your
-own sync if you want one. Everything else is opt-in.
+```
+data/
+├── cortex.sqlite            identity, tokens, sessions, tool policy + audit,
+│                            vault grants, janitor reports, settings
+├── vaults/<account>/        Obsidian vault = git working tree (source of truth)
+├── indexes/<account>.index.sqlite  rebuildable FTS5 index + embeddings
+└── archive/                 archived account vaults (history preserved)
+```
 
-| Adapter | Source of truth | Use case |
-|---|---|---|
-| `none` *(default)* | the local Obsidian vault | Single-box; bring-your-own-sync |
-| `git` | a git remote | Portable; the remote *is* both sync and audit |
-| `nextcloud` | Nextcloud/WebDAV | Obsidian-over-Nextcloud users (the original setup) |
-| `s3` | object storage | Cloud-first, large vaults |
+- **Vault files** are the only durable memory. Notes are Markdown with optional
+  YAML frontmatter; binary attachments are supported through the file tools.
+  Hidden paths and symlinks are rejected.
+- **Git** is the single audit trail and rollback mechanism. Each MCP mutation is
+  one commit whose message records actor and reason; `cortex sync` snapshots
+  human edits the same way.
+- **The SQLite identity database** holds no note content. Its schema is
+  migrated forward by `cortex migrate` / `cortex init`; historical tables from
+  the retired gateway are kept inert rather than dropped.
+- **Indexes** are caches: delete them and `cortex index` rebuilds them.
 
-Hard rule for any adapter: **git internals (`.git/`) are never propagated to a
-file-sync backend** (it corrupts the repo). The git remote is the only thing
-that ever sees `.git`.
+## 5. Retrieval
 
-### 3.4 Auth & Scoping
+All retrieval is scope-filtered before ranking limits apply, so a narrowly
+scoped caller never loses results to out-of-scope matches.
 
-- A **principal** is a named identity (a person or an agent).
-- A **scope** is a set of vault paths (glob) a principal may read (and later,
-  write).
-- A **credential** (bearer token) maps to exactly one principal. The server
-  treats "X called it" and "a holder of X's token called it" as identical —
-  which is exactly why the mapping must be explicit and enforced.
-- **No public exposure without credential→principal mapping.** Without it,
-  scoping is decorative. Over local `stdio` a single trusted default principal
-  is allowed; over HTTP a bearer token is required.
-- Secrets live in **environment variables / a secrets file**, never in the
-  committed config or the image.
+- **Lexical:** SQLite FTS5 with BM25 over heading-aware chunks (`search_index`).
+  Falls back to substring search if FTS5 is unavailable.
+- **Semantic (optional, off by default):** an OpenAI-compatible embedding
+  endpoint, loopback-only unless `allow_remote` is set, with normalized
+  float32 vectors stored beside FTS5 and refreshed incrementally by
+  `cortex index --embeddings` / `cortex sync` (`embeddings`).
+- **Hybrid:** `recall` fuses lexical and semantic ranks with weighted
+  reciprocal-rank fusion. `mode=auto` uses hybrid when the vector index is
+  healthy and lexical otherwise; results report their provenance.
+- **Lifecycle:** `memory_state` frontmatter (`current`, `superseded`, …) orders
+  results and hides superseded notes unless history is requested. See
+  [memory lifecycle](docs/memory-lifecycle.md).
+- **Synthesis:** `semantic_search` is the only tool that calls a chat model
+  (`llm`: OpenRouter, OpenAI-compatible, Anthropic, Ollama, or `none`). The
+  model only sees chunks the caller could have read directly.
 
-### 3.5 MCP Tools — v1 (read-only)
+Details: [local semantic search](docs/local-semantic-search.md).
 
-Deterministic and cheap (no model spend) unless marked:
+## 6. MCP tools
 
-| Tool | Purpose |
-|---|---|
-| `discover_scopes` | What can *I* (this principal) see? |
-| `search` | Scoped substring/regex search → matching notes + snippets |
-| `read_note` | Full note body (+ optional frontmatter), scope-checked |
-| `read_frontmatter` | Just the YAML frontmatter |
-| `read_section` | A single heading's section from a note |
-| `context_pack` | Compact, token-budgeted bundle assembled for a query |
-| `semantic_search` * | Fuzzy "comb the vault and synthesize" — *delegates to the LLM/Janitor backend*. The **only** tool that spends model tokens. |
+Read tools (always registered, governed by policy):
+`discover_scopes`, `status`, `list_notes`, `list_files`, `get_file`, `search`,
+`read_note`, `read_frontmatter`, `read_section`, `context_pack`,
+`semantic_search`.
 
-**Writes have since shipped, opt-in.** With the single global switch
-`writes.enabled: true` (default **false** — a server that never sets it
-registers no mutating tools at all), the tool set gains `write_note`,
-`patch_note`, `append_note`, `update_frontmatter`, and a gated `delete_note`.
-Every mutating tool requires a `reason` for the audit trail, is
-write-scope-checked (`write_scopes`, falling back to read scopes), and
-produces exactly one git commit — so every mutation, including a delete, is
-`git revert`-able.
+Write tools (registered only with `writes.enabled: true`; each needs a
+`reason`, is write-scope checked and produces one git commit):
+`write_note`, `patch_note`, `append_note`, `update_frontmatter`,
+`set_memory_state`, `supersede_note`, `delete_note`, `move_note`, `put_file`.
 
-### 3.6 LLM Provider (pluggable)
+Code layout: `mcp_tools/read_tools.py` and `mcp_tools/write_tools.py` register
+thin wrappers; the mutation logic lives in `note_writes.NoteWriteMixin` so it
+is unit-testable without MCP plumbing.
 
-A thin provider interface backs both `semantic_search` and the Janitor:
+## 7. Background work
 
-- `openrouter` *(default)* — one API key, many models via an OpenAI-compatible
-  endpoint. Default model: **latest Claude Sonnet**. Lets users swap models
-  without code changes.
-- `openai` — any OpenAI-compatible endpoint.
-- `anthropic` — the Anthropic API directly.
-- `ollama` — local models, zero API cost, full privacy.
-- `none` — disables semantic search + Janitor entirely (pure deterministic
-  retrieval). Cortex is fully useful in this mode, and this is what ships in the
-  example config so it runs with no API key.
+- **Sync** (`cortex sync`, typically a systemd timer): commit pending human
+  edits, refresh the index (and embeddings when enabled), then optionally
+  pull/push a git remote (`sync.adapter: git`). `nextcloud` and `s3` are
+  reserved adapter names and currently only snapshot locally.
+- **Janitor** (`janitor.enabled`, off by default): a bounded, report-only pass
+  over eligible notes that writes findings to the database and never edits the
+  vault. It cannot change scopes, principals, credentials or its own limits.
+  See [memory janitor](docs/memory-janitor.md).
 
-### 3.7 Janitor (dark by default)
+## 8. Safety invariants
 
-A heartbeat-driven worker, separate harness, low-power model. **Disabled until
-explicitly enabled**, and even then **dry-run/report-only before write mode**.
+1. Every guard is enforced server-side; clients are never trusted.
+2. Out-of-scope resources are invisible, not merely unreadable.
+3. Credentials map to exactly one principal; HTTP requires one.
+4. Writes are opt-in globally and per user; every write is a revertible commit.
+5. Only `semantic_search` spends chat-model tokens, and only on visible notes.
+6. Embedding endpoints are loopback unless explicitly acknowledged.
+7. Secrets come from the environment, never the repository or image.
 
-It **may**: normalize frontmatter, validate links/metadata shape/stale refs,
-propose or perform safe reorganization inside allowed paths, generate reports.
+These are exercised end to end by `tests/test_e2e_mcp.py`, which runs the real
+`cortex serve` process over stdio and HTTP.
 
-It **must never** edit: scope/permission definitions, principal definitions,
-auth/credential material, or **the ruleset defining its own limits**. This is a
-hard category, not a logged event: git would faithfully commit a privilege
-escalation, so the class of change must be *prevented*, not merely audited.
+## 9. Source map
 
-It can grow into a **drift-watcher** — noticing when an actor (human or AI) is
-moving away from declared operating rules — because it is structurally outside
-the actors it watches.
-
----
-
-## 4. Safety model (summary)
-
-1. Safety is enforced **server-side at the tool layer**, never at the client.
-2. **Writes are opt-in** (`writes.enabled`, default off; a server that never
-   enables them registers no mutating tools at all); deletes are the
-   most-gated mutation and, like every write, always land as a revertible
-   git commit.
-3. Reads are **principal-scoped**; no scope match → not visible, not just
-   not-readable.
-4. **Credential→principal mapping is mandatory** before any non-local exposure.
-5. The Janitor **cannot touch the four protected categories** (scopes,
-   principals, credentials, its own ruleset).
-6. **Everything is a git commit** with actor + reason → full audit + rollback.
-7. **No secrets in the repo or image.** Config is public-safe; secrets are env.
-
----
-
-## 5. Build order
-
-The repository is built in dependency order. Each step is runnable/verifiable
-before the next begins.
-
-1. **Design captured** (this document) + project scaffold.
-2. **Config system** — vault path, principals, scopes, sync adapter, LLM,
-   janitor toggles. Public-safe defaults; secrets via env.
-3. **Vault Store** — filesystem primitives (list/read/frontmatter/section/search).
-4. **Git Audit** — commit-on-mutation with actor+reason; history; rollback.
-5. **Scoping + Auth** — token→principal→scopes; path authorization.
-6. **MCP server v1 (read-only)** — deterministic tools, local `stdio` first.
-7. **LLM provider layer** — pluggable; default Claude; `none` works.
-8. **`semantic_search`** — the one non-deterministic tool, behind the provider.
-9. **Secure HTTP exposure** — (9a) Streamable HTTP + bearer→principal auth,
-   per-request scoping, Host/Origin protection, TLS via reverse proxy; (9b)
-   OAuth 2.1 authorization server (protected-resource + AS metadata, dynamic
-   client registration, authorization-code + PKCE, principal-token consent) for
-   one-click Claude.ai / ChatGPT / Grok connector UIs. **Done.**
-10. **Packaging** — Docker Compose for one-command spin-up *and* a first-class
-    bare-metal path (`pip install` + `cortex` CLI + systemd unit) that runs from
-    the repo unmodified on a Debian/Proxmox container.
-11. **Sync adapters** (opt-in) — git-remote first, then Nextcloud/WebDAV, then S3.
-12. **Janitor** — spec boundaries → dry-run/report → (opt-in) write mode.
-
-v1 is "done" at step 9–10: a credentialed, scoped, audited, read-only memory
-server anyone can run. The Janitor (12) is the self-improving face and lands
-last, behind its boundaries.
-
----
-
-## 6. Non-goals (v1)
-
-- Not a sync tool itself — it *uses* a sync adapter; it doesn't reinvent one.
-- Not an editor/UI — humans keep using Obsidian/their Obsidian-compatible editor of choice.
-- Not a general database — it's a memory layer over files, with git as truth.
-- Not autonomous on day one — the Janitor stays dark until boundaries are spec'd
-  and proven in dry-run.
-
----
-
-## 7. v2 — the multi-user expansion
-
-v1 above is a single-vault server with config-file principals. v2 grows it
-into a small multi-user memory host — real **user accounts** (local password
-and LDAP/AD) with groups, sessions, and per-user tokens in SQLite; **one
-vault + one git repo per user** alongside the shared main vault; a
-**React/Vite web app** (admin panel + Obsidian vault viewer) over a JSON
-`/api/v1` API; and an **MCP gateway** that proxies registered external MCP
-servers behind per-user/group permission gating with central call auditing —
-all without changing the v1 core: scoped, deterministic, git-audited memory.
-
-The canonical v2 design — data model, on-disk layout, request flows, the
-generalized scoping and safety models, and the A/B/C/D/E build order mapping
-issues #35–#55 — is [`docs/v2-design.md`](docs/v2-design.md). Agents working
-on v2 issues start there.
+| Area | Modules |
+| --- | --- |
+| Entry points | `cli`, `server`, `api`, `health` |
+| MCP tools | `mcp_tools/`, `note_writes` |
+| JSON API handlers | `api_routes/` (`_base`, `identity`, `vaults`, `policy`) |
+| Identity | `auth`, `oauth`, `sessions`, `users`, `ldap`, `pwhash`, `admin` |
+| Authorization | `access`, `scopes`, `memory_policy`, `db/vault_grants` |
+| Storage | `vault`, `vaults`, `gitlog`, `db/` |
+| Retrieval | `search_index`, `embeddings`, `recall`, `memory_lifecycle` |
+| Models | `llm/` |
+| Maintenance | `janitor/`, `sync/` |

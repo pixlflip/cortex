@@ -1,10 +1,9 @@
 """Lifecycle state in REST reads and recall, with ordinary scope enforcement."""
-import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 from cortex.api import ApiV1
 from cortex.sessions import SessionAuth
-from test_multivault import multivault
+pytest_plugins = ["test_multivault"]  # provides the `multivault` fixture
 
 
 def test_rest_lifecycle_recall_and_explicit_history(multivault):

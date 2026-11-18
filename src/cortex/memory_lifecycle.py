@@ -144,8 +144,8 @@ def vault_write_lock(root: Path):
         with lockpath.open('a+b') as handle:
             try:
                 import fcntl
-            except ImportError:
-                fcntl = None
+            except ImportError:  # pragma: no cover - non-POSIX
+                fcntl = None  # type: ignore[assignment]
             if fcntl:
                 fcntl.flock(handle, fcntl.LOCK_EX)
             try:

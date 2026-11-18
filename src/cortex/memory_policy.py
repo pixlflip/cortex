@@ -4,12 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from .config import CortexConfig, Principal
+
+if TYPE_CHECKING:
+    from .users import IdentityService
 
 # Explicit classification is intentional: a newly registered tool must not
 # silently inherit read access, even if it has a Cortex-looking name.
@@ -36,7 +40,7 @@ def _tool_id(name: str) -> str:
 class PermissionResolver:
     """Memory-only deny-wins rules shared by listing, calls and API preview."""
 
-    def __init__(self, config: CortexConfig, identity):
+    def __init__(self, config: CortexConfig, identity: IdentityService | None):
         self.config = config
         self.identity = identity
 
@@ -66,7 +70,9 @@ class PermissionResolver:
             return self.config.memory_policy.default_write_allow
         return self.config.memory_policy.default_read_allow
 
-    def explain(self, user: dict, tool_id: str) -> dict:
+    def explain(self, user: dict[str, Any], tool_id: str) -> dict[str, Any]:
+        if self.identity is None:
+            raise ValueError("permission preview requires the identity database")
         principal = self.identity.principal_for_username(user["username"])
         allowed = bool(principal and self.allowed(principal, tool_id))
         groups = self.identity.groups.groups_for_user(user["id"])
@@ -96,7 +102,12 @@ def _audit_argument_shape(arguments: dict[str, Any]) -> tuple[str, str, str | No
 
 
 class ToolGovernor:
-    def __init__(self, config: CortexConfig, identity, principal_getter):
+    def __init__(
+        self,
+        config: CortexConfig,
+        identity: IdentityService | None,
+        principal_getter: Callable[[], Principal],
+    ):
         self.identity = identity
         self.principal_getter = principal_getter
         self.permissions = PermissionResolver(config, identity)
@@ -109,7 +120,12 @@ class ToolGovernor:
         principal = self.principal_getter()
         return {name for name in names if self.permissions.allowed(principal, _tool_id(name))}
 
-    async def call(self, invoke, name: str, arguments: dict[str, Any]):
+    async def call(
+        self,
+        invoke: Callable[[str, dict[str, Any]], Awaitable[Any]],
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
         principal = self.principal_getter()
         tool_id = _tool_id(name)
         user = (
@@ -120,7 +136,7 @@ class ToolGovernor:
         digest, summary, vault = _audit_argument_shape(arguments)
         started = time.monotonic()
 
-        def audit(decision: str, error_kind: str | None = None):
+        def audit(decision: str, error_kind: str | None = None) -> None:
             if self.identity is not None:
                 self.identity.tool_audit.record(
                     subject=f"user:{principal.name}" if user else principal.name,
@@ -143,23 +159,23 @@ class ToolGovernor:
         return result
 
 
-class GovernedFastMCP(FastMCP):
+class GovernedFastMCP(FastMCP):  # type: ignore[misc, unused-ignore]  # untyped in older mcp
     """The advertised and callable memory surfaces share an unconditional guard."""
 
     governor: ToolGovernor | None = None
 
-    async def list_tools(self):
+    async def list_tools(self) -> list[Any]:
         if self.governor is None:
             raise ToolError("memory authorization is unavailable")
         tools = await super().list_tools()
         allowed = self.governor.filter_names([tool.name for tool in tools])
         return [tool for tool in tools if tool.name in allowed]
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]):
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         if self.governor is None:
             raise ToolError("memory authorization is unavailable")
 
-        async def invoke(tool_name: str, tool_args: dict[str, Any]):
+        async def invoke(tool_name: str, tool_args: dict[str, Any]) -> Any:
             return await super(GovernedFastMCP, self).call_tool(tool_name, tool_args)
 
         return await self.governor.call(invoke, name, arguments)

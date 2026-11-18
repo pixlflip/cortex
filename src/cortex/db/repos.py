@@ -12,6 +12,8 @@ so callers never hold anything tied to a closed connection.
 
 from __future__ import annotations
 
+import builtins
+
 import json
 import fnmatch
 import secrets
@@ -279,19 +281,19 @@ class GroupsRepo:
                 ).fetchone()
             )
 
-    def set_scopes(self, group_id: int, scopes: list[str]) -> None:
+    def set_scopes(self, group_id: int, scopes: builtins.list[str]) -> None:
         self.update(group_id, scopes_json=json.dumps(scopes))
 
-    def scopes(self, group_id: int) -> list[str]:
+    def scopes(self, group_id: int) -> builtins.list[str]:
         group = self.get(group_id)
         if group is None or not group["scopes_json"]:
             return []
         return list(json.loads(group["scopes_json"]))
 
-    def set_write_scopes(self, group_id: int, scopes: list[str]) -> None:
+    def set_write_scopes(self, group_id: int, scopes: builtins.list[str]) -> None:
         self.update(group_id, write_scopes_json=json.dumps(scopes))
 
-    def write_scopes(self, group_id: int) -> list[str]:
+    def write_scopes(self, group_id: int) -> builtins.list[str]:
         group = self.get(group_id)
         if group is None or not group.get("write_scopes_json"):
             return []
@@ -320,7 +322,7 @@ class GroupsRepo:
             )
             return cur.rowcount > 0
 
-    def members(self, group_id: int) -> list[dict]:
+    def members(self, group_id: int) -> builtins.list[dict]:
         with self.db.connection() as conn:
             return _rows(
                 conn.execute(
@@ -333,7 +335,7 @@ class GroupsRepo:
                 ).fetchall()
             )
 
-    def groups_for_user(self, user_id: int) -> list[dict]:
+    def groups_for_user(self, user_id: int) -> builtins.list[dict]:
         with self.db.connection() as conn:
             return _rows(
                 conn.execute(
@@ -399,6 +401,7 @@ class ApiTokensRepo:
                 ),
             )
             token_id = cur.lastrowid
+            assert token_id is not None
         return CreatedApiToken(
             id=token_id,
             user_id=user_id,
@@ -544,6 +547,7 @@ class SessionsRepo:
                 (sha256_hex(token), user_id, now, expires_at, now),
             )
             session_id = cur.lastrowid
+            assert session_id is not None
         return CreatedSession(
             id=session_id, user_id=user_id, token=token, expires_at=expires_at
         )
@@ -698,9 +702,9 @@ class ToolPermissionsRepo:
     def matching(
         self,
         user_id: int,
-        group_ids: list[int],
+        group_ids: builtins.list[int],
         tool_id: str,
-    ) -> list[dict]:
+    ) -> builtins.list[dict]:
         rules = self.list()
         return [
             rule
@@ -758,7 +762,7 @@ class ToolAuditRepo:
                     (args_summary or "")[:512] or None,
                 ),
             )
-            return int(cur.lastrowid)
+            return int(cur.lastrowid or 0)
 
     def list(
         self,

@@ -2,7 +2,7 @@
 
 > Historical review only: the UI, shared/global vault and upstream MCP broker
 > are retired. The SSRF/proxy assertions below describe removed code, not active
-> protections. See [memory policy](memory-policy.md), README and multi-user.md
+> protections. See [memory policy](../memory-policy.md), README and multi-user.md
 > for the current headless memory-only contract.
 
 Review scope: multi-user identity, per-user/shared vault routing, the same-origin

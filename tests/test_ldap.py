@@ -20,7 +20,6 @@ from cortex.db import Database
 from cortex.ldap import (
     DirectoryService,
     LdapClient,
-    LdapError,
     LdapUnavailableError,
     escape_filter_value,
 )

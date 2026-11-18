@@ -2,8 +2,8 @@
 
 > Historical design only. The UI, shared/global vault, and upstream MCP broker
 > have been removed. This is not the current implementation contract or a
-> roadmap to reactivate them. See [memory policy](memory-policy.md),
-> [account vaults](account-vaults.md), README and multi-user.md for operation.
+> roadmap to reactivate them. See [memory policy](../memory-policy.md),
+> [account vaults](../account-vaults.md), README and multi-user.md for operation.
 
 Like the v1 document, this is intentionally infrastructure-agnostic: no IP
 addresses, no hostnames, no secrets. Everything environment-specific is a
@@ -309,7 +309,7 @@ admin store's "roles" concept (A3 migrates roles → groups).
 
 ## 7. Safety model v2
 
-Extends [`ARCHITECTURE.md` §4](../ARCHITECTURE.md); every v1 rule stands.
+Extends [`ARCHITECTURE.md` §4](../../ARCHITECTURE.md); every v1 rule stands.
 Restating the v1 list with v2 amendments (**bold**):
 
 1. Safety is enforced **server-side at the tool/API layer** — now including

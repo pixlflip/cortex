@@ -1,24 +1,44 @@
-# v2 release checklist
+# Release checklist
 
-- [ ] Set matching versions in `pyproject.toml` and `src/cortex/__init__.py`;
-  update `CHANGELOG.md`.
-- [ ] Run `python -m pytest -q` on Python 3.11–3.13.
-- [ ] Build the wheel and verify no web assets or gateway/proxy module are included.
-- [ ] Verify `/` and old UI/static/admin routes return 404; health, API, MCP,
-  and optional OAuth authorization remain functional.
-- [ ] Build the Docker image and run `scripts/smoke-v2.sh cortex:<tag>`.
-- [ ] Test an existing DB snapshot upgrade; verify accounts, existing tokens,
-  audit and inert upstream records survive. No destructive migration.
-- [ ] Test fresh Compose setup, CLI local user creation, private vault,
-  group memory policy, token issuance, and authenticated memory-only MCP discovery.
-- [ ] Test LDAP dry-run/apply against the supported directory fixture.
-- [ ] Test old broker calls fail and REST routes return 404 without outbound
-  activity. Test deny-wins memory calls for old gateway.enabled true AND false;
-  inspect audit rows for argument values or secrets.
-- [ ] Parent/operator: verify direct consumer coverage before cutover, take
-  runtime backups, publish/deploy, run real MCP tests, and verify external
-  Nextcloud sync. See [retirement requirements](memory-policy.md).
-- [ ] Take/restore a backup containing DB plus all vault `.git` directories.
-- [ ] Review [`security-review-v2.md`](security-review-v2.md), publish image and
-  Python artifacts, tag the commit, and monitor migration/support reports.
+CI already runs lint, mypy, the dependency audit, the test matrix with
+coverage floors, the end-to-end MCP tests and the image smoke test on every
+push. This list covers what CI cannot.
 
+## Before tagging
+
+- [ ] CI is green on the release commit.
+- [ ] `version` in `pyproject.toml` and `__version__` in
+  `src/cortex/__init__.py` match the tag (the release workflow rejects a
+  mismatch).
+- [ ] `CHANGELOG.md`: move "Unreleased" under the new version heading and date
+  it. Call out breaking changes and link [upgrading](upgrading.md).
+- [ ] [`upgrading.md`](upgrading.md) covers every breaking change, with steps
+  and rollback.
+- [ ] `scripts/lock.sh` produces no diff, and `pip-audit` is clean (CI's
+  `audit` job).
+- [ ] Upgrade test: start the previous release on a copy of a real (or
+  representative) database and vaults, upgrade, run `cortex migrate`, and
+  confirm accounts, tokens, grants and audit rows survive and existing tokens
+  still work. Confirm the documented rollback path.
+- [ ] Fresh install test with Docker Compose: `check`, `init`, `user add`,
+  `token mint`, then connect a real MCP client over HTTP and over the `stdio`
+  profile.
+- [ ] If LDAP changed: run a dry-run and an apply sync against a test directory.
+- [ ] If semantic search changed: run `cortex check` and
+  `cortex index --embeddings` against a real local embedding model.
+- [ ] Take and restore a backup containing the database plus every vault
+  including `.git`.
+
+## Tag and publish
+
+- [ ] Tag `vX.Y.Z` on the release commit and push the tag. The
+  [release workflow](../.github/workflows/release.yml) smoke-tests and pushes
+  `ghcr.io/<owner>/cortex:X.Y.Z`, `:X.Y` and `:latest` with provenance and an
+  SBOM.
+- [ ] Create a GitHub release from the changelog section.
+- [ ] Pull the published image and run `scripts/smoke-v2.sh ghcr.io/<owner>/cortex:X.Y.Z`.
+
+## After
+
+- [ ] Watch issues for upgrade reports for a week.
+- [ ] Merge any Dependabot base-image or dependency PRs that queued up.
